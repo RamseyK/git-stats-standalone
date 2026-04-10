@@ -51,19 +51,23 @@ class GitStats:
         config = self._load_config(config_file)
 
         # aliases: canonical_name -> [alias, email, ...]
+        # Email keys are lowercased so lookups are case-insensitive.
         aliases = config.get('aliases', {})
         self.alias_to_canonical = {
-            alias: canon for canon, als in aliases.items() for alias in als
+            (alias.lower() if '@' in alias else alias): canon
+            for canon, als in aliases.items() for alias in als
         }
 
         # teams: team_name -> [author name or email, ...]
+        # Email keys are lowercased so lookups are case-insensitive.
         teams_config = config.get('teams', {})
         self.author_to_team = {}
         self.team_colors = {}
         for i, (team, members) in enumerate(teams_config.items()):
             self.team_colors[team] = TEAM_COLORS[i % len(TEAM_COLORS)]
             for m in members:
-                self.author_to_team[m] = team
+                key = m.lower() if '@' in m else m
+                self.author_to_team[key] = team
         self.team_colors['Unassigned'] = '#94a3b8'
 
         self.data = {
@@ -90,10 +94,10 @@ class GitStats:
             return json.load(f)
 
     def _get_author(self, name, email):
-        return self.alias_to_canonical.get(email, self.alias_to_canonical.get(name, name))
+        return self.alias_to_canonical.get(email.lower(), self.alias_to_canonical.get(name, name))
 
     def _get_team(self, author, email):
-        return self.author_to_team.get(email, self.author_to_team.get(author, 'Unassigned'))
+        return self.author_to_team.get(email.lower(), self.author_to_team.get(author, 'Unassigned'))
 
     def _run_git(self, args):
         return subprocess.check_output(
