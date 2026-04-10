@@ -278,10 +278,15 @@ class GitStats:
                 for i, (auth, count) in enumerate(t['top_authors'])
             ])
             team_badges = ''.join([
-                f'<span class="text-[10px] px-2 py-0.5 rounded font-black uppercase" '
-                f'style="background:{self.team_colors.get(team, "#94a3b8")}22;'
+                f'<span class="inline-flex items-center gap-1.5 text-[10px] px-2.5 py-1 rounded-lg font-black uppercase" '
+                f'style="background:{self.team_colors.get(team, "#94a3b8")}18;'
                 f'color:{self.team_colors.get(team, "#94a3b8")}">'
-                f'{team}: {count}</span>'
+                f'{team}'
+                f'<span class="opacity-60">·</span>'
+                f'<span>{count} commits</span>'
+                f'<span class="opacity-60">·</span>'
+                f'<span class="bg-white/60 rounded px-1 py-px">⚡ {self.data["teams"].get(team, {}).get("impact", 0)}</span>'
+                f'</span>'
                 for team, count in t['top_teams']
             ])
             parts.append(f'''
@@ -363,8 +368,7 @@ class GitStats:
     <div class="max-w-7xl mx-auto flex flex-col md:flex-row justify-between items-center gap-6">
         <div>
             <div class="flex items-center gap-3 mb-1">
-                <span class="bg-blue-600 text-white text-[10px] font-black px-2 py-0.5 rounded uppercase tracking-widest">Repository</span>
-                <h1 class="text-3xl font-black tracking-tighter text-slate-900 uppercase italic">Git<span class="text-blue-600">Stats</span></h1>
+                <span class="bg-blue-600 text-white text-[10px] font-black px-2 py-0.5 rounded uppercase tracking-widest">Repo Stats</span>
             </div>
             <h2 class="text-2xl font-bold text-slate-800">{pname}</h2>
             <p class="text-xs font-bold text-slate-400 uppercase tracking-widest mt-1">Last Analysis: {adate}</p>
@@ -423,7 +427,13 @@ class GitStats:
     <div id="tab-impact" class="tab-content hidden space-y-8">
         <div class="grid grid-cols-1 lg:grid-cols-2 gap-8">
             <div class="card">
-                <h3 class="text-xl font-black text-slate-900 mb-0.5">Top Contributors</h3>
+                <div class="flex items-start justify-between mb-0.5">
+                    <h3 class="text-xl font-black text-slate-900" id="impact-authors-title">Top Contributors</h3>
+                    <button id="impact-clear-btn" onclick="clearImpactFilter()"
+                            class="hidden text-[10px] font-black px-2.5 py-1 rounded-lg bg-slate-100 text-slate-500 hover:bg-slate-200 transition-all uppercase tracking-wide">
+                        Clear Filter
+                    </button>
+                </div>
                 <p class="text-xs text-slate-400 font-medium mb-6">Impact = commits&nbsp;{iw_commits}%&nbsp;·&nbsp;lines&nbsp;{iw_lines}%&nbsp;·&nbsp;tenure&nbsp;{iw_tenure}%</p>
                 <div id="impact-authors" class="space-y-1"></div>
             </div>
@@ -535,6 +545,7 @@ const totalCommits   = {tcom};
 let currentSortKey   = 'impact';
 let currentFilter    = null;
 let currentFilterType = null;
+let impactTeamFilter = null;
 
 // ─── Navigation ──────────────────────────────────────────────────────────────
 // Charts that live in non-default tabs must be initialized lazily (only when the
@@ -679,45 +690,77 @@ function renderAuthorTable(filter, filterType) {{
 }}
 
 // ─── Impact leaderboard ───────────────────────────────────────────────────────
+function filterImpactByTeam(team) {{
+    impactTeamFilter = team;
+    renderImpactLeaderboard();
+}}
+
+function clearImpactFilter() {{
+    impactTeamFilter = null;
+    renderImpactLeaderboard();
+}}
+
 function renderImpactLeaderboard() {{
     const medals = ['🥇','🥈','🥉'];
 
-    // Authors
-    const topAuthors = Object.entries(authorData)
-        .sort((a,b) => b[1].impact - a[1].impact).slice(0, 12);
+    // Authors — apply team filter if active
+    const allAuthors = Object.entries(authorData).sort((a,b) => b[1].impact - a[1].impact);
+    const filtered   = impactTeamFilter
+        ? allAuthors.filter(([, s]) => s.team === impactTeamFilter)
+        : allAuthors.slice(0, 12);
 
-    document.getElementById('impact-authors').innerHTML = topAuthors.map(([name, s], i) => {{
-        const color  = teamColor(s.team);
-        const prefix = i < 3
-            ? `<span class="text-xl w-8 text-center shrink-0">${{medals[i]}}</span>`
-            : `<span class="text-xs font-black text-slate-300 w-8 text-center shrink-0">#${{i+1}}</span>`;
-        return `<div class="flex items-center gap-3 p-3 rounded-xl hover:bg-slate-50 transition-colors">
-            ${{prefix}}
-            <div class="flex-1 min-w-0">
-                <div class="flex items-center justify-between mb-1">
-                    <span class="font-bold text-slate-800 truncate">${{name}}</span>
-                    <span class="text-sm font-black text-slate-700 ml-2 shrink-0">${{s.impact}}</span>
-                </div>
-                ${{impactBar(s.impact, '#3b82f6')}}
-                <div class="flex items-center gap-2 mt-1">
-                    ${{teamBadge(s.team)}}
-                    <span class="text-[10px] text-slate-400">${{fmt(s.commits)}} commits · +${{fmt(s.add)}} lines</span>
-                </div>
-            </div>
-        </div>`;
-    }}).join('');
+    const titleEl    = document.getElementById('impact-authors-title');
+    const clearBtn   = document.getElementById('impact-clear-btn');
+    if (impactTeamFilter) {{
+        titleEl.innerText = `${{impactTeamFilter}} Contributors`;
+        clearBtn.classList.remove('hidden');
+    }} else {{
+        titleEl.innerText = 'Top Contributors';
+        clearBtn.classList.add('hidden');
+    }}
 
-    // Teams
+    document.getElementById('impact-authors').innerHTML = filtered.length
+        ? filtered.map(([name, s], i) => {{
+            const color  = teamColor(s.team);
+            const rank   = allAuthors.findIndex(([n]) => n === name);
+            const prefix = rank < 3
+                ? `<span class="text-xl w-8 text-center shrink-0">${{medals[rank]}}</span>`
+                : `<span class="text-xs font-black text-slate-300 w-8 text-center shrink-0">#${{rank+1}}</span>`;
+            return `<div class="flex items-center gap-3 p-3 rounded-xl hover:bg-slate-50 transition-colors">
+                ${{prefix}}
+                <div class="flex-1 min-w-0">
+                    <div class="flex items-center justify-between mb-1">
+                        <span class="font-bold text-slate-800 truncate">${{name}}</span>
+                        <span class="text-sm font-black text-slate-700 ml-2 shrink-0">${{s.impact}}</span>
+                    </div>
+                    ${{impactBar(s.impact, '#3b82f6')}}
+                    <div class="flex items-center gap-2 mt-1">
+                        ${{teamBadge(s.team)}}
+                        <span class="text-[10px] text-slate-400">${{fmt(s.commits)}} commits · +${{fmt(s.add)}} lines</span>
+                    </div>
+                </div>
+            </div>`;
+          }}).join('')
+        : `<p class="text-sm text-slate-400 font-medium py-4">No contributors found for this team.</p>`;
+
+    // Teams — highlight active filter
     const topTeams = Object.entries(teamsData).sort((a,b) => b[1].impact - a[1].impact);
 
     document.getElementById('impact-teams').innerHTML = topTeams.map(([name, s], i) => {{
-        const color   = teamColor(name);
-        const members = Array.isArray(s.members) ? s.members.length : 0;
-        const prefix  = i < 3
+        const color      = teamColor(name);
+        const members    = Array.isArray(s.members) ? s.members.length : 0;
+        const isActive   = impactTeamFilter === name;
+        const prefix     = i < 3
             ? `<span class="text-xl w-8 text-center shrink-0">${{medals[i]}}</span>`
             : `<span class="text-xs font-black text-slate-300 w-8 text-center shrink-0">#${{i+1}}</span>`;
-        return `<div class="flex items-center gap-3 p-3 rounded-xl hover:bg-slate-50 transition-colors cursor-pointer"
-                     onclick="filterByTeam(${{JSON.stringify(name)}})" title="Click to filter contributors">
+        const activeCls  = isActive
+            ? `border border-2 rounded-xl`
+            : `hover:bg-slate-50 rounded-xl`;
+        const activeStyle = isActive ? `border-color:${{color}};background:${{color}}11` : '';
+        return `<div class="flex items-center gap-3 p-3 ${{activeCls}} transition-colors cursor-pointer"
+                     style="${{activeStyle}}" data-team="${{name.replace(/"/g,'&quot;')}}"
+                     onclick="filterImpactByTeam(this.dataset.team)"
+                     title="Click to filter contributors">
             ${{prefix}}
             <div class="flex-1 min-w-0">
                 <div class="flex items-center justify-between mb-1">
@@ -910,6 +953,12 @@ renderAuthorTable();
 renderImpactLeaderboard();
 renderTeamsGrid();
 </script>
+
+<footer class="text-center py-8 mt-4">
+    <span class="text-sm font-black tracking-tighter text-slate-300 uppercase italic select-none">
+        Git<span class="text-blue-300">Stats</span>
+    </span>
+</footer>
 </body>
 </html>"""
         with open(output, 'w') as f:
