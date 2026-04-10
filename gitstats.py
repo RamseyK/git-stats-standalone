@@ -39,6 +39,13 @@ class GitStats:
     Authors not assigned to any team appear under "Unassigned".
     """
 
+    # ── Impact score weights (must sum to 100) ──────────────────────────────────
+    # Each metric is normalized to the max value across all authors/teams (0–1),
+    # then multiplied by its weight, yielding a final score in the range 0–100.
+    IMPACT_W_COMMITS = 40   # commit count
+    IMPACT_W_LINES   = 40   # total lines changed (additions + deletions)
+    IMPACT_W_TENURE  = 20   # active tenure in days (first commit → last commit)
+
     def __init__(self, repo_path, config_file=None):
         self.repo_path = repo_path
         config = self._load_config(config_file)
@@ -219,9 +226,16 @@ class GitStats:
 
     def _compute_impact(self):
         """
-        Impact score (0–100) = commits/max*40 + (add+del)/max*40 + active_days/max*20
+        Impact score (0–100) = normalized(commits)*W_COMMITS
+                              + normalized(lines)*W_LINES
+                              + normalized(tenure_days)*W_TENURE
+        Weights are defined as class constants (IMPACT_W_*).
         Separately computed for authors and teams.
         """
+        wc = self.IMPACT_W_COMMITS
+        wl = self.IMPACT_W_LINES
+        wt = self.IMPACT_W_TENURE
+
         authors = self.data['authors']
         if authors:
             max_c = max(a['commits'] for a in authors.values()) or 1
@@ -230,9 +244,9 @@ class GitStats:
             for a in authors.values():
                 days = (a['last'] - a['first']) // 86400
                 a['impact'] = round(
-                    (a['commits'] / max_c) * 40 +
-                    ((a['add'] + a['del']) / max_k) * 40 +
-                    (days / max_d) * 20, 1
+                    (a['commits'] / max_c) * wc +
+                    ((a['add'] + a['del']) / max_k) * wl +
+                    (days / max_d) * wt, 1
                 )
 
         teams = self.data['teams']
@@ -243,9 +257,9 @@ class GitStats:
             for t in teams.values():
                 days = (t['last'] - t['first']) // 86400
                 t['impact'] = round(
-                    (t['commits'] / max_c) * 40 +
-                    ((t['add'] + t['del']) / max_k) * 40 +
-                    (days / max_d) * 20, 1
+                    (t['commits'] / max_c) * wc +
+                    ((t['add'] + t['del']) / max_k) * wl +
+                    (days / max_d) * wt, 1
                 )
 
     # ------------------------------------------------------------------ HTML helpers
@@ -313,6 +327,10 @@ class GitStats:
         tlines = self.data['general']['total_lines']
         nauth  = len(self.data['authors'])
         nteams = len(self.data['teams'])
+
+        iw_commits = self.IMPACT_W_COMMITS
+        iw_lines   = self.IMPACT_W_LINES
+        iw_tenure  = self.IMPACT_W_TENURE
 
         html = f"""<!DOCTYPE html>
 <html class="scroll-smooth">
@@ -406,7 +424,7 @@ class GitStats:
         <div class="grid grid-cols-1 lg:grid-cols-2 gap-8">
             <div class="card">
                 <h3 class="text-xl font-black text-slate-900 mb-0.5">Top Contributors</h3>
-                <p class="text-xs text-slate-400 font-medium mb-6">Impact = commits&nbsp;40%&nbsp;·&nbsp;lines&nbsp;40%&nbsp;·&nbsp;tenure&nbsp;20%</p>
+                <p class="text-xs text-slate-400 font-medium mb-6">Impact = commits&nbsp;{iw_commits}%&nbsp;·&nbsp;lines&nbsp;{iw_lines}%&nbsp;·&nbsp;tenure&nbsp;{iw_tenure}%</p>
                 <div id="impact-authors" class="space-y-1"></div>
             </div>
             <div class="card">
@@ -418,6 +436,46 @@ class GitStats:
         <div class="card" style="height:360px">
             <h3 class="text-xl font-black mb-4">Impact Score — Top 15 Contributors</h3>
             <canvas id="impactChart"></canvas>
+        </div>
+
+        <!-- Score methodology explanation -->
+        <div class="card">
+            <h3 class="text-xl font-black text-slate-900 mb-1">How the Impact Score Is Computed</h3>
+            <p class="text-xs text-slate-400 font-medium mb-6">Scores range from 0 to 100. Each metric is normalized relative to the top performer, so the highest scorer in each dimension always contributes the full weight for that dimension.</p>
+            <div class="grid grid-cols-1 md:grid-cols-3 gap-6 mb-6">
+                <div class="bg-slate-50 rounded-2xl p-5">
+                    <div class="flex items-center justify-between mb-2">
+                        <span class="text-sm font-black text-slate-700">Commit Volume</span>
+                        <span class="text-2xl font-black text-blue-600">{iw_commits}%</span>
+                    </div>
+                    <div class="impact-bar mb-3"><div class="impact-fill" style="width:{iw_commits}%"></div></div>
+                    <p class="text-xs text-slate-500">Total number of commits authored. Rewards consistent contribution frequency over time.</p>
+                    <p class="text-[11px] text-slate-400 mt-2 font-mono">score += (commits / max_commits) × {iw_commits}</p>
+                </div>
+                <div class="bg-slate-50 rounded-2xl p-5">
+                    <div class="flex items-center justify-between mb-2">
+                        <span class="text-sm font-black text-slate-700">Lines Changed</span>
+                        <span class="text-2xl font-black text-blue-600">{iw_lines}%</span>
+                    </div>
+                    <div class="impact-bar mb-3"><div class="impact-fill" style="width:{iw_lines}%"></div></div>
+                    <p class="text-xs text-slate-500">Sum of lines added and deleted across all commits. Captures the raw volume of code touched.</p>
+                    <p class="text-[11px] text-slate-400 mt-2 font-mono">score += ((add + del) / max_lines) × {iw_lines}</p>
+                </div>
+                <div class="bg-slate-50 rounded-2xl p-5">
+                    <div class="flex items-center justify-between mb-2">
+                        <span class="text-sm font-black text-slate-700">Active Tenure</span>
+                        <span class="text-2xl font-black text-blue-600">{iw_tenure}%</span>
+                    </div>
+                    <div class="impact-bar mb-3"><div class="impact-fill" style="width:{iw_tenure}%"></div></div>
+                    <p class="text-xs text-slate-500">Days between a contributor's first and last commit. Rewards long-term, sustained engagement.</p>
+                    <p class="text-[11px] text-slate-400 mt-2 font-mono">score += (tenure_days / max_tenure) × {iw_tenure}</p>
+                </div>
+            </div>
+            <div class="bg-blue-50 border border-blue-100 rounded-xl p-4 text-xs text-blue-800">
+                <span class="font-black">Formula: </span>
+                Impact = (commits / max_commits) × {iw_commits} &nbsp;+&nbsp; ((add + del) / max_lines) × {iw_lines} &nbsp;+&nbsp; (tenure_days / max_tenure) × {iw_tenure}
+                <br><span class="text-blue-500 mt-1 block">All normalizations are computed independently for authors and for teams.</span>
+            </div>
         </div>
     </div>
 
