@@ -1,17 +1,11 @@
-# Dev environment directories
+# Dev env
 /.idea/
 .vscode/
-
-# Tests results
-/test-reports/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
 *$py.class
-
-# C extensions
-*.so
 
 # Distribution / packaging
 .Python
@@ -27,10 +21,6 @@ sdist/
 # Linting
 .ruff_cache/
 
-# Installer logs
-pip-log.txt
-pip-delete-this-directory.txt
-
 # Unit test / coverage reports
 htmlcov/
 .tox/
@@ -41,32 +31,9 @@ htmlcov/
 coverage.xml
 *,cover
 
-# Generated Documentation
-docs/
-
-# Open temp files
+# Temp files
 *~
 ._*
 *.swp
-
-# Mac files
 *DS_Store*
-
-# Pipenv
-/Pipfile
-/Pipfile.lock
-
-# Pyenv
-.python-version
-
-# Memray output
-memray-*.bin*
-
-# line_profiler output
-profile_output*
-
-# uv lock file
-uv.lock
-
-index.html
 
