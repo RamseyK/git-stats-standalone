@@ -1,4 +1,9 @@
-import os, subprocess, json, datetime, sys
+import os
+import subprocess
+import sys
+import json
+import datetime
+import argparse
 from collections import Counter, defaultdict
 
 # Distinct colors for up to 12 teams; 'Unassigned' gets slate
@@ -19,7 +24,7 @@ class GitStats:
       - Release/tag breakdown by author and team
       - Directory churn chart (click to filter by module)
 
-    Config file (teams.json or custom path) format:
+    Config file (./config.json or custom path) format:
     {
       "teams": {
         "Team Name": ["author name", "author@email.com", ...]
@@ -92,7 +97,7 @@ class GitStats:
     # ------------------------------------------------------------------ collect
 
     def collect(self):
-        print(f"🚀 Analyzing {self.data['project_name']}...")
+        print(f"Analyzing {self.data['project_name']}...")
 
         # 1. File inventory
         ls_files = self._run_git(['ls-files']).splitlines()
@@ -158,7 +163,7 @@ class GitStats:
                     self.data['teams'][current_team]['add'] += a
                     self.data['teams'][current_team]['del'] += d
                     running_loc += (a - d)
-                    self.data['loc_history'].append({'t': ts * 1000, 'y': running_loc})
+                    self.data['loc_history'].append(running_loc)
 
                     domain = path.split('/')[0] if '/' in path else 'root'
                     self.data['domains'][domain] += (a + d)
@@ -191,9 +196,9 @@ class GitStats:
                 continue
             author_counts = Counter()
             team_counts = Counter()
-            for l in tag_log.splitlines():
-                if '|' in l:
-                    n, e = l.split('|', 1)
+            for tag_log_line in tag_log.splitlines():
+                if '|' in tag_log_line:
+                    n, e = tag_log_line.split('|', 1)
                     canon = self._get_author(n, e)
                     author_counts[canon] += 1
                     team_counts[self._get_team(canon, e)] += 1
@@ -817,13 +822,17 @@ for (let i = 364; i >= 0; i--) {{
 // ─── Charts ───────────────────────────────────────────────────────────────────
 const commonOpts = {{ responsive:true, maintainAspectRatio:false, plugins:{{ legend:{{ display:false }} }} }};
 
+const locData = {loc_json};
 new Chart(document.getElementById('locChart'), {{
     type: 'line',
-    data: {{ datasets: [{{
-        label: 'LOC', data: {loc_json},
-        borderColor: '#3b82f6', pointRadius: 0, fill: true,
-        backgroundColor: 'rgba(59,130,246,0.05)', tension: 0.1,
-    }}] }},
+    data: {{
+        labels: locData.map((_,i) => i),
+        datasets: [{{
+            label: 'LOC', data: locData,
+            borderColor: '#3b82f6', pointRadius: 0, fill: true,
+            backgroundColor: 'rgba(59,130,246,0.05)', tension: 0.1,
+        }}],
+    }},
     options: {{ ...commonOpts, scales: {{ x: {{ display:false }} }} }},
 }});
 
@@ -847,25 +856,47 @@ renderTeamsGrid();
 </html>"""
         with open(output, 'w') as f:
             f.write(html)
-        print(f"✅ Report generated: {os.path.abspath(output)}")
+        print(f"Report generated: {os.path.abspath(output)}")
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description="Generate a self-contained HTML statistics report for a Git repository."
+    )
+    parser.add_argument(
+        "-s", "--source", required=True,
+        help="Path to the source Git repository"
+    )
+    parser.add_argument(
+        "-c", "--config", default=os.path.join(os.getcwd(), "config.json"),
+        help="Path to teams/aliases config JSON (default: ./config.json)"
+    )
+    parser.add_argument(
+        "-o", "--output", required=True, default="/tmp/index.html",
+        help="Output HTML file path (default: /tmp/index.html)"
+    )
+    args = parser.parse_args()
+    if not os.path.isdir(args.source):
+        print(f"Provided source Git repository directory does not exist at {args.source}")
+        return 1
+
+    config_path = args.config
+    if config_path and os.path.exists(config_path):
+        print(f"Using config: {config_path}")
+    else:
+        print("No config file found — all authors will appear as 'Unassigned'.")
+        print("Create config.json with format: {\"teams\": {\"Team\": [\"name\", \"email\"]}, \"aliases\": {}}")
+
+    stats = GitStats(args.source, config_path)
+    stats.collect()
+    stats.generate_report(args.output)
+    return 0
 
 
 if __name__ == "__main__":
-    repo   = sys.argv[1] if len(sys.argv) > 1 else "."
-    config = sys.argv[2] if len(sys.argv) > 2 else None
+    try:
+        sys.exit(main())
+    except Exception as e:
+        print(e)
+        sys.exit(1)
 
-    # Auto-discover config if not specified
-    if config is None:
-        for name in ('teams.json', 'config.json'):
-            if os.path.exists(name):
-                config = name
-                print(f"📋 Using config: {name}")
-                break
-
-    if config is None:
-        print("ℹ️  No config file found — all authors will appear as 'Unassigned'.")
-        print("   Create teams.json with format: {\"teams\": {\"Team\": [\"name\", \"email\"]}, \"aliases\": {}}")
-
-    stats = GitStats(repo, config)
-    stats.collect()
-    stats.generate_report()
