@@ -96,6 +96,9 @@ class GitStats:
         # Email members are stored lowercased for case-insensitive matching.
         # Authors not listed in any team fall back to the built-in "Community" team.
         teams_config = config.get('teams', {})
+        # True only when at least one team is explicitly defined in config.
+        # Used to hide the Teams tab when running without team configuration.
+        self.has_teams = bool(teams_config)
         self.author_to_team = {}   # name/email → team name
         self.team_colors = {}      # team name  → hex color string
         for i, (team, value) in enumerate(teams_config.items()):
@@ -581,6 +584,8 @@ class GitStats:
                 f'<b class="text-blue-600 ml-2 shrink-0">{count}</b></div>'
                 for i, (auth, count) in enumerate(t['top_authors'])
             ])
+            # Only render team badges when teams are explicitly configured.
+            # With no teams, every commit maps to "Community", which adds no signal.
             team_badges = ''.join([
                 f'<span class="inline-flex items-center gap-1.5 text-[10px] px-2.5 py-1 rounded-lg font-black uppercase" '
                 f'style="background:{self.team_colors.get(team, "#94a3b8")}18;'
@@ -592,7 +597,7 @@ class GitStats:
                 f'<span class="bg-white/60 rounded px-1 py-px">⚡ {self.data["teams"].get(team, {}).get("impact", 0)}</span>'
                 f'</span>'
                 for team, count in t['top_teams']
-            ])
+            ]) if self.has_teams else ''
             parts.append(f'''
             <div class="card group">
                 <div class="flex flex-col md:flex-row justify-between items-start md:items-center gap-4 mb-6 border-b border-slate-100 pb-6">
@@ -649,6 +654,9 @@ class GitStats:
         iw_commits = self.IMPACT_W_COMMITS
         iw_lines   = self.IMPACT_W_LINES
         iw_tenure  = self.IMPACT_W_TENURE
+
+        # Hide the Teams tab entirely when no teams are defined in config.
+        teams_tab_hidden = ' hidden' if not self.has_teams else ''
 
         # Noise-reduction settings — displayed in the impact explanation section
         # so viewers know exactly what filtering was applied to this report.
@@ -725,7 +733,7 @@ class GitStats:
             <button onclick="showTab('activity',this)" class="tab-btn active">Activity</button>
             <button onclick="showTab('impact',this)"   class="tab-btn">Impact</button>
             <button onclick="showTab('authors',this)"  class="tab-btn">Authors</button>
-            <button onclick="showTab('teams',this)"    class="tab-btn">Teams</button>
+            <button onclick="showTab('teams',this)"    class="tab-btn{teams_tab_hidden}">Teams</button>
             <button onclick="showTab('tags',this)"     class="tab-btn">Releases</button>
             <button onclick="showTab('components',this)"  class="tab-btn">Components</button>
         </div>
@@ -747,7 +755,7 @@ class GitStats:
 
     <!-- ═══ IMPACT ═══════════════════════════════════════════════════════════ -->
     <div id="tab-impact" class="tab-content hidden space-y-8">
-        <div class="grid grid-cols-1 lg:grid-cols-2 gap-8">
+        <div class="{'grid grid-cols-1 lg:grid-cols-2' if self.has_teams else 'grid grid-cols-1'} gap-8">
             <div class="card">
                 <div class="flex items-start justify-between mb-0.5">
                     <h3 class="text-xl font-black text-slate-900" id="impact-authors-title">Top Contributors</h3>
@@ -759,7 +767,7 @@ class GitStats:
                 <p class="text-xs text-slate-400 font-medium mb-6">Impact = commits&nbsp;{iw_commits}%&nbsp;·&nbsp;lines&nbsp;{iw_lines}%&nbsp;·&nbsp;tenure&nbsp;{iw_tenure}%</p>
                 <div id="impact-authors" class="space-y-1"></div>
             </div>
-            <div class="card">
+            <div class="card" id="impact-teams-card">
                 <h3 class="text-xl font-black text-slate-900 mb-0.5">Team Rankings</h3>
                 <p class="text-xs text-slate-400 font-medium mb-6">Click a team to filter contributors</p>
                 <div id="impact-teams" class="space-y-1"></div>
@@ -842,7 +850,7 @@ class GitStats:
     </div>
 
     <!-- ═══ TEAMS ═════════════════════════════════════════════════════════════ -->
-    <div id="tab-teams" class="tab-content hidden">
+    <div id="tab-teams" class="tab-content hidden{teams_tab_hidden}">
         <div id="teams-grid" class="grid grid-cols-1 md:grid-cols-2 gap-6"></div>
     </div>
 
@@ -869,6 +877,7 @@ class GitStats:
 const authorData     = {authors_json};
 const teamsData      = {teams_json};
 const teamColors     = {team_colors_json};
+const hasTeams       = {json.dumps(self.has_teams)};
 const componentData     = {component_json};
 const teamComponentData = {team_component_json};
 const totalCommits   = {tcom};
@@ -927,6 +936,9 @@ function impactBar(score, color) {{
 }}
 
 function teamBadge(team) {{
+    // Returns empty string when no teams are configured — avoids a meaningless
+    // "Community" label appearing on every author row and leaderboard entry.
+    if (!hasTeams) return '';
     const c = teamColor(team);
     return `<span class="text-[10px] px-2 py-0.5 rounded font-black uppercase inline-block"
                   style="background:${{c}}22;color:${{c}}">${{team}}</span>`;
@@ -1304,6 +1316,11 @@ _chartInited['activity'] = true;
 renderAuthorTable();
 renderImpactLeaderboard();
 renderTeamsGrid();
+// Hide the Team Rankings card on the Impact tab when no teams are configured.
+if (!hasTeams) {{
+    const card = document.getElementById('impact-teams-card');
+    if (card) card.classList.add('hidden');
+}}
 </script>
 
 <footer class="text-center py-8 mt-4">

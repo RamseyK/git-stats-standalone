@@ -87,6 +87,15 @@ All configuration lives in a single JSON file. Every key is optional.
 
 ### Teams
 
+Defining teams unlocks a dedicated **Teams tab** in the report (hidden when no teams are configured) and enriches every other tab with team context:
+
+- **Impact tab** — team rankings alongside the author leaderboard, with click-to-filter so you can isolate any team's contributors
+- **Authors tab** — each contributor row shows their team badge
+- **Releases tab** — each release card shows a per-team commit and impact breakdown
+- **Components tab** — team ownership breakdown per component
+
+Without teams, all authors are grouped under a single **Community** label and the Teams tab is not shown.
+
 `teams` is an object where each key is a team name and the value is an object with:
 
 | Key | Required | Description |
