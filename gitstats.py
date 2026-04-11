@@ -6,7 +6,7 @@ import datetime
 import argparse
 from collections import Counter, defaultdict
 
-# Distinct colors for up to 12 teams; 'Unassigned' gets slate
+# Distinct colors for up to 12 teams; 'Community' gets slate
 TEAM_COLORS = [
     '#3b82f6', '#10b981', '#f59e0b', '#ef4444',
     '#8b5cf6', '#ec4899', '#06b6d4', '#84cc16',
@@ -26,8 +26,12 @@ class GitStats:
 
     Config file (./config.json or custom path) format:
     {
+      "tag_prefix": "v",
       "teams": {
-        "Team Name": ["author name", "author@email.com", ...]
+        "Team Name": {
+          "color": "#3b82f6",
+          "members": ["author name", "author@email.com", ...]
+        }
       },
       "aliases": {
         "Canonical Name": ["alias", "old@email.com", ...]
@@ -35,8 +39,9 @@ class GitStats:
     }
 
     Members in "teams" are matched against git author names and emails.
+    "color" is optional; teams without one are assigned a color from the palette.
     "aliases" merges multiple identities into a single canonical name.
-    Authors not assigned to any team appear under "Unassigned".
+    Authors not assigned to any team appear under "Community".
     """
 
     # ── Impact score weights (must sum to 100) ──────────────────────────────────
@@ -60,15 +65,20 @@ class GitStats:
 
         # teams: team_name -> [author name or email, ...]
         # Email keys are lowercased so lookups are case-insensitive.
+        # teams: {"Team Name": {"color": "#hex", "members": [name/email, ...]}}
         teams_config = config.get('teams', {})
         self.author_to_team = {}
         self.team_colors = {}
-        for i, (team, members) in enumerate(teams_config.items()):
-            self.team_colors[team] = TEAM_COLORS[i % len(TEAM_COLORS)]
-            for m in members:
+        for i, (team, value) in enumerate(teams_config.items()):
+            self.team_colors[team] = value.get('color') or TEAM_COLORS[i % len(TEAM_COLORS)]
+            for m in value.get('members', []):
                 key = m.lower() if '@' in m else m
                 self.author_to_team[key] = team
-        self.team_colors['Unassigned'] = '#94a3b8'
+        self.team_colors['Community'] = '#94a3b8'
+
+        # Optional tag prefix filter — only tags starting with this string are
+        # included in the Releases tab. Empty string / absent key = all tags.
+        self.release_tag_prefix = config.get('release_tag_prefix', '')
 
         self.data = {
             'project_name': os.path.basename(os.path.abspath(repo_path)),
@@ -97,7 +107,7 @@ class GitStats:
         return self.alias_to_canonical.get(email.lower(), self.alias_to_canonical.get(name, name))
 
     def _get_team(self, author, email):
-        return self.author_to_team.get(email.lower(), self.author_to_team.get(author, 'Unassigned'))
+        return self.author_to_team.get(email.lower(), self.author_to_team.get(author, 'Community'))
 
     def _run_git(self, args):
         return subprocess.check_output(
@@ -198,6 +208,9 @@ class GitStats:
             tags = self._run_git(['tag', '--sort=-creatordate']).splitlines()
         except subprocess.CalledProcessError:
             tags = []
+
+        if self.release_tag_prefix:
+            tags = [t for t in tags if t.startswith(self.release_tag_prefix)]
 
         for i, tag in enumerate(tags[:20]):
             tag_range = tag if i == len(tags) - 1 else f"{tags[i + 1]}..{tag}"
@@ -995,8 +1008,8 @@ def main() -> int:
     if config_path and os.path.exists(config_path):
         print(f"Using config: {config_path}")
     else:
-        print("No config file found — all authors will appear as 'Unassigned'.")
-        print("Create config.json with format: {\"teams\": {\"Team\": [\"name\", \"email\"]}, \"aliases\": {}}")
+        print("No config file found — all authors will appear as 'Community'.")
+        print('Create config.json with format: {"teams": {"Team": {"color": "#3b82f6", "members": ["name", "email"]}}, "aliases": {}}')
 
     stats = GitStats(args.source, config_path)
     stats.collect()
