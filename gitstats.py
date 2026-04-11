@@ -26,7 +26,8 @@ class GitStats:
 
     Config file (./config.json or custom path) format:
     {
-      "tag_prefix": "v",
+      "release_tag_prefix": "v",
+      "max_release_tags": 50,
       "teams": {
         "Team Name": {
           "color": "#3b82f6",
@@ -79,6 +80,9 @@ class GitStats:
         # Optional tag prefix filter — only tags starting with this string are
         # included in the Releases tab. Empty string / absent key = all tags.
         self.release_tag_prefix = config.get('release_tag_prefix', '')
+
+        # Maximum number of tags to display in the Releases tab (default: 20).
+        self.max_release_tags = int(config.get('max_release_tags', 20))
 
         self.data = {
             'project_name': os.path.basename(os.path.abspath(repo_path)),
@@ -212,7 +216,7 @@ class GitStats:
         if self.release_tag_prefix:
             tags = [t for t in tags if t.startswith(self.release_tag_prefix)]
 
-        for i, tag in enumerate(tags[:20]):
+        for i, tag in enumerate(tags[:self.max_release_tags]):
             tag_range = tag if i == len(tags) - 1 else f"{tags[i + 1]}..{tag}"
             try:
                 tag_log = self._run_git(['log', tag_range, '--pretty=format:%an|%ae'])
