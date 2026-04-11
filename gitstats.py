@@ -224,7 +224,8 @@ class GitStats:
         self.data = {
             'project_name': os.path.basename(os.path.abspath(repo_path)),
             'analysis_date': datetime.datetime.now().strftime("%Y-%m-%d %H:%M"),
-            'general': {'total_commits': 0, 'total_files': 0, 'total_lines': 0, 'age_days': 0},
+            'general': {'total_commits': 0, 'total_files': 0, 'total_lines': 0,
+                        'total_repo_lines': 0, 'age_days': 0},
             'activity': {'hour': Counter(), 'weekday': Counter(), 'heatmap': Counter()},
             'authors': {},   # canonical name → {commits, add, del, first, last, team, impact}
             'teams': {},     # team name      → {commits, add, del, members, first, last, impact}
@@ -460,14 +461,23 @@ class GitStats:
         # git ls-files lists every tracked file. We use it to:
         #   a) count files by extension for the general stats
         #   b) find component roots (dirs that contain a marker file)
+        #   c) count current lines of code (binary newline count — fast, works for
+        #      all encodings; binary files contribute negligibly to the total)
         ls_files = self._run_git(['ls-files']).splitlines()
         self.data['general']['total_files'] = len(ls_files)
         component_dirs_set = set()
+        _repo_lines = 0
         for f in ls_files:
             ext = os.path.splitext(f)[1].lower() or 'source'
             self.data['files'][ext] += 1
             if os.path.basename(f) in self.component_markers:
                 component_dirs_set.add(os.path.dirname(f))
+            try:
+                with open(os.path.join(self.repo_path, f), 'rb') as _fh:
+                    _repo_lines += _fh.read().count(b'\n')
+            except OSError:
+                pass
+        self.data['general']['total_repo_lines'] = _repo_lines
         # Longest paths first so _get_component() matches the deepest ancestor.
         main_component_dirs = sorted(component_dirs_set, key=len, reverse=True)
 
@@ -887,7 +897,8 @@ class GitStats:
         tlines = self.data['general']['total_lines']
         nauth  = len(self.data['authors'])
         nteams = len(self.data['teams'])
-        age_days = self.data['general'].get('age_days', 0)
+        age_days   = self.data['general'].get('age_days', 0)
+        repo_lines = self.data['general'].get('total_repo_lines', 0)
 
         iw_commits = self.IMPACT_W_COMMITS
         iw_lines   = self.IMPACT_W_LINES
@@ -1130,8 +1141,8 @@ class GitStats:
                     <div class="text-xs text-slate-400 mt-1">Since {first_commit_date}</div>
                 </div>
                 <div class="text-center p-4 bg-slate-50 rounded-2xl">
-                    <div class="text-3xl font-black text-blue-600">{tlines:,}</div>
-                    <div class="text-[10px] uppercase font-bold text-slate-400 mt-0.5 tracking-widest">Net Lines</div>
+                    <div class="text-3xl font-black text-blue-600">{repo_lines:,}</div>
+                    <div class="text-[10px] uppercase font-bold text-slate-400 mt-0.5 tracking-widest">Lines of Code</div>
                     <div class="text-xs text-slate-400 mt-1">Main repository</div>
                 </div>
                 <div class="text-center p-4 bg-slate-50 rounded-2xl">

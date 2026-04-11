@@ -716,3 +716,206 @@ class TestComponentMarkers:
         assert 'id="componentChart-main"' in html
         # The labels array for the main repo chart must be empty.
         assert '"labels": []' in html or '"labels":[]' in html
+
+
+# ---------------------------------------------------------------------------
+# Summary tab
+# ---------------------------------------------------------------------------
+
+class TestSummaryTab:
+    """Verify the Summary tab data and HTML.
+
+    Covers:
+      - collect() stores first/last commit timestamps and true tag count before cap.
+      - __init__ reads summary_velocity_days and bus_factor_threshold from config,
+        with correct defaults.
+      - Bus factor computation: monotonicity w.r.t. threshold and the core invariant
+        (top N contributors cover the threshold; top N-1 do not).
+      - generate_report() renders the Summary tab, removes the Activity tab, produces
+        velocity cards matching the configured windows, and retains the punchcard.
+    """
+
+    # ── Class-scoped HTML fixture ────────────────────────────────────────────
+
+    @pytest.fixture(scope='class')
+    def std_html(self, std_gs, tmp_path_factory):
+        """Generate the standard-config report HTML once for all HTML-checking tests."""
+        tmp = str(tmp_path_factory.mktemp('summary_std_html'))
+        out = os.path.join(tmp, 'report.html')
+        std_gs.generate_report(os.path.join(PROJECT_ROOT, 'externals'), out)
+        return open(out).read()
+
+    # ── Data collected by collect() ──────────────────────────────────────────
+
+    def test_first_commit_ts_stored(self, std_gs):
+        """collect() must store a positive first_commit_ts in general."""
+        assert std_gs.data['general']['first_commit_ts'] > 0
+
+    def test_last_commit_ts_at_or_after_first(self, std_gs):
+        """last_commit_ts must be greater than or equal to first_commit_ts."""
+        g = std_gs.data['general']
+        assert g['last_commit_ts'] >= g['first_commit_ts']
+
+    def test_age_days_consistent_with_timestamps(self, std_gs):
+        """age_days must equal (last_commit_ts - first_commit_ts) // 86400."""
+        g = std_gs.data['general']
+        expected = (g['last_commit_ts'] - g['first_commit_ts']) // 86400
+        assert g['age_days'] == expected
+
+    def test_total_tags_stored_before_cap(self, repo_path, tmp_path):
+        """total_tags must reflect the true tag count before max_release_tags truncation.
+
+        make_config defaults to max_release_tags=10.  Pyodide has well over 10 tags,
+        so total_tags must be strictly greater than the displayed 5.
+        """
+        cfg = make_config(tmp_path, max_release_tags=5)
+        gs = gitstats.GitStats(repo_path, cfg)
+        gs.collect()
+        assert len(gs.data['tags']) == 5
+        assert gs.data['general']['total_tags'] > 5
+
+    def test_total_tags_no_cap_geq_shown(self, repo_path, tmp_path):
+        """With max_release_tags=0 (unlimited), total_tags must be >= len(data['tags']).
+
+        total_tags counts every raw git tag before filtering; data['tags'] only
+        contains tags whose commit range has at least one commit, so the raw count
+        may be slightly higher (tags with no commits in their range are excluded).
+        """
+        cfg = make_config(tmp_path, max_release_tags=0)
+        gs = gitstats.GitStats(repo_path, cfg)
+        gs.collect()
+        assert gs.data['general']['total_tags'] >= len(gs.data['tags'])
+
+    # ── Config defaults and overrides ────────────────────────────────────────
+
+    def test_default_velocity_days(self, repo_path, tmp_path):
+        """summary_velocity_days must default to [30, 90] when absent from config."""
+        cfg = make_config(tmp_path)
+        gs = gitstats.GitStats(repo_path, cfg)
+        assert gs.summary_velocity_days == [30, 90]
+
+    def test_default_bus_factor_threshold(self, repo_path, tmp_path):
+        """bus_factor_threshold must default to 0.5 when absent from config."""
+        cfg = make_config(tmp_path)
+        gs = gitstats.GitStats(repo_path, cfg)
+        assert gs.bus_factor_threshold == 0.5
+
+    def test_custom_velocity_days_from_config(self, repo_path, tmp_path):
+        """summary_velocity_days in config must override the default list."""
+        cfg = make_config(tmp_path, summary_velocity_days=[7, 365])
+        gs = gitstats.GitStats(repo_path, cfg)
+        assert gs.summary_velocity_days == [7, 365]
+
+    def test_custom_bus_factor_threshold_from_config(self, repo_path, tmp_path):
+        """bus_factor_threshold in config must override the default value."""
+        cfg = make_config(tmp_path, bus_factor_threshold=0.8)
+        gs = gitstats.GitStats(repo_path, cfg)
+        assert gs.bus_factor_threshold == 0.8
+
+    # ── Bus factor computation ───────────────────────────────────────────────
+
+    @staticmethod
+    def _compute_bus_factor(gs, threshold):
+        """Return the bus factor count for a collected GitStats instance."""
+        sorted_a = sorted(
+            gs.data['authors'].items(), key=lambda x: x[1]['commits'], reverse=True
+        )
+        total = sum(a['commits'] for _, a in sorted_a) or 1
+        cutoff = total * threshold
+        running = 0
+        for i, (_, a) in enumerate(sorted_a, 1):
+            running += a['commits']
+            if running >= cutoff:
+                return i
+        return len(sorted_a)
+
+    def test_bus_factor_invariant(self, std_gs):
+        """Top N bus-factor contributors must reach the 50% threshold; top N-1 must not."""
+        threshold = 0.5
+        sorted_a = sorted(
+            std_gs.data['authors'].items(), key=lambda x: x[1]['commits'], reverse=True
+        )
+        total = sum(a['commits'] for _, a in sorted_a)
+        cutoff = total * threshold
+        n = self._compute_bus_factor(std_gs, threshold)
+
+        top_n_commits = sum(a['commits'] for _, a in sorted_a[:n])
+        assert top_n_commits >= cutoff, "Top N contributors must reach the threshold"
+
+        if n > 1:
+            top_n_minus_1 = sum(a['commits'] for _, a in sorted_a[:n - 1])
+            assert top_n_minus_1 < cutoff, "Top N-1 contributors must not reach the threshold"
+
+    def test_bus_factor_monotone_with_threshold(self, std_gs):
+        """A lower threshold requires no more contributors than a higher one."""
+        bf_10 = self._compute_bus_factor(std_gs, 0.1)
+        bf_50 = self._compute_bus_factor(std_gs, 0.5)
+        bf_90 = self._compute_bus_factor(std_gs, 0.9)
+        assert bf_10 <= bf_50 <= bf_90
+
+    def test_bus_factor_top_author_exceeds_10_pct(self, std_gs):
+        """Hood Chatham holds ~34.7% of commits, so threshold=0.1 yields bus factor 1."""
+        sorted_a = sorted(
+            std_gs.data['authors'].items(), key=lambda x: x[1]['commits'], reverse=True
+        )
+        total = sum(a['commits'] for _, a in sorted_a)
+        top_share = sorted_a[0][1]['commits'] / total
+        # Top author alone exceeds 10%, so bus factor at 0.1 must be exactly 1.
+        assert top_share >= 0.1
+        assert self._compute_bus_factor(std_gs, 0.1) == 1
+
+    # ── HTML output ──────────────────────────────────────────────────────────
+
+    def test_summary_tab_present(self, std_html):
+        """The Summary tab div must be present in the generated HTML."""
+        assert 'id="tab-summary"' in std_html
+
+    def test_activity_tab_removed(self, std_html):
+        """The old Activity tab div must not appear in the generated HTML."""
+        assert 'id="tab-activity"' not in std_html
+
+    def test_summary_nav_button_present(self, std_html):
+        """The nav bar must use showTab('summary') and not showTab('activity')."""
+        assert "showTab('summary'" in std_html
+        assert "showTab('activity'" not in std_html
+
+    def test_punchcard_canvas_retained_in_summary(self, std_html):
+        """The hourChart canvas must be present — punchcard is kept in the Summary tab."""
+        assert 'id="hourChart"' in std_html
+
+    def test_heatmap_and_loc_chart_removed(self, std_html):
+        """The heatmap div and LOC history canvas must no longer appear."""
+        assert 'id="heatmap"' not in std_html
+        assert 'id="locChart"' not in std_html
+
+    def test_bus_factor_section_in_html(self, std_html):
+        """The Bus Factor heading must appear in the Summary tab."""
+        assert 'Bus Factor' in std_html
+
+    def test_velocity_cards_match_default_config(self, std_html):
+        """Default velocity config [30, 90] must produce 'Last 30 Days' and 'Last 90 Days'."""
+        assert 'Last 30 Days' in std_html
+        assert 'Last 90 Days' in std_html
+
+    def test_custom_velocity_days_produce_matching_labels(self, repo_path, tmp_path_factory):
+        """Custom summary_velocity_days must produce exactly the configured day-window labels."""
+        tmp = str(tmp_path_factory.mktemp('vel_custom_html'))
+        cfg = make_config(tmp, summary_velocity_days=[7, 180])
+        out = os.path.join(tmp, 'report.html')
+        gs = gitstats.GitStats(repo_path, cfg)
+        gs.collect()
+        gs.generate_report(os.path.join(PROJECT_ROOT, 'externals'), out)
+        html = open(out).read()
+
+        assert 'Last 7 Days' in html
+        assert 'Last 180 Days' in html
+        # The default 30-day and 90-day labels must not appear.
+        assert 'Last 30 Days' not in html
+        assert 'Last 90 Days' not in html
+
+    def test_summary_stats_tiles_present(self, std_html):
+        """The four summary stat tiles (Days Old, Net Lines, Commits / Week, Releases) must appear."""
+        assert 'Days Old' in std_html
+        assert 'Net Lines' in std_html
+        assert 'Commits / Week' in std_html
+        assert 'Releases' in std_html
