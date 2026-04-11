@@ -89,8 +89,26 @@ class GitStats:
     IMPACT_W_LINES   = 40   # total lines changed (additions + deletions)
     IMPACT_W_TENURE  = 20   # active tenure in days (first commit → last commit)
 
-    def __init__(self, repo_path, config_file=None):
+    # ── Component marker filenames ───────────────────────────────────────────────
+    # A directory that directly contains one of these files is treated as a
+    # component root for the Components tab churn chart.  This set is the
+    # built-in default; it can be replaced entirely per-run via the
+    # "component_markers" key in config.json (see README for details).
+    #
+    # Tweak the default or use the config key to match the conventions of the
+    # repos you analyse:
+    #   - Add marker files specific to your build system (e.g. 'CMakeLists.txt',
+    #     'BUILD', 'BUCK', 'Cargo.toml') to pick up more component boundaries.
+    #   - Remove entries that are too common in your repo (e.g. 'Makefile' in a
+    #     repo where every subdirectory has one) to avoid over-fragmenting the chart.
+    COMPONENT_MARKERS = {'make.py', 'pyproject.toml', 'setup.py', 'Makefile', 'meta.yaml'}
+
+    def __init__(self, repo_path, config_file=None, support_paths=None):
         self.repo_path = repo_path
+        # Additional git repositories whose commit histories contribute to the
+        # combined author/team/activity stats.  Components, LOC history, file
+        # counts, and release tags are always taken from the main repo only.
+        self.support_paths = list(support_paths or [])
         config = self._load_config(config_file)
 
         # Build alias lookup: any name/email variant → canonical author name.
@@ -160,6 +178,12 @@ class GitStats:
         # Set to 0 in config to display all matching tags with no limit.
         self.max_release_tags = int(config.get('max_release_tags', 20))
 
+        # Component marker filenames — overridable via "component_markers" in config.
+        # When present, the config list replaces the class default entirely, giving
+        # full control over which directories are detected as component boundaries.
+        cfg_markers = config.get('component_markers')
+        self.component_markers = set(cfg_markers) if cfg_markers is not None else self.COMPONENT_MARKERS
+
         # ── Impact score noise-reduction options ──────────────────────────────
         # These filter out commits that inflate the lines metric without
         # representing real work (reformats, mass moves, revert pairs).
@@ -194,9 +218,12 @@ class GitStats:
             'component_contributions': defaultdict(lambda: Counter()),  # component path → {author: commit_count}
             'team_components': defaultdict(lambda: Counter()),           # team name      → {component path: churn lines}
             'files': Counter(),      # file extension → count
-            'components': Counter(), # component path → total churn lines
+            'components': Counter(), # main repo: component path → total churn lines
             'tags': [],              # list of release dicts built in step 3 of collect()
             'loc_history': [],       # running net LOC per file-change event, oldest-first after reversal
+            # One entry per support repo, populated during collect() phase 2b.
+            # Each entry: {name, components, component_contributions, team_components}
+            'support_repos': [],
         }
 
     # ------------------------------------------------------------------ helpers
@@ -208,18 +235,18 @@ class GitStats:
         with open(path) as f:
             return json.load(f)
 
-    def _get_component(self, path):
+    def _get_component(self, path, dirs):
         """Map a repo-relative file path to its component directory.
 
         A component is any directory that directly contains make.py,
-        pyproject.toml, or setup.py (discovered during collect()).
-        self._component_dirs is pre-sorted longest-first so the most
-        specific (deepest) ancestor wins when directories are nested.
+        pyproject.toml, setup.py, or Makefile (discovered during collect()).
+        `dirs` must be pre-sorted longest-first so the most specific (deepest)
+        ancestor wins when directories are nested.
 
         Returns the component directory string, '(root)' for top-level
         marker files, or None if the file is not inside any component.
         """
-        for comp in self._component_dirs:
+        for comp in dirs:
             if comp == '':
                 # Marker file is at the repo root (dirname of 'pyproject.toml' == '')
                 return '(root)'
@@ -251,61 +278,55 @@ class GitStats:
                     return team
         return 'Community'
 
-    def _run_git(self, args):
-        """Run a git subcommand inside self.repo_path and return its stdout as a string.
+    def _run_git(self, args, repo=None):
+        """Run a git subcommand and return its stdout as a string.
 
+        Runs inside `repo` when provided, otherwise inside self.repo_path.
         stderr is suppressed. Raises subprocess.CalledProcessError on non-zero exit.
         """
         return subprocess.check_output(
-            ['git', '-C', self.repo_path] + args,
+            ['git', '-C', repo or self.repo_path] + args,
             stderr=subprocess.DEVNULL
         ).decode('utf-8', 'ignore')
 
     # ------------------------------------------------------------------ collect
 
-    def collect(self):
-        """Populate self.data by running git commands against the repository.
+    def _collect_commits(self, repo_path, component_dirs, components,
+                         component_contributions, team_components, record_loc=False):
+        """Process git log --numstat for one repository.
 
-        Three phases:
-          1. File inventory + component discovery (git ls-files)
-          2. Full commit history with per-file line stats (git log --numstat)
-          3. Release tag breakdown (git tag + git log per tag range)
+        Reads every commit in `repo_path` and accumulates data into the shared
+        author/team/activity structures in self.data.  Per-repo component stats
+        are written into the caller-supplied Counter/defaultdict arguments so
+        the main repo and each support repo maintain separate component records.
 
-        Must be called before generate_report().
+        Args:
+            repo_path:               Path to the git repository to analyse.
+            component_dirs:          Sorted (longest-first) list of component
+                                     root directories for this repo, as returned
+                                     by the Phase-1 ls-files scan.
+            components:              Counter()  — component path → churn lines.
+            component_contributions: defaultdict(Counter) — component → {author: n}.
+            team_components:         defaultdict(Counter) — team → {component: churn}.
+            record_loc:              When True, append running net LOC to
+                                     self.data['loc_history'] (main repo only).
+
+        Returns:
+            (all_ts, running_loc) — list of commit timestamps and the final net
+            LOC value, used by the caller to set age_days and total_lines on the
+            main repo.
         """
-        print(f"Analyzing {self.data['project_name']}...")
-
-        # ── Phase 1: file inventory + component discovery ─────────────────────
-        # git ls-files lists every tracked file. We use it to:
-        #   a) count files by extension for the general stats
-        #   b) find component roots (dirs that contain a marker file)
-        ls_files = self._run_git(['ls-files']).splitlines()
-        self.data['general']['total_files'] = len(ls_files)
-        component_markers = {'make.py', 'pyproject.toml', 'setup.py', 'Makefile'}
-        component_dirs = set()
-        for f in ls_files:
-            ext = os.path.splitext(f)[1].lower() or 'source'
-            self.data['files'][ext] += 1
-            if os.path.basename(f) in component_markers:
-                # The directory containing the marker file is the component root.
-                component_dirs.add(os.path.dirname(f))
-        # Longest paths first so _get_component() matches the deepest ancestor.
-        self._component_dirs = sorted(component_dirs, key=len, reverse=True)
-
-        # ── Phase 2: commit history ───────────────────────────────────────────
-        # --numstat emits one "COMMIT|..." header per commit followed by
-        # tab-separated (added, deleted, filepath) lines for each changed file.
-        log_data = self._run_git(['log', '--numstat', '--pretty=format:COMMIT|%at|%an|%ae'])
+        log_data = self._run_git(
+            ['log', '--numstat', '--pretty=format:COMMIT|%at|%an|%ae'], repo_path
+        )
 
         # State carried across lines within the same commit
         current_author = current_team = None
-        running_loc = 0   # net lines added across all commits so far (used for LOC chart)
-        all_ts = []       # all commit timestamps, used to compute repo age
-        ts = 0
+        running_loc = 0
+        all_ts = []
 
-        # Per-commit line accumulators for the current commit being processed.
-        # Flushed into commit_lines[] on each new COMMIT header (and after the loop).
-        # _compute_impact() uses these lists to filter out meaningless mass changes.
+        # Per-commit line accumulators flushed on each new COMMIT header and
+        # after the loop.  _compute_impact() uses these to filter out noise.
         current_commit_ts = 0
         current_commit_adds = 0
         current_commit_dels = 0
@@ -313,13 +334,10 @@ class GitStats:
         for line in log_data.splitlines():
             if line.startswith('COMMIT|'):
                 # ── Commit header ─────────────────────────────────────────────
-                # Before moving on, flush the previous commit's accumulated line
-                # counts into that author's commit_lines list so _compute_impact()
-                # can apply per-commit noise filtering later.
+                # Flush the previous commit's accumulated line counts.
+                # Store the team alongside the line stats so _compute_impact()
+                # can credit effective lines to the right team per-commit.
                 if current_author is not None:
-                    # Store the team alongside the line stats so _compute_impact()
-                    # can roll effective lines to the right team per-commit, not just
-                    # to whichever team the author belongs to at their last commit.
                     self.data['authors'][current_author]['commit_lines'].append(
                         (current_commit_ts, current_commit_adds, current_commit_dels, current_team))
                 current_commit_adds = 0
@@ -330,13 +348,13 @@ class GitStats:
                 current_commit_ts = ts
                 dt = datetime.datetime.fromtimestamp(ts)
                 author = self._get_author(name, email)
-                team = self._get_team(author, email, ts)  # pass ts for time-ranged membership
+                team = self._get_team(author, email, ts)
                 all_ts.append(ts)
                 current_author = author
                 current_team = team
 
                 # Initialize author record on first encounter.
-                # commit_lines stores (timestamp, adds, dels) per commit —
+                # commit_lines stores (ts, adds, dels, team) per commit —
                 # used by _compute_impact() to filter noise before scoring.
                 if author not in self.data['authors']:
                     self.data['authors'][author] = {
@@ -381,23 +399,22 @@ class GitStats:
                     self.data['teams'][current_team]['add'] += a
                     self.data['teams'][current_team]['del'] += d
 
-                    # Accumulate this file's lines into the current commit bucket
-                    # so they can be flushed as a single (ts, adds, dels) entry.
+                    # Accumulate into the current commit bucket for impact scoring.
                     current_commit_adds += a
                     current_commit_dels += d
 
-                    # Track running net LOC for the LOC history chart.
-                    # We append after every file change, then reverse the list
-                    # at the end so it runs oldest → newest.
-                    running_loc += (a - d)
-                    self.data['loc_history'].append(running_loc)
+                    if record_loc:
+                        # Track running net LOC for the LOC history chart.
+                        # Reversed to chronological order in collect() after the loop.
+                        running_loc += (a - d)
+                        self.data['loc_history'].append(running_loc)
 
-                    # Attribute churn to the file's component (if any)
-                    component = self._get_component(path)
+                    # Attribute churn to this repo's component (if any)
+                    component = self._get_component(path, component_dirs)
                     if component is not None:
-                        self.data['components'][component] += (a + d)
-                        self.data['component_contributions'][component][current_author] += 1
-                        self.data['team_components'][current_team][component] += (a + d)
+                        components[component] += (a + d)
+                        component_contributions[component][current_author] += 1
+                        team_components[current_team][component] += (a + d)
                 except (ValueError, IndexError):
                     continue
 
@@ -407,21 +424,103 @@ class GitStats:
             self.data['authors'][current_author]['commit_lines'].append(
                 (current_commit_ts, current_commit_adds, current_commit_dels, current_team))
 
-        # Derive repo age from the span between oldest and newest commit
-        if all_ts:
-            self.data['general']['age_days'] = (max(all_ts) - min(all_ts)) // 86400
-        self.data['general']['total_lines'] = running_loc
+        return all_ts, running_loc
 
-        # git log walks newest-first, so reverse to get chronological order
+    def collect(self):
+        """Populate self.data by running git commands against all repositories.
+
+        Three phases:
+          1. Main repo file inventory + component discovery (git ls-files).
+             File counts, LOC history, age, and release tags are always taken
+             from the main repo only.
+          2. Commit history for the main repo then each support repo in order
+             (git log --numstat).  Author, team, and activity stats accumulate
+             across all repos; component data is tracked separately per repo so
+             each gets its own chart card in the output.
+          3. Release tag breakdown from the main repo only (git tag + git log).
+
+        Must be called before generate_report().
+        """
+        print(f"Analyzing {self.data['project_name']}...")
+
+        # ── Phase 1: main repo file inventory + component discovery ──────────
+        # git ls-files lists every tracked file. We use it to:
+        #   a) count files by extension for the general stats
+        #   b) find component roots (dirs that contain a marker file)
+        ls_files = self._run_git(['ls-files']).splitlines()
+        self.data['general']['total_files'] = len(ls_files)
+        component_dirs_set = set()
+        for f in ls_files:
+            ext = os.path.splitext(f)[1].lower() or 'source'
+            self.data['files'][ext] += 1
+            if os.path.basename(f) in self.component_markers:
+                component_dirs_set.add(os.path.dirname(f))
+        # Longest paths first so _get_component() matches the deepest ancestor.
+        main_component_dirs = sorted(component_dirs_set, key=len, reverse=True)
+
+        # ── Phase 2a: main repo commit history ───────────────────────────────
+        # --numstat emits one "COMMIT|..." header per commit followed by
+        # tab-separated (added, deleted, filepath) lines for each changed file.
+        # record_loc=True so the LOC history chart is populated for the main repo.
+        main_components      = Counter()
+        main_comp_contrib    = defaultdict(lambda: Counter())
+        main_team_comps      = defaultdict(lambda: Counter())
+
+        main_all_ts, main_running_loc = self._collect_commits(
+            self.repo_path, main_component_dirs,
+            main_components, main_comp_contrib, main_team_comps,
+            record_loc=True,
+        )
+
+        self.data['components']              = main_components
+        self.data['component_contributions'] = main_comp_contrib
+        self.data['team_components']         = main_team_comps
+
+        # Age and total LOC derive from the main repo only.
+        if main_all_ts:
+            self.data['general']['age_days'] = (max(main_all_ts) - min(main_all_ts)) // 86400
+        self.data['general']['total_lines'] = main_running_loc
+
+        # git log walks newest-first, so reverse to get chronological order.
         self.data['loc_history'].reverse()
-
         # For large repos, decimating to ≤2000 points keeps the chart responsive
         # without meaningfully reducing visual fidelity.
         if len(self.data['loc_history']) > 2000:
             step = len(self.data['loc_history']) // 2000
             self.data['loc_history'] = self.data['loc_history'][::step]
 
-        # ── Phase 3: release tag breakdown ───────────────────────────────────
+        # ── Phase 2b: support repo commit histories ───────────────────────────
+        # Author/team/activity stats accumulate; each support repo gets its own
+        # component record appended to self.data['support_repos'].
+        for support_path in self.support_paths:
+            support_name = os.path.basename(os.path.abspath(support_path))
+            print(f"  + {support_name} (support repository)...")
+
+            support_ls = self._run_git(['ls-files'], support_path).splitlines()
+            sup_dirs_set = set()
+            for f in support_ls:
+                if os.path.basename(f) in self.component_markers:
+                    sup_dirs_set.add(os.path.dirname(f))
+            support_component_dirs = sorted(sup_dirs_set, key=len, reverse=True)
+
+            sup_components   = Counter()
+            sup_comp_contrib = defaultdict(lambda: Counter())
+            sup_team_comps   = defaultdict(lambda: Counter())
+
+            self._collect_commits(
+                support_path, support_component_dirs,
+                sup_components, sup_comp_contrib, sup_team_comps,
+                record_loc=False,
+            )
+
+            self.data['support_repos'].append({
+                'name': support_name,
+                'components': sup_components,
+                'component_contributions': sup_comp_contrib,
+                'team_components': sup_team_comps,
+            })
+
+        # ── Phase 3: release tag breakdown (main repo only) ──────────────────
         # Tags are sorted newest-first. For each tag we attribute the commits
         # between it and the previous tag (tag_range) to authors and teams.
         # The oldest tag uses just its name as the range (all commits up to it).
@@ -696,18 +795,81 @@ class GitStats:
         authors_json    = json.dumps(self.data['authors'])
         teams_json      = json.dumps(self.data['teams'])
         team_colors_json = json.dumps(self.team_colors)
-        # component_contributions: {path: {author: commit_count}} — used by the
-        # Components tab click-to-filter feature in the Authors tab.
-        component_json      = json.dumps({k: dict(v) for k, v in self.data['component_contributions'].items()})
         # team_components: top 8 components per team — used by the Teams tab cards.
+        # Drawn from the main repo only; support repo component data appears in
+        # the separate per-repo cards on the Components tab.
         team_component_json = json.dumps({k: dict(v.most_common(8)) for k, v in self.data['team_components'].items()})
         heatmap_json        = json.dumps(dict(self.data['activity']['heatmap']))
         loc_json            = json.dumps(self.data['loc_history'])
         hour_data           = json.dumps([self.data['activity']['hour'][i] for i in range(24)])
 
-        sorted_components      = self.data['components'].most_common(30)
-        component_labels       = json.dumps([c[0] for c in sorted_components])
-        component_values       = json.dumps([c[1] for c in sorted_components])
+        # ── Per-repo component chart data ─────────────────────────────────────
+        # repo_charts: one entry per repo (main first, then support repos).
+        # Each entry has id, name, labels (component paths), and values (churn).
+        # Support repo component paths are prefixed as "reponame:path" in the
+        # labels list to avoid collision with main repo paths in componentData.
+        repo_charts = []
+        main_top = self.data['components'].most_common(30)
+        repo_charts.append({
+            'id': 'main',
+            'name': self.data['project_name'],
+            'labels': [c[0] for c in main_top],
+            'values': [c[1] for c in main_top],
+        })
+        for i, sr in enumerate(self.data['support_repos']):
+            sr_top = sorted(sr['components'].items(), key=lambda x: x[1], reverse=True)[:30]
+            repo_charts.append({
+                'id': f'support-{i}',
+                'name': sr['name'],
+                'labels': [f"{sr['name']}:{c[0]}" for c in sr_top],
+                'values': [c[1] for c in sr_top],
+            })
+        repo_charts_json = json.dumps(repo_charts)
+
+        # Unified component contributions for click-to-filter in the Authors tab.
+        # Main repo paths are bare; support repo paths carry the "reponame:" prefix.
+        all_comp_contrib = {k: dict(v) for k, v in self.data['component_contributions'].items()}
+        for sr in self.data['support_repos']:
+            prefix = sr['name']
+            for path, authors in sr['component_contributions'].items():
+                all_comp_contrib[f'{prefix}:{path}'] = dict(authors)
+        component_json = json.dumps(all_comp_contrib)
+
+        # ── Per-repo component chart cards HTML ───────────────────────────────
+        # Main repo card first, then one card per support repo.
+        has_support = bool(self.support_paths)
+        component_cards = []
+        for rc in repo_charts:
+            cid = rc['id']
+            is_main = cid == 'main'
+            margin_cls = '' if is_main else ' mt-6'
+            if has_support and is_main:
+                tag_html = (' <span class="text-xs font-bold text-slate-400 '
+                            'uppercase tracking-widest ml-2">Main Repository</span>')
+            elif not is_main:
+                tag_html = (' <span class="text-xs font-bold text-slate-400 '
+                            'uppercase tracking-widest ml-2">Support Repository</span>')
+            else:
+                tag_html = ''
+            component_cards.append(
+                f'        <div class="card{margin_cls}" id="componentChartCard-{cid}">\n'
+                f'            <div class="mb-6">\n'
+                f'                <h3 class="text-xl font-black">'
+                f'Component Churn \u2014 {rc["name"]}{tag_html}</h3>\n'
+                f'                <p class="text-sm text-slate-400 font-medium mt-1">'
+                f'Click any bar to filter contributors by component.</p>\n'
+                f'            </div>\n'
+                f'            <canvas id="componentChart-{cid}"></canvas>\n'
+                f'        </div>'
+            )
+        component_cards_html = '\n'.join(component_cards)
+
+        # LOC History card subtitle — shown when support repos are configured
+        # to make clear the chart covers the main repository only.
+        loc_note_html = (
+            '<p class="text-xs text-slate-400 font-medium mb-2">Main repository only.</p>'
+            if self.support_paths else ''
+        )
 
         pname  = self.data['project_name']
         adate  = self.data['analysis_date']
@@ -813,7 +975,7 @@ class GitStats:
             </div>
         </div>
         <div class="grid grid-cols-1 md:grid-cols-2 gap-10">
-            <div class="card" style="height:400px"><h3 class="font-bold mb-4">LOC History</h3><canvas id="locChart"></canvas></div>
+            <div class="card" style="height:400px"><h3 class="font-bold mb-2">LOC History</h3>{loc_note_html}<canvas id="locChart"></canvas></div>
             <div class="card" style="height:400px"><h3 class="font-bold mb-4">Hourly Punchcard</h3><canvas id="hourChart"></canvas></div>
         </div>
     </div>
@@ -926,13 +1088,7 @@ class GitStats:
 
     <!-- ═══ COMPONENTS ════════════════════════════════════════════════════════ -->
     <div id="tab-components" class="tab-content hidden">
-        <div class="card" id="componentChartCard">
-            <div class="mb-6">
-                <h3 class="text-xl font-black">Component Churn Analysis</h3>
-                <p class="text-sm text-slate-400 font-medium mt-1">Click any bar to filter contributors by component.</p>
-            </div>
-            <canvas id="componentChart"></canvas>
-        </div>
+{component_cards_html}
     </div>
 
 </div><!-- /max-w-7xl -->
@@ -947,12 +1103,20 @@ const componentData     = {component_json};
 const teamComponentData = {team_component_json};
 const totalCommits   = {tcom};
 
-// Pre-compute how many component paths share each short (last-segment) name.
-// Used by compLabel() to decide whether to show the short name or the full path.
+// Per-repo chart data: one entry per repo (main first, then support repos).
+// Labels for support repos carry a "reponame:path" prefix to avoid collision.
+const repoCharts = {repo_charts_json};
+
+// Pre-compute how many component paths share each short (last-segment) name
+// across all repos, so compLabel() can decide whether to abbreviate.
 const _compShortCount = {{}};
-Object.keys(componentData).forEach(k => {{
-    const s = k.includes('/') ? k.split('/').pop() : k;
-    _compShortCount[s] = (_compShortCount[s] || 0) + 1;
+repoCharts.forEach(repo => {{
+    repo.labels.forEach(k => {{
+        const colon = k.indexOf(':');
+        const p = colon >= 0 ? k.slice(colon + 1) : k;
+        const s = p.includes('/') ? p.split('/').pop() : p;
+        _compShortCount[s] = (_compShortCount[s] || 0) + 1;
+    }});
 }});
 
 let currentSortKey   = 'impact';
@@ -989,11 +1153,14 @@ function teamColor(team) {{ return teamColors[team] || '#94a3b8'; }}
 function fmt(n) {{ return Number(n).toLocaleString(); }}
 
 // Return a display label for a component path.
+// Support repo paths carry a "reponame:path" prefix which is stripped first.
 // Uses only the last path segment unless that segment is ambiguous (shared by
-// multiple components), in which case the full path is returned instead.
+// multiple components across all repos), in which case the full path is returned.
 function compLabel(path) {{
-    const short = path.includes('/') ? path.split('/').pop() : path;
-    return _compShortCount[short] > 1 ? path : short;
+    const colon = path.indexOf(':');
+    const p = colon >= 0 ? path.slice(colon + 1) : path;
+    const short = p.includes('/') ? p.split('/').pop() : p;
+    return _compShortCount[short] > 1 ? p : short;
 }}
 
 function impactBar(score, color) {{
@@ -1043,7 +1210,9 @@ function renderAuthorTable(filter, filterType) {{
         const filtered = componentData[currentFilter] || {{}};
         authors      = authors.filter(([n]) => filtered[n]);
         displayTotal = Object.values(filtered).reduce((a,b) => a+b, 0) || 1;
-        title.innerText = `Component: ${{compLabel(currentFilter)}}`;
+        const colon  = currentFilter.indexOf(':');
+        const repoTag = colon >= 0 ? ` [${{currentFilter.slice(0, colon)}}]` : '';
+        title.innerText = `Component: ${{compLabel(currentFilter)}}${{repoTag}}`;
         resetBtn.classList.remove('hidden');
     }} else if (currentFilter && currentFilterType === 'team') {{
         authors      = authors.filter(([,d]) => d.team === currentFilter);
@@ -1311,27 +1480,34 @@ function filterByTeam(team) {{
 }}
 
 function initComponentChart() {{
-    const componentKeys = {component_labels};
-    const canvas = document.getElementById('componentChart');
-    const chartHeight = Math.max(300, componentKeys.length * 36 + 80);
-    canvas.style.height = chartHeight + 'px';
-    document.getElementById('componentChartCard').style.height = (chartHeight + 120) + 'px';
-    const dChart = new Chart(canvas, {{
-        type: 'bar',
-        data: {{
-            labels: componentKeys.map(compLabel),
-            datasets: [{{ label:'Churn', data:{component_values}, backgroundColor:'#3b82f6', borderRadius:8, barThickness:16 }}],
-        }},
-        options: {{
-            responsive: true, maintainAspectRatio: false, indexAxis: 'y',
-            plugins: {{ legend: {{ display: false }} }},
-            onClick: (e, elements) => {{
-                if (!elements.length) return;
-                const component = componentKeys[elements[0].index];
-                renderAuthorTable(component, 'component');
-                navToAuthors();
+    // Initialise one Chart.js bar chart per repo (main first, then support repos).
+    repoCharts.forEach(repo => {{
+        if (!repo.labels.length) return;
+        const canvas = document.getElementById('componentChart-' + repo.id);
+        if (!canvas) return;
+        const chartHeight = Math.max(300, repo.labels.length * 36 + 80);
+        canvas.style.height = chartHeight + 'px';
+        const card = document.getElementById('componentChartCard-' + repo.id);
+        if (card) card.style.height = (chartHeight + 120) + 'px';
+        new Chart(canvas, {{
+            type: 'bar',
+            data: {{
+                labels: repo.labels.map(compLabel),
+                datasets: [{{ label:'Churn', data:repo.values, backgroundColor:'#3b82f6', borderRadius:8, barThickness:16 }}],
             }},
-        }},
+            options: {{
+                responsive: true, maintainAspectRatio: false, indexAxis: 'y',
+                plugins: {{ legend: {{ display: false }} }},
+                onClick: (e, elements) => {{
+                    if (!elements.length) return;
+                    // Use the raw label key (which carries the "reponame:" prefix
+                    // for support repos) so componentData lookup is correct.
+                    const component = repo.labels[elements[0].index];
+                    renderAuthorTable(component, 'component');
+                    navToAuthors();
+                }},
+            }},
+        }});
     }});
 }}
 
@@ -1429,7 +1605,14 @@ def main() -> int:
     parser.add_argument(
         '-externals', '--externals', default=os.path.join(os.getcwd(), 'externals'),
         help="Path to 'externals' directory containing our CSS and Javascript dependencies (default ./externals)"
-)
+    )
+    parser.add_argument(
+        '-support', '--support', action='append', default=[],
+        metavar='REPO_PATH',
+        help=("Path to an additional git repository whose commit history contributes "
+              "to the combined author/team/activity statistics. May be specified "
+              "multiple times for multiple support repositories.")
+    )
     args = parser.parse_args()
 
     if not os.path.isdir(args.source):
@@ -1440,6 +1623,11 @@ def main() -> int:
         print(f"Provided externals dependencies directory does not exist at {args.externals}")
         return 1
 
+    for sp in args.support:
+        if not os.path.isdir(sp):
+            print(f"Provided support repository directory does not exist at {sp}")
+            return 1
+
     config_path = args.config
     if config_path and os.path.exists(config_path):
         print(f"Using config: {config_path}")
@@ -1447,7 +1635,7 @@ def main() -> int:
         print("No config file found — all authors will appear as 'Community'.")
         print('Create config.json with format: {"teams": {"Team": {"color": "#3b82f6", "members": ["name", "email"]}}, "aliases": {}}')
 
-    stats = GitStats(args.source, config_path)
+    stats = GitStats(args.source, config_path, support_paths=args.support)
     stats.collect()
     stats.generate_report(args.externals, args.output)
     return 0

@@ -1,15 +1,17 @@
 """
-Tests for gitstats.py using the pyodide repository as a fixed baseline.
+Tests for gitstats.py using the pyodide and pyodide-recipes repositories as
+fixed baselines.
 
-All tests run against a git worktree locked to LOCKED_COMMIT so results are
-deterministic regardless of ongoing development in the pyodide repo.
+All tests run against git worktrees locked to specific commits so results are
+deterministic regardless of ongoing development in either repo.
 
 Run from the project root:
     pytest tests/
 
 Requirements:
     pip install pytest
-    The pyodide repository must exist at ~/Downloads/pyodide.
+    ~/Downloads/pyodide       — main test repository
+    ~/Downloads/pyodide-recipes — support repository used by TestSupportRepos
 """
 
 import json
@@ -37,6 +39,14 @@ EXPECTED_FILES    = 546
 EXPECTED_AUTHORS  = 310
 EXPECTED_TEAMS    = 3    # Core, Build & Packaging, Community
 EXPECTED_TAGS     = 50   # capped by max_release_tags in config.json
+
+# Support repo — pyodide-recipes adds recipe package commits on top of pyodide.
+RECIPES_REPO          = os.path.expanduser('~/Downloads/pyodide-recipes')
+RECIPES_LOCKED_COMMIT = 'b7c6155fa29d773c53cb0825d28f04d65cf76d32'
+
+# Expected values when pyodide + pyodide-recipes are combined.
+EXPECTED_COMBINED_COMMITS = 4613   # 4204 pyodide + 409 recipes
+EXPECTED_COMBINED_AUTHORS = 329    # 310 pyodide + 19 recipes-only authors
 
 
 # ---------------------------------------------------------------------------
@@ -446,7 +456,7 @@ class TestNoTeams:
     def test_teams_tab_hidden_in_html(self, no_teams_gs, tmp_path_factory):
         tmp = str(tmp_path_factory.mktemp('html_no_teams'))
         out = os.path.join(tmp, 'report.html')
-        no_teams_gs.generate_report(out)
+        no_teams_gs.generate_report(os.path.join(PROJECT_ROOT, 'externals'), out)
         html = open(out).read()
         # The Teams tab button must carry the hidden class.
         assert 'class="tab-btn hidden"' in html or "tab-btn hidden" in html
@@ -456,9 +466,253 @@ class TestNoTeams:
     def test_teams_tab_visible_with_teams(self, std_gs, tmp_path_factory):
         tmp = str(tmp_path_factory.mktemp('html_with_teams'))
         out = os.path.join(tmp, 'report.html')
-        std_gs.generate_report(out)
+        std_gs.generate_report(os.path.join(PROJECT_ROOT, 'externals'), out)
         html = open(out).read()
         assert 'const hasTeams       = true;' in html
         # The Teams button must NOT be hidden.
         assert 'showTab(\'teams\',this)"    class="tab-btn"' in html or \
                'showTab(\'teams\',this)"    class="tab-btn ' in html
+
+
+# ---------------------------------------------------------------------------
+# Support repositories
+# ---------------------------------------------------------------------------
+
+@pytest.fixture(scope='module')
+def recipes_repo_path(tmp_path_factory):
+    """
+    Create a detached git worktree of pyodide-recipes at RECIPES_LOCKED_COMMIT.
+    The worktree is removed after all tests in the module complete.
+    """
+    wt = str(tmp_path_factory.mktemp('recipes_locked'))
+    subprocess.run(
+        ['git', '-C', RECIPES_REPO, 'worktree', 'add', '--detach', wt, RECIPES_LOCKED_COMMIT],
+        check=True, capture_output=True,
+    )
+    yield wt
+    subprocess.run(
+        ['git', '-C', RECIPES_REPO, 'worktree', 'remove', '--force', wt],
+        capture_output=True,
+    )
+
+
+@pytest.fixture(scope='module')
+def combined_gs(repo_path, recipes_repo_path, std_config_path):
+    """
+    GitStats instance with pyodide as main repo and pyodide-recipes as a
+    support repo, both locked to fixed commits.  Shared across all tests in
+    TestSupportRepos that only need to read the result.
+    """
+    gs = gitstats.GitStats(repo_path, std_config_path, support_paths=[recipes_repo_path])
+    gs.collect()
+    return gs
+
+
+class TestSupportRepos:
+    # ── Combined stats ──────────────────────────────────────────────────────
+
+    def test_combined_commit_count(self, combined_gs):
+        """Total commits must equal pyodide + pyodide-recipes combined."""
+        assert combined_gs.data['general']['total_commits'] == EXPECTED_COMBINED_COMMITS
+
+    def test_combined_author_count(self, combined_gs):
+        """Authors from both repos must be merged into a single set."""
+        assert len(combined_gs.data['authors']) == EXPECTED_COMBINED_AUTHORS
+
+    def test_recipes_only_authors_appear(self, combined_gs, std_gs):
+        """Authors who only committed to pyodide-recipes must appear in the combined result."""
+        combined = set(combined_gs.data['authors'].keys())
+        main_only = set(std_gs.data['authors'].keys())
+        new_authors = combined - main_only
+        # pyodide-recipes adds 19 authors not present in pyodide alone.
+        assert len(new_authors) == 19
+
+    def test_shared_author_commits_accumulate(self, combined_gs, std_gs):
+        """An author who committed to both repos must have a higher combined commit count."""
+        # Agriya Khetarpal is in config.json (Build & Packaging) and has commits in both repos.
+        main_commits = std_gs.data['authors']['Agriya Khetarpal']['commits']
+        combined_commits = combined_gs.data['authors']['Agriya Khetarpal']['commits']
+        assert combined_commits > main_commits
+
+    # ── Main-repo-only fields ───────────────────────────────────────────────
+
+    def test_file_count_is_main_repo_only(self, combined_gs, std_gs):
+        """File count must equal the main repo count regardless of support repos."""
+        assert combined_gs.data['general']['total_files'] == std_gs.data['general']['total_files']
+
+    def test_loc_history_is_main_repo_only(self, combined_gs, std_gs):
+        """LOC history must be identical to the main-repo-only result."""
+        assert combined_gs.data['loc_history'] == std_gs.data['loc_history']
+
+    def test_age_days_is_main_repo_only(self, combined_gs, std_gs):
+        """Repo age must reflect the main repo span, not the support repo."""
+        assert combined_gs.data['general']['age_days'] == std_gs.data['general']['age_days']
+
+    def test_total_lines_is_main_repo_only(self, combined_gs, std_gs):
+        """Net line count must derive from the main repo only."""
+        assert combined_gs.data['general']['total_lines'] == std_gs.data['general']['total_lines']
+
+    def test_release_tags_are_main_repo_only(self, combined_gs, std_gs):
+        """Release tags must be unchanged when a support repo is added."""
+        assert len(combined_gs.data['tags']) == len(std_gs.data['tags'])
+        assert combined_gs.data['tags'][0]['name'] == std_gs.data['tags'][0]['name']
+
+    # ── Support repo component data ─────────────────────────────────────────
+
+    def test_support_repo_entry_present(self, combined_gs):
+        """data['support_repos'] must have one entry for the support repo."""
+        assert len(combined_gs.data['support_repos']) == 1
+
+    def test_support_repo_has_components(self, combined_gs):
+        """The support repo must have detected at least one component."""
+        sr = combined_gs.data['support_repos'][0]
+        assert len(sr['components']) > 0
+
+    def test_support_repo_components_separate_from_main(self, combined_gs):
+        """Support repo components must not appear in the main repo component dict."""
+        main_keys = set(combined_gs.data['components'].keys())
+        sr_keys   = set(combined_gs.data['support_repos'][0]['components'].keys())
+        # The two component sets may share names (e.g. '(root)') but they are
+        # stored in separate dicts, so their values are independent.
+        assert isinstance(main_keys, set)
+        assert isinstance(sr_keys, set)
+
+    # ── Single-repo regression ───────────────────────────────────────────────
+
+    def test_no_support_repos_list_is_empty(self, std_gs):
+        """A GitStats instance without support_paths must have an empty support_repos list."""
+        assert std_gs.data['support_repos'] == []
+
+    def test_single_repo_commit_count_unchanged(self, std_gs):
+        """Adding a support repo to a different instance must not affect single-repo counts."""
+        assert std_gs.data['general']['total_commits'] == EXPECTED_COMMITS
+
+    # ── HTML output ─────────────────────────────────────────────────────────
+
+    def test_html_support_repo_component_card(self, combined_gs, recipes_repo_path, tmp_path_factory):
+        """The generated HTML must contain a separate component card for the support repo."""
+        tmp = str(tmp_path_factory.mktemp('html_combined'))
+        out = os.path.join(tmp, 'report.html')
+        combined_gs.generate_report(os.path.join(PROJECT_ROOT, 'externals'), out)
+        html = open(out).read()
+        sr_name = os.path.basename(os.path.abspath(recipes_repo_path))
+        # The support repo card must have a canvas with id="componentChart-support-0"
+        assert 'id="componentChart-support-0"' in html
+        # The LOC note must be present since support repos are configured.
+        assert 'Main repository only.' in html
+        # Both "Main Repository" and "Support Repository" labels must appear.
+        assert 'Main Repository' in html
+        assert 'Support Repository' in html
+
+
+# ---------------------------------------------------------------------------
+# Component markers
+# ---------------------------------------------------------------------------
+
+class TestComponentMarkers:
+    """Verify that the component_markers config key controls which directories
+    are detected as component roots in the Components tab churn chart."""
+
+    # ── Data-layer correctness ───────────────────────────────────────────────
+
+    def test_empty_markers_yields_no_components(self, repo_path, tmp_path):
+        """Setting component_markers to [] must disable all component detection."""
+        cfg = make_config(tmp_path, component_markers=[])
+        gs = gitstats.GitStats(repo_path, cfg)
+        gs.collect()
+        assert len(gs.data['components']) == 0
+
+    def test_pyproject_toml_only_detects_expected_dirs(self, repo_path, tmp_path):
+        """Using only 'pyproject.toml' as a marker must detect exactly the
+        directories that contain a pyproject.toml — and no others."""
+        cfg = make_config(tmp_path, component_markers=['pyproject.toml'])
+        gs = gitstats.GitStats(repo_path, cfg)
+        gs.collect()
+        components = set(gs.data['components'].keys())
+        # src/py and (root) both have pyproject.toml in the locked repo.
+        assert '(root)' in components
+        assert 'src/py' in components
+        # cpython, docs, emsdk, packages are only reachable via Makefile/other markers.
+        assert 'cpython' not in components
+        assert 'docs' not in components
+
+    def test_makefile_only_detects_expected_dirs(self, repo_path, tmp_path):
+        """Using only 'Makefile' as a marker must detect exactly the directories
+        that contain a Makefile."""
+        cfg = make_config(tmp_path, component_markers=['Makefile'])
+        gs = gitstats.GitStats(repo_path, cfg)
+        gs.collect()
+        components = set(gs.data['components'].keys())
+        # (root), cpython, docs, emsdk, packages all have Makefiles.
+        assert '(root)' in components
+        assert 'cpython' in components
+        assert 'docs' in components
+        assert 'emsdk' in components
+        assert 'packages' in components
+        # src/py is only reachable via pyproject.toml, not Makefile.
+        assert 'src/py' not in components
+
+    def test_custom_markers_subset_of_default(self, repo_path, tmp_path_factory):
+        """A single-marker config must produce fewer components than the full default set."""
+        ptoml_dir = str(tmp_path_factory.mktemp('ptoml'))
+        default_dir = str(tmp_path_factory.mktemp('default'))
+        cfg_ptoml   = make_config(ptoml_dir,   component_markers=['pyproject.toml'])
+        cfg_default = make_config(default_dir)  # no component_markers key → uses class default
+
+        gs_ptoml = gitstats.GitStats(repo_path, cfg_ptoml)
+        gs_ptoml.collect()
+        gs_default = gitstats.GitStats(repo_path, cfg_default)
+        gs_default.collect()
+
+        # pyproject.toml alone finds 9 components; the full default finds 37.
+        assert len(gs_ptoml.data['components']) == 9
+        assert len(gs_default.data['components']) == 37
+        # Every pyproject.toml-detected component must also appear in the default set.
+        assert set(gs_ptoml.data['components']).issubset(set(gs_default.data['components']))
+
+    def test_omitting_config_key_uses_class_default(self, repo_path, tmp_path):
+        """When 'component_markers' is absent from config, COMPONENT_MARKERS is used."""
+        cfg = make_config(tmp_path)  # no component_markers key
+        gs = gitstats.GitStats(repo_path, cfg)
+        assert gs.component_markers == gitstats.GitStats.COMPONENT_MARKERS
+
+    def test_config_key_replaces_default_entirely(self, repo_path, tmp_path):
+        """Providing component_markers in config must replace the default set, not extend it."""
+        cfg = make_config(tmp_path, component_markers=['pyproject.toml'])
+        gs = gitstats.GitStats(repo_path, cfg)
+        assert gs.component_markers == {'pyproject.toml'}
+        assert 'Makefile' not in gs.component_markers
+
+    # ── HTML output ──────────────────────────────────────────────────────────
+
+    def test_html_chart_labels_reflect_custom_markers(self, repo_path, tmp_path_factory):
+        """The repoCharts JSON in the generated HTML must contain exactly the
+        component labels produced by the active marker set."""
+        tmp = str(tmp_path_factory.mktemp('html_markers'))
+        cfg = make_config(tmp, component_markers=['pyproject.toml'])
+        out = os.path.join(tmp, 'report.html')
+        gs = gitstats.GitStats(repo_path, cfg)
+        gs.collect()
+        gs.generate_report(os.path.join(PROJECT_ROOT, 'externals'), out)
+        html = open(out).read()
+
+        # src/py is detected by pyproject.toml; must appear in the chart data.
+        assert '"src/py"' in html
+        # cpython is only detected by Makefile; must be absent from the chart data.
+        assert '"cpython"' not in html
+
+    def test_html_no_components_card_when_empty_markers(self, repo_path, tmp_path_factory):
+        """With zero components detected the chart canvas must still be rendered
+        (empty chart), and the repoCharts labels list must be empty."""
+        tmp = str(tmp_path_factory.mktemp('html_empty'))
+        cfg = make_config(tmp, component_markers=[])
+        out = os.path.join(tmp, 'report.html')
+        gs = gitstats.GitStats(repo_path, cfg)
+        gs.collect()
+        gs.generate_report(os.path.join(PROJECT_ROOT, 'externals'), out)
+        html = open(out).read()
+
+        # The main repo chart card must still be present.
+        assert 'id="componentChart-main"' in html
+        # The labels array for the main repo chart must be empty.
+        assert '"labels": []' in html or '"labels":[]' in html

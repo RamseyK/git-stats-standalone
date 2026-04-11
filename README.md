@@ -9,7 +9,7 @@ A Python script that analyzes a Git repository and generates a self-contained HT
 - **Authors** — sortable contributor table with team badges, filterable by component or team
 - **Teams** — per-team stats, member lists, and top components
 - **Releases** — per-release breakdown of commits by author and team
-- **Components** — churn chart for directories that contain a `make.py`, `pyproject.toml`, or `setup.py`
+- **Components** — churn chart for directories that contain a component marker file (configurable; defaults to `make.py`, `pyproject.toml`, `setup.py`, `Makefile`, `meta.yaml`)
 
 ## Requirements
 
@@ -18,15 +18,16 @@ Python 3.8+
 ## Usage
 
 ```
-python gitstats.py -s <repo-path> -o <output.html> [-c <config.json>] [-externals <dir>]
+python gitstats.py -s <repo-path> -o <output.html> [-c <config.json>] [-externals <dir>] [-support <repo-path>] ...
 ```
 
 | Flag | Required | Description |
 |------|----------|-------------|
-| `-s`, `--source` | Yes | Path to the Git repository to analyze |
+| `-s`, `--source` | Yes | Path to the primary Git repository to analyze |
 | `-o`, `--output` | Yes | Path for the generated HTML file |
 | `-c`, `--config` | No | Path to a config JSON file (default: `./config.json`) |
 | `-externals`, `--externals` | No | Path to the directory containing `tailwind.js` and `chart.js` (default: `./externals`) |
+| `-support`, `--support` | No | Path to an additional Git repository whose commits contribute to the combined stats. Repeatable for multiple support repositories. |
 
 **Example:**
 
@@ -34,9 +35,52 @@ python gitstats.py -s <repo-path> -o <output.html> [-c <config.json>] [-external
 python gitstats.py -s ~/projects/myrepo -c config.json -o report.html
 ```
 
+**Example with support repositories:**
+
+```bash
+python gitstats.py -s ~/projects/myrepo -c config.json -o report.html \
+  -support ~/projects/myrepo-recipes \
+  -support ~/projects/myrepo-tools
+```
+
 On success, `tailwind.js` and `chart.js` are copied from the externals directory into the same directory as the output HTML so the report works fully offline or from a self-hosted webserver.
 
 If no config file is found, all authors are grouped under a single "Community" team and no aliases are applied.
+
+## Support Repositories
+
+Some projects spread their work across multiple Git repositories — a main repo and separate repos for recipes, tools, tests, or packaging. Support repositories let you fold those additional histories into a single unified report.
+
+```bash
+python gitstats.py -s ~/projects/myrepo -c config.json -o report.html \
+  -support ~/projects/myrepo-recipes
+```
+
+The `-support` flag may be repeated to include any number of additional repositories. Support repos may be submodules checked out separately or entirely unrelated directories.
+
+### What merges across all repositories
+
+| Data | Behavior |
+|------|----------|
+| Author commit counts | Combined — each commit in any repo is credited to the resolved canonical author |
+| Author line stats | Combined — additions and deletions accumulate across all repos |
+| Team attribution | Combined — the same config teams and aliases apply to all repos |
+| Activity heatmap and punchcard | Combined |
+| Impact scoring | Computed over the combined author and team data |
+
+### What stays main-repository-only
+
+| Data | Reason |
+|------|--------|
+| LOC history chart | A per-file running total only makes sense within a single repo's history; the chart notes this |
+| Components tab | Each repo gets its own component chart card (main repo first, support repos below) |
+| Release tags | Tag names and release ranges are specific to the main repo's version history |
+| File count | Reflects the current tracked files in the main repo |
+| Repo age | Derived from the oldest and newest commit in the main repo |
+
+### Per-repo component cards
+
+The Components tab shows a separate churn chart for each repository. The main repo card appears first; each support repo card is labeled **Support Repository** so it is clearly distinguished. Clicking any bar on any card filters the Authors table to contributors who touched that component.
 
 ## Configuration
 
@@ -85,6 +129,29 @@ All configuration lives in a single JSON file. Every key is optional.
 |-----|---------|-------------|
 | `release_tag_prefix` | `""` | Only tags whose name starts with this prefix appear in the Releases tab. For example, `"v"` includes `v1.0`, `v2.3.1` but excludes `nightly-20240101`. An empty string includes all tags. |
 | `max_release_tags` | `20` | Maximum number of release tags to display, taken from the most recent. Set to `0` to show all tags with no limit. |
+| `component_markers` | *(see below)* | List of filenames that identify a component boundary. Any directory directly containing one of these files becomes a component root in the Components tab churn chart. When omitted, the built-in default set is used. |
+
+#### Component markers
+
+A **component** is any directory whose immediate contents include a marker file. The built-in default markers are:
+
+```
+make.py  pyproject.toml  setup.py  Makefile  meta.yaml
+```
+
+Override this list in config to match the conventions of the repos you analyse:
+
+```json
+{
+  "component_markers": ["pyproject.toml", "Cargo.toml", "CMakeLists.txt"]
+}
+```
+
+**When to customise:**
+
+- **Add markers** (`"Cargo.toml"`, `"CMakeLists.txt"`, `"BUILD"`, `"BUCK"`, `"go.mod"`) to detect component boundaries specific to your build system.
+- **Remove markers** (e.g. drop `"Makefile"`) when a file is present in almost every directory — leaving it in would fragment the chart into dozens of trivial components rather than meaningful project modules.
+- The config list **replaces** the default set entirely, so include every marker you want.
 
 ### Teams
 
