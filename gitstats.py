@@ -33,7 +33,12 @@ class GitStats:
       "teams": {
         "Team Name": {
           "color": "#3b82f6",
-          "members": ["author name", "author@email.com", ...]
+          "members": [
+            "always member name",        // plain string → no time bounds
+            "always@email.com",
+            {"name": "Jane Smith", "from": "2021-01-01", "to": "2022-12-31"},
+            {"name": "bob@example.com", "from": "2023-06-01"}  // no end date
+          ]
         }
       },
       "aliases": {
@@ -91,21 +96,53 @@ class GitStats:
         }
 
         # Build team membership and color lookups from config.
-        # Config format: {"Team Name": {"color": "#hex", "members": [name/email, ...]}}
-        # If a team omits "color", it is assigned the next color in TEAM_COLORS.
-        # Email members are stored lowercased for case-insensitive matching.
-        # Authors not listed in any team fall back to the built-in "Community" team.
+        #
+        # Each member entry may be a plain string (always on the team) or a dict
+        # with optional "from" / "to" date fields for time-bounded membership:
+        #
+        #   "members": [
+        #     "Always Member",                          # always on this team
+        #     "always@email.com",
+        #     {"name": "Jane Smith", "from": "2021-01-01", "to": "2022-12-31"},
+        #     {"name": "bob@example.com", "from": "2023-06-01"}  # no end date
+        #   ]
+        #
+        # Membership ranges are stored as (team, from_ts, to_ts) tuples keyed by
+        # lowercased email or exact author name.  from_ts=0 / to_ts=inf for
+        # open-ended entries.  _get_team() picks the first matching range.
         teams_config = config.get('teams', {})
         # True only when at least one team is explicitly defined in config.
         # Used to hide the Teams tab when running without team configuration.
         self.has_teams = bool(teams_config)
-        self.author_to_team = {}   # name/email → team name
         self.team_colors = {}      # team name  → hex color string
+        # key (lowercased email or author name) → list of (team, from_ts, to_ts)
+        self.author_to_team_ranges = defaultdict(list)
+
+        def _date_to_ts(date_str):
+            """Convert a 'YYYY-MM-DD' string to a Unix timestamp (midnight local time).
+            Returns None when date_str is absent or empty."""
+            if not date_str:
+                return None
+            return int(datetime.datetime.strptime(date_str, '%Y-%m-%d').timestamp())
+
         for i, (team, value) in enumerate(teams_config.items()):
             self.team_colors[team] = value.get('color') or TEAM_COLORS[i % len(TEAM_COLORS)]
             for m in value.get('members', []):
-                key = m.lower() if '@' in m else m
-                self.author_to_team[key] = team
+                if isinstance(m, str):
+                    # Plain string — membership has no time bounds.
+                    key = m.lower() if '@' in m else m
+                    self.author_to_team_ranges[key].append((team, 0, float('inf')))
+                elif isinstance(m, dict):
+                    # Dict entry — parse optional "from" / "to" date bounds.
+                    name = m.get('name', '')
+                    if not name:
+                        continue
+                    key = name.lower() if '@' in name else name
+                    from_ts = _date_to_ts(m.get('from')) or 0
+                    # Add 86399 so the "to" date is inclusive through end of day.
+                    to_raw = _date_to_ts(m.get('to'))
+                    to_ts  = (to_raw + 86399) if to_raw is not None else float('inf')
+                    self.author_to_team_ranges[key].append((team, from_ts, to_ts))
         self.team_colors['Community'] = '#94a3b8'  # slate — always last / fallback
 
         # Only git tags whose name begins with this prefix are shown in the
@@ -190,12 +227,22 @@ class GitStats:
         """
         return self.alias_to_canonical.get(email.lower(), self.alias_to_canonical.get(name, name))
 
-    def _get_team(self, author, email):
-        """Return the team name for a given canonical author name and email.
+    def _get_team(self, author, email, ts=0):
+        """Return the team name for a given canonical author name, email, and commit timestamp.
 
-        Lookup order: email (lowercased) → author name → 'Community' fallback.
+        Checks the email (lowercased) first, then the author display name. For each
+        key, iterates through its (team, from_ts, to_ts) ranges and returns the
+        first team whose range contains ts. Falls back to 'Community' when no range
+        matches — including when an author has left all configured teams.
+
+        ts defaults to 0 so callers that don't have a timestamp (e.g. tests) get a
+        sensible result for unbounded entries.
         """
-        return self.author_to_team.get(email.lower(), self.author_to_team.get(author, 'Community'))
+        for key in (email.lower(), author):
+            for team, from_ts, to_ts in self.author_to_team_ranges.get(key, []):
+                if from_ts <= ts <= to_ts:
+                    return team
+        return 'Community'
 
     def _run_git(self, args):
         """Run a git subcommand inside self.repo_path and return its stdout as a string.
@@ -263,8 +310,11 @@ class GitStats:
                 # counts into that author's commit_lines list so _compute_impact()
                 # can apply per-commit noise filtering later.
                 if current_author is not None:
+                    # Store the team alongside the line stats so _compute_impact()
+                    # can roll effective lines to the right team per-commit, not just
+                    # to whichever team the author belongs to at their last commit.
                     self.data['authors'][current_author]['commit_lines'].append(
-                        (current_commit_ts, current_commit_adds, current_commit_dels))
+                        (current_commit_ts, current_commit_adds, current_commit_dels, current_team))
                 current_commit_adds = 0
                 current_commit_dels = 0
 
@@ -273,7 +323,7 @@ class GitStats:
                 current_commit_ts = ts
                 dt = datetime.datetime.fromtimestamp(ts)
                 author = self._get_author(name, email)
-                team = self._get_team(author, email)
+                team = self._get_team(author, email, ts)  # pass ts for time-ranged membership
                 all_ts.append(ts)
                 current_author = author
                 current_team = team
@@ -348,7 +398,7 @@ class GitStats:
         # COMMIT header, so the last commit in the log would otherwise be lost).
         if current_author is not None:
             self.data['authors'][current_author]['commit_lines'].append(
-                (current_commit_ts, current_commit_adds, current_commit_dels))
+                (current_commit_ts, current_commit_adds, current_commit_dels, current_team))
 
         # Derive repo age from the span between oldest and newest commit
         if all_ts:
@@ -385,17 +435,20 @@ class GitStats:
             # For the oldest tag in the list, include all its commits.
             tag_range = tag if i == len(tags) - 1 else f"{tags[i + 1]}..{tag}"
             try:
-                tag_log = self._run_git(['log', tag_range, '--pretty=format:%an|%ae'])
+                # Include %at (Unix timestamp) so time-ranged team membership is
+                # resolved correctly for each commit within this release range.
+                tag_log = self._run_git(['log', tag_range, '--pretty=format:%at|%an|%ae'])
             except subprocess.CalledProcessError:
                 continue
             author_counts = Counter()
             team_counts = Counter()
             for tag_log_line in tag_log.splitlines():
                 if '|' in tag_log_line:
-                    n, e = tag_log_line.split('|', 1)
+                    ts_str, n, e = tag_log_line.split('|', 2)
+                    commit_ts = int(ts_str) if ts_str.isdigit() else 0
                     canon = self._get_author(n, e)
                     author_counts[canon] += 1
-                    team_counts[self._get_team(canon, e)] += 1
+                    team_counts[self._get_team(canon, e, commit_ts)] += 1
             if author_counts:
                 self.data['tags'].append({
                     'name': tag,
@@ -461,10 +514,11 @@ class GitStats:
         # ── Step 1: per-commit effective lines ───────────────────────────────
         # Compute abs(adds - dels) or adds + dels for each commit depending on
         # the use_net_lines setting. Stored as a parallel list (_eff) per author.
+        # commit_lines entries are (ts, adds, dels, team) — team is ignored here.
         for a in authors.values():
             a['_eff'] = [
                 abs(adds - dels) if use_net else (adds + dels)
-                for _, adds, dels in a.get('commit_lines', [])
+                for _, adds, dels, _team in a.get('commit_lines', [])
             ]
 
         # ── Step 2: winsorization ─────────────────────────────────────────────
@@ -501,7 +555,7 @@ class GitStats:
             # Each bucket accumulates per-commit effective lines AND the raw
             # adds/dels needed to detect the wash condition.
             buckets = defaultdict(lambda: {'eff': 0, 'raw_a': 0, 'raw_d': 0})
-            for (ts, raw_a, raw_d), e in zip(commits, eff):
+            for (ts, raw_a, raw_d, _team), e in zip(commits, eff):
                 b = ts // window_secs
                 buckets[b]['eff']   += e
                 buckets[b]['raw_a'] += raw_a
@@ -539,13 +593,16 @@ class GitStats:
                 )
 
         # ── Score teams ───────────────────────────────────────────────────────
-        # Team effective lines = sum of member effective lines so that the same
-        # noise filtering applied to authors flows through to the team score.
+        # Team effective lines are computed per-commit using the team recorded in
+        # each commit_lines entry. This correctly handles authors who switched teams:
+        # their commits are credited to whichever team they belonged to at the time
+        # of each commit, not to their current team.
         teams = self.data['teams']
         if teams:
             team_eff = defaultdict(float)
-            for name, a in authors.items():
-                team_eff[a.get('team', 'Community')] += eff_map.get(name, 0)
+            for a in authors.values():
+                for (_, _ra, _rd, team), e in zip(a.get('commit_lines', []), a.get('_eff', [])):
+                    team_eff[team] += e
 
             max_c = max(t['commits'] for t in teams.values()) or 1
             max_k = max(team_eff.values()) or 1
