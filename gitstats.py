@@ -674,12 +674,12 @@ class GitStats:
 
     # ------------------------------------------------------------------ report
 
-    def generate_report(self, output="index.html"):
+    def generate_report(self, external_dir, output="index.html"):
         """Render all collected data into a self-contained HTML file.
 
         Serializes self.data to JSON and injects it directly into the HTML
         as JavaScript constants, so the output file has zero external data
-        dependencies. external/tailwind.js and external/chart.js are copied
+        dependencies. externals/tailwind.js and externals/chart.js are copied
         next to the output file so the report works fully offline.
         """
         # Convert member sets to sorted lists so they are JSON-serializable
@@ -1392,9 +1392,7 @@ if (!hasTeams) {{
         with open(output, 'w') as f:
             f.write(html)
 
-        # Copy external JS files (tailwind.js, chart.js) next to the output HTML
-        # so the report works fully offline with no Internet dependencies.
-        external_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'external')
+        # Copy externals JS files (tailwind.js, chart.js) next to the output HTML for portable use
         out_dir = os.path.dirname(os.path.abspath(output))
         for fname in ('tailwind.js', 'chart.js'):
             src = os.path.join(external_dir, fname)
@@ -1422,10 +1420,18 @@ def main() -> int:
         "-o", "--output", required=True, default="/tmp/index.html",
         help="Output HTML file path (default: /tmp/index.html)"
     )
+    parser.add_argument(
+        '-externals', '--externals', default=os.path.join(os.getcwd(), 'externals'),
+        help="Path to 'externals' directory containing our CSS and Javascript dependencies (default ./externals)"
+)
     args = parser.parse_args()
 
     if not os.path.isdir(args.source):
         print(f"Provided source Git repository directory does not exist at {args.source}")
+        return 1
+
+    if not os.path.isdir(args.externals):
+        print(f"Provided externals dependencies directory does not exist at {args.externals}")
         return 1
 
     config_path = args.config
@@ -1437,7 +1443,7 @@ def main() -> int:
 
     stats = GitStats(args.source, config_path)
     stats.collect()
-    stats.generate_report(args.output)
+    stats.generate_report(args.externals, args.output)
     return 0
 
 

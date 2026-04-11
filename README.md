@@ -18,7 +18,7 @@ Python 3.8+
 ## Usage
 
 ```
-python gitstats.py -s <repo-path> -o <output.html> [-c <config.json>]
+python gitstats.py -s <repo-path> -o <output.html> [-c <config.json>] [-externals <dir>]
 ```
 
 | Flag | Required | Description |
@@ -26,6 +26,7 @@ python gitstats.py -s <repo-path> -o <output.html> [-c <config.json>]
 | `-s`, `--source` | Yes | Path to the Git repository to analyze |
 | `-o`, `--output` | Yes | Path for the generated HTML file |
 | `-c`, `--config` | No | Path to a config JSON file (default: `./config.json`) |
+| `-externals`, `--externals` | No | Path to the directory containing `tailwind.js` and `chart.js` (default: `./externals`) |
 
 **Example:**
 
@@ -33,7 +34,7 @@ python gitstats.py -s <repo-path> -o <output.html> [-c <config.json>]
 python gitstats.py -s ~/projects/myrepo -c config.json -o report.html
 ```
 
-Open `report.html` in a browser. No server required.
+On success, `tailwind.js` and `chart.js` are copied from the externals directory into the same directory as the output HTML so the report works fully offline or from a self-hosted webserver.
 
 If no config file is found, all authors are grouped under a single "Community" team and no aliases are applied.
 
