@@ -22,7 +22,7 @@ class GitStats:
       - Sortable contributors table with team badges
       - Team cards showing stats, ownership, members
       - Release/tag breakdown by author and team
-      - Directory churn chart (click to filter by module)
+      - Component churn chart (click to filter by component)
 
     Config file (./config.json or custom path) format:
     {
@@ -91,10 +91,10 @@ class GitStats:
             'activity': {'hour': Counter(), 'weekday': Counter(), 'heatmap': Counter()},
             'authors': {},
             'teams': {},
-            'domain_contributions': defaultdict(lambda: Counter()),  # domain -> {author: commit_count}
-            'team_domains': defaultdict(lambda: Counter()),           # team   -> {domain: churn}
+            'component_contributions': defaultdict(lambda: Counter()),  # component -> {author: commit_count}
+            'team_components': defaultdict(lambda: Counter()),           # team      -> {component: churn}
             'files': Counter(),
-            'domains': Counter(),
+            'components': Counter(),
             'tags': [],
             'loc_history': [],
         }
@@ -106,6 +106,15 @@ class GitStats:
             return {}
         with open(path) as f:
             return json.load(f)
+
+    def _get_component(self, path):
+        """Return the component directory for a file path, or None if not within any component."""
+        for comp in self._component_dirs:
+            if comp == '':
+                return '(root)'
+            if path == comp or path.startswith(comp + '/'):
+                return comp
+        return None
 
     def _get_author(self, name, email):
         return self.alias_to_canonical.get(email.lower(), self.alias_to_canonical.get(name, name))
@@ -124,12 +133,20 @@ class GitStats:
     def collect(self):
         print(f"Analyzing {self.data['project_name']}...")
 
-        # 1. File inventory
+        # 1. File inventory + component discovery
+        # A component is a directory that directly contains make.py, pyproject.toml, or setup.py.
         ls_files = self._run_git(['ls-files']).splitlines()
         self.data['general']['total_files'] = len(ls_files)
+        component_markers = {'make.py', 'pyproject.toml', 'setup.py'}
+        component_dirs = set()
         for f in ls_files:
             ext = os.path.splitext(f)[1].lower() or 'source'
             self.data['files'][ext] += 1
+            if os.path.basename(f) in component_markers:
+                comp_dir = os.path.dirname(f)
+                component_dirs.add(comp_dir)
+        # Sort longest-first so the most specific ancestor matches first
+        self._component_dirs = sorted(component_dirs, key=len, reverse=True)
 
         # 2. Full commit history with per-file stats
         log_data = self._run_git(['log', '--numstat', '--pretty=format:COMMIT|%at|%an|%ae'])
@@ -190,10 +207,11 @@ class GitStats:
                     running_loc += (a - d)
                     self.data['loc_history'].append(running_loc)
 
-                    domain = path.split('/')[0] if '/' in path else 'root'
-                    self.data['domains'][domain] += (a + d)
-                    self.data['domain_contributions'][domain][current_author] += 1
-                    self.data['team_domains'][current_team][domain] += (a + d)
+                    component = self._get_component(path)
+                    if component is not None:
+                        self.data['components'][component] += (a + d)
+                        self.data['component_contributions'][component][current_author] += 1
+                        self.data['team_components'][current_team][component] += (a + d)
                 except (ValueError, IndexError):
                     continue
 
@@ -216,7 +234,10 @@ class GitStats:
         if self.release_tag_prefix:
             tags = [t for t in tags if t.startswith(self.release_tag_prefix)]
 
-        for i, tag in enumerate(tags[:self.max_release_tags]):
+        if self.max_release_tags:
+            tags = tags[:self.max_release_tags]
+
+        for i, tag in enumerate(tags):
             tag_range = tag if i == len(tags) - 1 else f"{tags[i + 1]}..{tag}"
             try:
                 tag_log = self._run_git(['log', tag_range, '--pretty=format:%an|%ae'])
@@ -337,15 +358,15 @@ class GitStats:
         authors_json    = json.dumps(self.data['authors'])
         teams_json      = json.dumps(self.data['teams'])
         team_colors_json = json.dumps(self.team_colors)
-        domain_json     = json.dumps({k: dict(v) for k, v in self.data['domain_contributions'].items()})
-        team_domain_json = json.dumps({k: dict(v.most_common(8)) for k, v in self.data['team_domains'].items()})
-        heatmap_json    = json.dumps(dict(self.data['activity']['heatmap']))
-        loc_json        = json.dumps(self.data['loc_history'])
-        hour_data       = json.dumps([self.data['activity']['hour'][i] for i in range(24)])
+        component_json      = json.dumps({k: dict(v) for k, v in self.data['component_contributions'].items()})
+        team_component_json = json.dumps({k: dict(v.most_common(8)) for k, v in self.data['team_components'].items()})
+        heatmap_json        = json.dumps(dict(self.data['activity']['heatmap']))
+        loc_json            = json.dumps(self.data['loc_history'])
+        hour_data           = json.dumps([self.data['activity']['hour'][i] for i in range(24)])
 
-        sorted_domains  = self.data['domains'].most_common(30)
-        domain_labels   = json.dumps([d[0] for d in sorted_domains])
-        domain_values   = json.dumps([d[1] for d in sorted_domains])
+        sorted_components   = self.data['components'].most_common(30)
+        component_labels    = json.dumps([c[0] for c in sorted_components])
+        component_values    = json.dumps([c[1] for c in sorted_components])
 
         pname  = self.data['project_name']
         adate  = self.data['analysis_date']
@@ -426,7 +447,7 @@ class GitStats:
             <button onclick="showTab('authors',this)"  class="tab-btn">Authors</button>
             <button onclick="showTab('teams',this)"    class="tab-btn">Teams</button>
             <button onclick="showTab('tags',this)"     class="tab-btn">Releases</button>
-            <button onclick="showTab('domains',this)"  class="tab-btn">Modules</button>
+            <button onclick="showTab('components',this)"  class="tab-btn">Components</button>
         </div>
     </nav>
 
@@ -541,14 +562,14 @@ class GitStats:
         {self._render_tags_html()}
     </div>
 
-    <!-- ═══ MODULES ═══════════════════════════════════════════════════════════ -->
-    <div id="tab-domains" class="tab-content hidden">
+    <!-- ═══ COMPONENTS ════════════════════════════════════════════════════════ -->
+    <div id="tab-components" class="tab-content hidden">
         <div class="card" style="height:700px">
             <div class="mb-6">
-                <h3 class="text-xl font-black">Directory Churn Analysis</h3>
-                <p class="text-sm text-slate-400 font-medium mt-1">Click any bar to filter contributors by module.</p>
+                <h3 class="text-xl font-black">Component Churn Analysis</h3>
+                <p class="text-sm text-slate-400 font-medium mt-1">Click any bar to filter contributors by component.</p>
             </div>
-            <canvas id="domainChart"></canvas>
+            <canvas id="componentChart"></canvas>
         </div>
     </div>
 
@@ -559,8 +580,8 @@ class GitStats:
 const authorData     = {authors_json};
 const teamsData      = {teams_json};
 const teamColors     = {team_colors_json};
-const domainData     = {domain_json};
-const teamDomainData = {team_domain_json};
+const componentData     = {component_json};
+const teamComponentData = {team_component_json};
 const totalCommits   = {tcom};
 
 let currentSortKey   = 'impact';
@@ -581,7 +602,7 @@ function showTab(t, btn) {{
     if (!_chartInited[t]) {{
         _chartInited[t] = true;
         if (t === 'impact')  initImpactChart();
-        if (t === 'domains') initDomainChart();
+        if (t === 'components') initComponentChart();
     }}
     window.scrollTo({{top: 0, behavior: 'smooth'}});
 }}
@@ -636,11 +657,11 @@ function renderAuthorTable(filter, filterType) {{
     let authors      = Object.entries(authorData);
     let displayTotal = totalCommits;
 
-    if (currentFilter && currentFilterType === 'domain') {{
-        const filtered = domainData[currentFilter] || {{}};
+    if (currentFilter && currentFilterType === 'component') {{
+        const filtered = componentData[currentFilter] || {{}};
         authors      = authors.filter(([n]) => filtered[n]);
         displayTotal = Object.values(filtered).reduce((a,b) => a+b, 0) || 1;
-        title.innerText = `Module: ${{currentFilter}}`;
+        title.innerText = `Component: ${{currentFilter}}`;
         resetBtn.classList.remove('hidden');
     }} else if (currentFilter && currentFilterType === 'team') {{
         authors      = authors.filter(([,d]) => d.team === currentFilter);
@@ -660,8 +681,8 @@ function renderAuthorTable(filter, filterType) {{
     }});
 
     const rows = authors.map(([name, s]) => {{
-        const commits = (currentFilter && currentFilterType === 'domain')
-            ? ((domainData[currentFilter] || {{}})[name] || 0)
+        const commits = (currentFilter && currentFilterType === 'component')
+            ? ((componentData[currentFilter] || {{}})[name] || 0)
             : s.commits;
         const share      = ((commits / displayTotal) * 100).toFixed(1);
         const activeDays = Math.floor((s.last - s.first) / 86400);
@@ -840,7 +861,7 @@ function renderTeamsGrid() {{
         const color      = teamColor(name);
         const members    = Array.isArray(s.members) ? s.members : [];
         const activeDays = Math.floor((s.last - s.first) / 86400);
-        const topDomains = Object.entries(teamDomainData[name] || {{}}).slice(0, 5);
+        const topDomains = Object.entries(teamComponentData[name] || {{}}).slice(0, 5);
         const medalHtml  = i < 3 ? `<span class="text-2xl">${{medals[i]}}</span>` : '';
 
         return `<div class="card hover:shadow-md transition-shadow cursor-pointer"
@@ -880,7 +901,7 @@ function renderTeamsGrid() {{
 
             ${{topDomains.length ? `
             <div class="mb-4">
-                <div class="text-[10px] font-black uppercase text-slate-400 mb-1.5">Primary Modules</div>
+                <div class="text-[10px] font-black uppercase text-slate-400 mb-1.5">Primary Components</div>
                 <div class="flex flex-wrap gap-1">
                     ${{topDomains.map(([d]) =>
                         `<span class="text-[10px] px-2 py-0.5 rounded font-black uppercase"
@@ -907,20 +928,20 @@ function filterByTeam(team) {{
     navToAuthors();
 }}
 
-function initDomainChart() {{
-    const dChart = new Chart(document.getElementById('domainChart'), {{
+function initComponentChart() {{
+    const dChart = new Chart(document.getElementById('componentChart'), {{
         type: 'bar',
         data: {{
-            labels: {domain_labels},
-            datasets: [{{ label:'Churn', data:{domain_values}, backgroundColor:'#3b82f6', borderRadius:8, barThickness:16 }}],
+            labels: {component_labels},
+            datasets: [{{ label:'Churn', data:{component_values}, backgroundColor:'#3b82f6', borderRadius:8, barThickness:16 }}],
         }},
         options: {{
             responsive: true, maintainAspectRatio: false, indexAxis: 'y',
             plugins: {{ legend: {{ display: false }} }},
             onClick: (e, elements) => {{
                 if (!elements.length) return;
-                const domain = dChart.data.labels[elements[0].index];
-                renderAuthorTable(domain, 'domain');
+                const component = dChart.data.labels[elements[0].index];
+                renderAuthorTable(component, 'component');
                 navToAuthors();
             }},
         }},
