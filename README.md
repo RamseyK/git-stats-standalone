@@ -4,7 +4,7 @@ A Python script that analyzes a Git repository and generates a self-contained HT
 
 ## Primary Metrics
 
-- **Summary** — project age, net lines, weekly cadence, release count, commit velocity trend, bus factor, and hourly punchcard
+- **Summary** — project age, lines of code, weekly cadence, release count, commit velocity trend, bus factor, and hourly punchcard
 - **Impact** — weighted leaderboard ranking authors and teams by commit volume, lines changed, and active tenure
 - **Authors** — sortable contributor table with team badges, filterable by component or team
 - **Teams** — per-team stats, member lists, and top components
@@ -13,7 +13,7 @@ A Python script that analyzes a Git repository and generates a self-contained HT
 
 ## Requirements
 
-Python 3.8+
+Python 3.11+
 
 ## Usage
 
@@ -65,14 +65,13 @@ The `-support` flag may be repeated to include any number of additional reposito
 | Author commit counts | Combined — each commit in any repo is credited to the resolved canonical author |
 | Author line stats | Combined — additions and deletions accumulate across all repos |
 | Team attribution | Combined — the same config teams and aliases apply to all repos |
-| Activity heatmap and punchcard | Combined |
+| Hourly punchcard | Combined |
 | Impact scoring | Computed over the combined author and team data |
 
 ### What stays main-repository-only
 
 | Data | Reason |
 |------|--------|
-| LOC history chart | A per-file running total only makes sense within a single repo's history; the chart notes this |
 | Components tab | Each repo gets its own component chart card (main repo first, support repos below) |
 | Release tags | Tag names and release ranges are specific to the main repo's version history |
 | File count | Reflects the current tracked files in the main repo |

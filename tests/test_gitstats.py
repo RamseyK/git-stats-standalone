@@ -40,7 +40,7 @@ EXPECTED_AUTHORS  = 310
 EXPECTED_TEAMS    = 3    # Core, Build & Packaging, Community
 EXPECTED_TAGS     = 50   # capped by max_release_tags in config.json
 
-# Support repo — pyodide-recipes adds recipe package commits on top of pyodide.
+# Support repo — pyodide-recipes
 RECIPES_REPO          = os.path.expanduser('~/Downloads/pyodide-recipes')
 RECIPES_LOCKED_COMMIT = 'b7c6155fa29d773c53cb0825d28f04d65cf76d32'
 
@@ -359,6 +359,382 @@ class TestImpactScoring:
                  gitstats.GitStats.IMPACT_W_LINES   +
                  gitstats.GitStats.IMPACT_W_TENURE)
         assert total == 100
+
+    # ── Stats invariants (real repo) ─────────────────────────────────────────
+
+    def test_sum_of_author_commits_equals_total_commits(self, std_gs):
+        """Every commit must be credited to exactly one canonical author."""
+        author_total = sum(a['commits'] for a in std_gs.data['authors'].values())
+        assert author_total == std_gs.data['general']['total_commits']
+
+    def test_sum_of_team_commits_equals_total_commits(self, std_gs):
+        """Every commit must be credited to exactly one team (including Community)."""
+        team_total = sum(t['commits'] for t in std_gs.data['teams'].values())
+        assert team_total == std_gs.data['general']['total_commits']
+
+    def test_author_add_del_nonnegative(self, std_gs):
+        """No author may have negative raw add or del counts."""
+        for name, a in std_gs.data['authors'].items():
+            assert a['add'] >= 0, f"{name} has negative add"
+            assert a['del'] >= 0, f"{name} has negative del"
+
+    def test_team_add_del_sum_matches_author_sum(self, std_gs):
+        """Team raw line totals must equal author raw line totals.
+
+        Each file-stat line in git log is credited once to the author and once
+        to their team, so the cross-author and cross-team sums must be equal.
+        """
+        author_adds = sum(a['add'] for a in std_gs.data['authors'].values())
+        author_dels = sum(a['del'] for a in std_gs.data['authors'].values())
+        team_adds   = sum(t['add'] for t in std_gs.data['teams'].values())
+        team_dels   = sum(t['del'] for t in std_gs.data['teams'].values())
+        assert team_adds == author_adds
+        assert team_dels == author_dels
+
+    def test_author_first_le_last(self, std_gs):
+        """Every author's first commit timestamp must be ≤ their last commit timestamp."""
+        for name, a in std_gs.data['authors'].items():
+            assert a['first'] <= a['last'], f"{name}: first={a['first']} > last={a['last']}"
+
+
+# ---------------------------------------------------------------------------
+# Impact scoring — unit tests with synthetic data
+# ---------------------------------------------------------------------------
+
+_DAY = 86400  # seconds in one day
+
+
+def _make_synthetic_gs(tmp_path, authors_spec, **gs_overrides):
+    """Return a GitStats instance with injected author data for testing _compute_impact().
+
+    authors_spec maps author name → dict with:
+        commit_lines: list of (timestamp_secs, adds, dels, team_name) tuples
+        team:         display team (optional, default 'Community')
+
+    gs_overrides are applied to the GitStats instance after construction so
+    individual tests can override use_net_lines, wash_window_days, etc.
+    The instance has no real git repo; call only _compute_impact(), not collect().
+    """
+    import pathlib
+    pathlib.Path(tmp_path).mkdir(parents=True, exist_ok=True)
+    cfg = make_config(str(tmp_path))
+    gs = gitstats.GitStats(str(tmp_path), cfg)
+    for k, v in gs_overrides.items():
+        setattr(gs, k, v)
+
+    authors = {}
+    teams = {}
+    for name, spec in authors_spec.items():
+        cls = spec['commit_lines']
+        team = spec.get('team', 'Community')
+        timestamps = [ts for ts, _, _, _ in cls]
+        authors[name] = {
+            'commits':      len(cls),
+            'add':          sum(a for _, a, _, _ in cls),
+            'del':          sum(d for _, _, d, _ in cls),
+            'first':        min(timestamps) if timestamps else 0,
+            'last':         max(timestamps) if timestamps else 0,
+            'team':         team,
+            'commit_lines': list(cls),
+        }
+        for ts, a, d, t in cls:
+            if t not in teams:
+                teams[t] = {
+                    'commits': 0, 'add': 0, 'del': 0,
+                    'members': set(), 'first': ts, 'last': ts,
+                }
+            teams[t]['commits'] += 1
+            teams[t]['add']     += a
+            teams[t]['del']     += d
+            teams[t]['members'].add(name)
+            teams[t]['first'] = min(teams[t]['first'], ts)
+            teams[t]['last']  = max(teams[t]['last'],  ts)
+
+    gs.data['authors'] = authors
+    gs.data['teams']   = teams
+    return gs
+
+
+class TestImpactLogicUnit:
+    """Unit tests for _compute_impact() using synthetic commit data.
+
+    These tests bypass git entirely — author commit_lines are injected directly —
+    so the formula, noise-reduction steps, and edge cases can be verified precisely.
+    """
+
+    # ── Score formula ─────────────────────────────────────────────────────────
+
+    def test_formula_two_authors_exact(self, tmp_path):
+        """Verify exact scores with two authors where Alice maximises every dimension.
+
+        With caps/wash disabled and gross lines:
+            max_commits=2, max_eff=200, max_tenure=365
+            Alice: (2/2)*40 + (200/200)*40 + (365/365)*20 = 100.0
+            Bob:   (2/2)*40 + (100/200)*40 + (183/365)*20 ≈ 70.0
+        """
+        gs = _make_synthetic_gs(tmp_path, {
+            'Alice': {'commit_lines': [
+                (0,            100, 0, 'C'),
+                (_DAY * 365,   100, 0, 'C'),
+            ]},
+            'Bob': {'commit_lines': [
+                (0,            50, 0, 'C'),
+                (_DAY * 183,   50, 0, 'C'),
+            ]},
+        }, use_net_lines=False, wash_window_days=0, line_cap_percentile=0)
+        gs._compute_impact()
+        assert gs.data['authors']['Alice']['impact'] == 100.0
+        assert gs.data['authors']['Bob']['impact'] == pytest.approx(70.0, abs=0.2)
+
+    def test_single_author_scores_100(self, tmp_path):
+        """A repository with exactly one author must score 100 (leads every dimension)."""
+        gs = _make_synthetic_gs(tmp_path, {
+            'Solo': {'commit_lines': [
+                (0,           500, 100, 'C'),
+                (_DAY * 200,  300,  50, 'C'),
+            ]},
+        }, wash_window_days=0, line_cap_percentile=0)
+        gs._compute_impact()
+        assert gs.data['authors']['Solo']['impact'] == 100.0
+
+    # ── Edge cases (no division errors) ──────────────────────────────────────
+
+    def test_all_zero_lines_no_division_error(self, tmp_path):
+        """Authors with zero effective lines (metadata-only commits) must not crash."""
+        gs = _make_synthetic_gs(tmp_path, {
+            'Alice': {'commit_lines': [(0, 0, 0, 'C'), (_DAY * 100, 0, 0, 'C')]},
+            'Bob':   {'commit_lines': [(0, 0, 0, 'C')]},
+        }, wash_window_days=0, line_cap_percentile=0)
+        gs._compute_impact()
+        for a in gs.data['authors'].values():
+            assert 0.0 <= a['impact'] <= 100.0
+
+    def test_single_commit_zero_tenure(self, tmp_path):
+        """An author whose first == last commit (zero tenure) must produce a valid score."""
+        gs = _make_synthetic_gs(tmp_path, {
+            'OneHit':  {'commit_lines': [(_DAY * 10,  100, 0, 'C')]},
+            'Veteran': {'commit_lines': [(0, 50, 0, 'C'), (_DAY * 200, 50, 0, 'C')]},
+        }, wash_window_days=0, line_cap_percentile=0)
+        gs._compute_impact()
+        for a in gs.data['authors'].values():
+            assert 0.0 <= a['impact'] <= 100.0
+
+    # ── Net vs gross lines ────────────────────────────────────────────────────
+
+    def test_net_lines_balanced_commit_scores_zero_lines(self, tmp_path):
+        """A commit with equal adds and deletes contributes 0 effective lines under net mode.
+
+        Only the commits weight (40) contributes; the lines and tenure weights are 0.
+        """
+        gs = _make_synthetic_gs(tmp_path, {
+            'Reformatter': {'commit_lines': [(_DAY, 1000, 1000, 'C')]},
+        }, use_net_lines=True, wash_window_days=0, line_cap_percentile=0)
+        gs._compute_impact()
+        # tenure = 0 days → tenure term = 0; eff_lines = 0 → lines term = 0
+        # score = (1/1)*40 + 0 + 0 = 40.0
+        assert gs.data['authors']['Reformatter']['impact'] == pytest.approx(40.0, abs=0.1)
+
+    def test_gross_lines_scores_both_sides(self, tmp_path):
+        """With net mode off, adds+dels are both counted, so a balanced commit scores high."""
+        gs_net   = _make_synthetic_gs(tmp_path / 'net', {
+            'A': {'commit_lines': [(_DAY, 1000, 1000, 'C')]},
+        }, use_net_lines=True,  wash_window_days=0, line_cap_percentile=0)
+        gs_gross = _make_synthetic_gs(tmp_path / 'gross', {
+            'A': {'commit_lines': [(_DAY, 1000, 1000, 'C')]},
+        }, use_net_lines=False, wash_window_days=0, line_cap_percentile=0)
+        gs_net._compute_impact()
+        gs_gross._compute_impact()
+        # Gross: eff=2000 → full lines weight (40) adds to commits weight (40) = ~80
+        # Net:   eff=0    → lines term = 0, score ≈ 40
+        assert gs_gross.data['authors']['A']['impact'] > gs_net.data['authors']['A']['impact']
+
+    def test_net_lines_asymmetric_commit(self, tmp_path):
+        """An asymmetric commit contributes abs(adds - dels) under net mode.
+
+        A single commit → tenure=0 → tenure term=0. With one author leading on
+        commits (1/1=1) and lines (full weight), score = commits_w + lines_w = 80.
+        """
+        gs = _make_synthetic_gs(tmp_path, {
+            'A': {'commit_lines': [(_DAY, 1000, 300, 'C')]},
+        }, use_net_lines=True, wash_window_days=0, line_cap_percentile=0)
+        gs._compute_impact()
+        wc = gitstats.GitStats.IMPACT_W_COMMITS
+        wl = gitstats.GitStats.IMPACT_W_LINES
+        # tenure=0 → tenure term contributes 0; commits and lines both at max
+        assert gs.data['authors']['A']['impact'] == pytest.approx(wc + wl, abs=0.1)
+
+    # ── Winsorization ─────────────────────────────────────────────────────────
+
+    def test_winsorization_reduces_outlier_dominance(self, tmp_path):
+        """A single bulk-import commit should not completely overshadow steady contributors.
+
+        With N total commits, cap_idx = int(N * cap_pct/100). For the 95th-percentile cap
+        to actually clamp the outlier we need N > 20 (otherwise cap_idx == N-1 and the
+        cap equals the outlier itself). We use 20 regular commits (21 total).
+        """
+        # 20 regular commits of 100 lines; 1 importer commit of 1,000,000 lines → N=21
+        # cap_idx = int(21 * 0.95) = 19; sorted _eff[19] = 100 → outlier capped to 100
+        regular_commits = [(_DAY * i, 100, 0, 'C') for i in range(20)]
+        gs_capped   = _make_synthetic_gs(tmp_path / 'cap', {
+            'Regular':  {'commit_lines': regular_commits},
+            'Importer': {'commit_lines': [(_DAY * 25, 1_000_000, 0, 'C')]},
+        }, use_net_lines=False, wash_window_days=0, line_cap_percentile=95)
+        gs_uncapped = _make_synthetic_gs(tmp_path / 'nocap', {
+            'Regular':  {'commit_lines': regular_commits},
+            'Importer': {'commit_lines': [(_DAY * 25, 1_000_000, 0, 'C')]},
+        }, use_net_lines=False, wash_window_days=0, line_cap_percentile=0)
+        gs_capped._compute_impact()
+        gs_uncapped._compute_impact()
+        capped_reg   = gs_capped.data['authors']['Regular']['impact']
+        uncapped_reg = gs_uncapped.data['authors']['Regular']['impact']
+        # Capping the outlier raises Regular's lines contribution, increasing their score.
+        assert capped_reg > uncapped_reg
+
+    def test_winsorization_disabled_at_zero_percentile(self, tmp_path):
+        """line_cap_percentile=0 must disable the cap entirely (no crash, single author = 100)."""
+        gs = _make_synthetic_gs(tmp_path, {
+            'A': {'commit_lines': [(_DAY, 10_000, 0, 'C'), (_DAY * 100, 10_000, 0, 'C')]},
+        }, line_cap_percentile=0, wash_window_days=0)
+        gs._compute_impact()
+        # Single author with positive commits, lines, and tenure → score = 100.
+        assert gs.data['authors']['A']['impact'] == 100.0
+
+    # ── Wash-window detection ─────────────────────────────────────────────────
+
+    def test_wash_window_revert_pair_scores_lower(self, tmp_path):
+        """A delete-then-re-add within one week bucket should score near zero for lines.
+
+        Alice: +1000 day 1, -1000 day 3 — same 7-day bucket → effective ≈ 0.
+        Bob:   three genuine commits spread across three separate weeks → effective = 600,
+               and Bob dominates all three dimensions so Alice clearly scores lower.
+        """
+        WEEK = 7 * _DAY
+        gs = _make_synthetic_gs(tmp_path, {
+            'Alice': {'commit_lines': [
+                (_DAY,          1000, 0,    'C'),
+                (_DAY * 3,      0,    1000, 'C'),
+            ]},
+            'Bob': {'commit_lines': [
+                (_DAY,          200, 0, 'C'),   # week 0
+                (WEEK + _DAY,   200, 0, 'C'),   # week 1 (different bucket)
+                (2*WEEK + _DAY, 200, 0, 'C'),   # week 2 (different bucket)
+            ]},
+        }, use_net_lines=True, wash_window_days=7, wash_min_gross=200, line_cap_percentile=0)
+        gs._compute_impact()
+        # Alice: gross=2000 > 200, min/gross=0.5 > 0.4 → washed → effective = 0
+        # Bob: each bucket gross=200, 200 > 200 is False → not triggered → effective = 600
+        # Bob leads on commits (3 vs 2), lines (600 vs 0), and tenure (14d vs 2d).
+        assert gs.data['authors']['Alice']['impact'] < gs.data['authors']['Bob']['impact']
+
+    def test_wash_window_below_min_gross_not_triggered(self, tmp_path):
+        """A balanced bucket with gross == wash_min_gross must NOT be suppressed.
+
+        The condition is `gross > wash_min` (strictly greater), so gross=200 with
+        wash_min_gross=200 leaves the bucket intact. The commit's full gross effective
+        value (200) is retained, giving the same result as with wash disabled.
+        """
+        gs_wash = _make_synthetic_gs(tmp_path / 'wash', {
+            'A': {'commit_lines': [(_DAY, 100, 100, 'C')]},
+        }, use_net_lines=False, wash_window_days=7, wash_min_gross=200, line_cap_percentile=0)
+        gs_no   = _make_synthetic_gs(tmp_path / 'nowash', {
+            'A': {'commit_lines': [(_DAY, 100, 100, 'C')]},
+        }, use_net_lines=False, wash_window_days=0,            line_cap_percentile=0)
+        gs_wash._compute_impact()
+        gs_no._compute_impact()
+        # gross=200 is NOT > wash_min_gross=200 → bucket intact in both cases → same score
+        assert gs_wash.data['authors']['A']['impact'] == gs_no.data['authors']['A']['impact']
+
+    def test_wash_window_separate_buckets_not_suppressed(self, tmp_path):
+        """Add in week 1 and delete in week 2 (different buckets) must NOT be washed out."""
+        WEEK = 7 * _DAY
+        gs = _make_synthetic_gs(tmp_path, {
+            'Alice': {'commit_lines': [
+                (_DAY,           1000, 0,    'C'),   # bucket 0
+                (WEEK + _DAY,    0,    1000, 'C'),   # bucket 1
+            ]},
+            'Bob': {'commit_lines': [(_DAY, 100, 0, 'C')]},
+        }, use_net_lines=True, wash_window_days=7, wash_min_gross=200, line_cap_percentile=0)
+        gs._compute_impact()
+        # Each bucket has gross=1000, net=1000, min/gross=0 → not balanced → not washed.
+        # Alice's effective = 1000+1000=2000 >> Bob's 100 → Alice scores higher.
+        assert gs.data['authors']['Alice']['impact'] > gs.data['authors']['Bob']['impact']
+
+    def test_wash_window_disabled_with_zero_days(self, tmp_path):
+        """wash_window_days=0 must disable wash detection: revert pair scores full effective."""
+        gs_on  = _make_synthetic_gs(tmp_path / 'on', {
+            'A': {'commit_lines': [
+                (_DAY,      1000, 0,    'C'),
+                (_DAY * 3,  0,    1000, 'C'),
+            ]},
+        }, use_net_lines=True, wash_window_days=7, wash_min_gross=200, line_cap_percentile=0)
+        gs_off = _make_synthetic_gs(tmp_path / 'off', {
+            'A': {'commit_lines': [
+                (_DAY,      1000, 0,    'C'),
+                (_DAY * 3,  0,    1000, 'C'),
+            ]},
+        }, use_net_lines=True, wash_window_days=0, line_cap_percentile=0)
+        gs_on._compute_impact()
+        gs_off._compute_impact()
+        # Wash on: effective ≈ 0 → score ≈ commits weight only ≈ 40
+        # Wash off: effective = 1000+1000=2000 → lines term adds → higher score
+        assert gs_off.data['authors']['A']['impact'] > gs_on.data['authors']['A']['impact']
+
+    # ── Team scoring consistency ──────────────────────────────────────────────
+
+    def test_team_wash_window_matches_author_wash_window(self, tmp_path):
+        """Team effective lines must apply the same wash-window logic as author scoring.
+
+        Setup:
+          Reverts team — Alice: +5000 on day 1, -5000 on day 5 (same 7-day bucket).
+          Genuine team — Bob: +300 on day 1, +300 on day 100 (different buckets).
+          Both teams have 2 commits, but Genuine has much longer tenure (99 days vs 4 days).
+
+        With wash on:  Reverts bucket is washed (gross=10000, net=0, ratio=0.5 > 0.4) →
+                       team_eff['Reverts']=0; Genuine team gets 600. Genuine wins.
+        With wash off: Reverts gets 10000 effective lines >> Genuine's 600. Reverts wins.
+        """
+        spec = {
+            'Alice': {'commit_lines': [
+                (_DAY,      5000, 0,    'Reverts'),   # bucket 0
+                (_DAY * 5,  0,    5000, 'Reverts'),   # bucket 0 (same week)
+            ], 'team': 'Reverts'},
+            'Bob': {'commit_lines': [
+                (_DAY,       300, 0, 'Genuine'),      # bucket 0
+                (_DAY * 100, 300, 0, 'Genuine'),      # bucket 14 (different week)
+            ], 'team': 'Genuine'},
+        }
+        gs_on  = _make_synthetic_gs(tmp_path / 'on',  spec,
+                                    use_net_lines=True, wash_window_days=7,
+                                    wash_min_gross=200, line_cap_percentile=0)
+        gs_off = _make_synthetic_gs(tmp_path / 'off', spec,
+                                    use_net_lines=True, wash_window_days=0,
+                                    line_cap_percentile=0)
+        gs_on._compute_impact()
+        gs_off._compute_impact()
+
+        genuine_on   = gs_on.data['teams']['Genuine']['impact']
+        reverts_on   = gs_on.data['teams']['Reverts']['impact']
+        genuine_off  = gs_off.data['teams']['Genuine']['impact']
+        reverts_off  = gs_off.data['teams']['Reverts']['impact']
+
+        # With wash on: Reverts washed to 0 effective lines → Genuine dominates lines+tenure.
+        assert genuine_on > reverts_on
+        # Without wash: Reverts gets 10000 effective lines → wins the lines dimension.
+        assert reverts_off > genuine_off
+
+    def test_team_add_del_computed_from_raw_lines(self, tmp_path):
+        """Team raw add/del totals must equal the sum of their members' raw add/del."""
+        gs = _make_synthetic_gs(tmp_path, {
+            'Alice': {'commit_lines': [(_DAY, 300, 100, 'Core')], 'team': 'Core'},
+            'Bob':   {'commit_lines': [(_DAY, 200,  50, 'Core')], 'team': 'Core'},
+            'Carol': {'commit_lines': [(_DAY, 400, 200, 'Docs')], 'team': 'Docs'},
+        }, wash_window_days=0, line_cap_percentile=0)
+        gs._compute_impact()
+        # Verify raw add/del on the data injected (before _compute_impact cleans commit_lines).
+        assert gs.data['teams']['Core']['add'] == 500   # 300+200
+        assert gs.data['teams']['Core']['del'] == 150   # 100+50
+        assert gs.data['teams']['Docs']['add'] == 400
+        assert gs.data['teams']['Docs']['del'] == 200
 
 
 # ---------------------------------------------------------------------------
@@ -914,8 +1290,55 @@ class TestSummaryTab:
         assert 'Last 90 Days' not in html
 
     def test_summary_stats_tiles_present(self, std_html):
-        """The four summary stat tiles (Days Old, Net Lines, Commits / Week, Releases) must appear."""
+        """The four summary stat tiles (Days Old, Lines of Code, Commits / Week, Releases) must appear."""
         assert 'Days Old' in std_html
-        assert 'Net Lines' in std_html
+        assert 'Lines of Code' in std_html
         assert 'Commits / Week' in std_html
         assert 'Releases' in std_html
+
+    def test_summary_tile_says_lines_of_code_not_net_lines(self, std_html):
+        """The summary tab tile label must be 'Lines of Code', not the old 'Net Lines'.
+
+        'Net Lines' still appears in the global header (historical net LOC from git history),
+        so we verify that 'Lines of Code' appears inside the tab-summary div specifically.
+        """
+        summary_start = std_html.find('id="tab-summary"')
+        assert summary_start != -1
+        # Find the closing boundary of the summary tab section.
+        # The next tab div begins with id="tab-impact".
+        summary_end = std_html.find('id="tab-impact"', summary_start)
+        summary_section = std_html[summary_start:summary_end] if summary_end != -1 else std_html[summary_start:]
+        assert 'Lines of Code' in summary_section
+        assert 'Net Lines' not in summary_section
+
+    # ── Data-layer: total_repo_lines ─────────────────────────────────────────
+
+    def test_total_repo_lines_positive(self, std_gs):
+        """total_repo_lines must be a positive integer after collect().
+
+        This field is the actual newline count of all tracked files — not the
+        historical net additions/deletions — and must be well above zero for pyodide.
+        """
+        assert std_gs.data['general']['total_repo_lines'] > 0
+
+    def test_total_repo_lines_differs_from_total_lines(self, std_gs):
+        """total_repo_lines (file newline count) must differ from total_lines (net git LOC).
+
+        total_lines is computed as running additions minus deletions across the full git
+        history and will undercount the actual file content. The two values represent
+        different measurements and must not be equal for a real-world repository.
+        """
+        repo_lines = std_gs.data['general']['total_repo_lines']
+        net_lines  = std_gs.data['general']['total_lines']
+        assert repo_lines != net_lines
+
+    def test_total_repo_lines_is_main_repo_only(self, combined_gs, std_gs):
+        """total_repo_lines must be identical with or without support repos.
+
+        Support repo file content is not counted; only the main repo's tracked files
+        contribute to this metric.
+        """
+        assert combined_gs.data['general']['total_repo_lines'] == std_gs.data['general']['total_repo_lines']
+
+if __name__ == "__main__":
+    sys.exit(pytest.main())
