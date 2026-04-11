@@ -1,4 +1,5 @@
 import os
+import shutil
 import subprocess
 import sys
 import json
@@ -678,7 +679,8 @@ class GitStats:
 
         Serializes self.data to JSON and injects it directly into the HTML
         as JavaScript constants, so the output file has zero external data
-        dependencies (Chart.js and Tailwind are loaded from CDN).
+        dependencies. external/tailwind.js and external/chart.js are copied
+        next to the output file so the report works fully offline.
         """
         # Convert member sets to sorted lists so they are JSON-serializable
         for t in self.data['teams'].values():
@@ -728,8 +730,8 @@ class GitStats:
 <html class="scroll-smooth">
 <head>
     <meta charset="UTF-8">
-    <script src="https://cdn.tailwindcss.com"></script>
-    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <script src="tailwind.js"></script>
+    <script src="chart.js"></script>
     <title>GitStats: {pname}</title>
     <style>
         .heatmap-cell {{ width:12px; height:12px; border-radius:2px; transition:transform 0.1s; cursor:help; }}
@@ -1389,6 +1391,17 @@ if (!hasTeams) {{
 </html>"""
         with open(output, 'w') as f:
             f.write(html)
+
+        # Copy external JS files (tailwind.js, chart.js) next to the output HTML
+        # so the report works fully offline with no Internet dependencies.
+        external_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'external')
+        out_dir = os.path.dirname(os.path.abspath(output))
+        for fname in ('tailwind.js', 'chart.js'):
+            src = os.path.join(external_dir, fname)
+            dst = os.path.join(out_dir, fname)
+            if os.path.abspath(src) != os.path.abspath(dst):
+                shutil.copy2(src, dst)
+
         print(f"Report generated: {os.path.abspath(output)}")
 
 

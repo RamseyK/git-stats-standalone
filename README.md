@@ -105,6 +105,26 @@ Without teams, all authors are grouped under a single **Community** label and th
 
 Authors not listed in any team are grouped into a built-in **Community** team shown in slate gray.
 
+#### Time-ranged membership
+
+Members can belong to a team for a specific date range, useful when contributors switch teams over time. Replace the plain string entry with an object:
+
+```json
+"members": [
+  "Always Member",
+  {"name": "Jane Smith", "from": "2021-01-01", "to": "2022-12-31"},
+  {"name": "bob@example.com", "from": "2023-06-01"}
+]
+```
+
+| Field | Description |
+|-------|-------------|
+| `name` | Git author name or email address |
+| `from` | Start date (`YYYY-MM-DD`). Omit to mean "since the beginning of the repo". |
+| `to` | End date (`YYYY-MM-DD`), inclusive. Omit to mean "through the present". |
+
+Each commit is credited to whichever team the author belonged to **at the time of that commit**. This ensures team impact scores reflect actual historical membership rather than a contributor's current team assignment.
+
 ### Aliases
 
 `aliases` merges multiple git identities into a single canonical name. This is useful when a contributor has committed under different names or email addresses over time.
@@ -117,22 +137,9 @@ Authors not listed in any team are grouped into a built-in **Community** team sh
 
 Each key is the canonical display name. Each value is a list of alternate names or email addresses that should be treated as the same person. Emails in the alias list are matched case-insensitively.
 
-### Impact score noise filtering
+## Impact Score
 
-The impact score's **Lines Changed** metric is filtered before scoring to prevent meaningless bulk operations (reformats, mass moves, revert pairs) from inflating contributor rankings.
-
-| Key | Default | Description |
-|-----|---------|-------------|
-| `impact_use_net_lines` | `true` | When `true`, each commit contributes `\|adds − dels\|` instead of `adds + dels`. A reformatting commit that deletes and re-adds 10,000 lines scores near zero rather than 20,000 gross lines. Set to `false` to use raw gross lines. |
-| `impact_wash_window_days` | `7` | Groups each author's commits into non-overlapping N-day time buckets. If a bucket's raw gross lines exceed `impact_wash_min_gross` and at least 67% of the changes cancel out (adds ≈ dels), the bucket scores only its net `\|adds − dels\|`. This catches the two-commit revert pattern: mass delete on Monday, mass re-add on Friday. Set to `0` to disable. |
-| `impact_wash_min_gross` | `200` | Minimum gross lines in a time bucket to trigger wash-window detection. Prevents small balanced day-to-day edits from being mistakenly zeroed out. |
-| `impact_line_cap_percentile` | `95` | Caps each commit's effective line contribution at this percentile of all commits in the repository. Prevents a one-time bulk import from dominating the lines metric. Set to `0` to disable the cap. |
-
-The filtering details used to generate any given report are displayed on the **Impact** tab under "Lines noise filtering," including the exact configured values.
-
-### Impact score weights
-
-The overall impact score formula is:
+The impact score is a single number in the range 0–100 that answers: *who did the most meaningful, sustained work in this repository?* It balances three signals so that no single dimension can dominate the ranking:
 
 ```
 score = (commits / max_commits)         × 40
@@ -140,7 +147,34 @@ score = (commits / max_commits)         × 40
       + (tenure_days / max_tenure)      × 20
 ```
 
-Each metric is normalized against the top performer in that dimension, so the highest scorer in each category always contributes the full weight for that category. To change the weights, edit the class constants at the top of `gitstats.py`:
+Each metric is normalized against the top performer in that dimension, so the leader in any one category always contributes the full weight for that category and everyone else is proportional.
+
+- **Commits (40%)** — rewards consistent, incremental contribution. Hard to inflate without corresponding lines.
+- **Effective lines (40%)** — volume of real code changed, after noise filtering. Reformats and reverts score near zero.
+- **Tenure (20%)** — days between first and last commit. A burst of 500 commits over one week scores lower than 500 commits spread over three years.
+
+### Noise filtering
+
+Raw line counts from `git log --numstat` overcount meaningless work. The effective lines metric applies a three-step pipeline before scoring.
+
+**Step 1 — Net lines** (`impact_use_net_lines`, default `true`): Each commit contributes `|adds − dels|` rather than `adds + dels`. A reformatting pass that deletes and re-adds 10,000 lines scores near zero.
+
+**Step 2 — Percentile cap** (`impact_line_cap_percentile`, default `95`): Each commit's effective contribution is capped at the 95th percentile of all commits. A one-time bulk import won't overshadow years of regular work.
+
+**Step 3 — Wash-window detection** (`impact_wash_window_days`, default `7`): Catches the two-commit revert pattern Step 1 misses — a large delete on Monday and re-add on Friday each have `|adds − dels|` near zero individually, but together represent no net change. Commits are grouped into N-day buckets per author; if a bucket's gross lines exceed `impact_wash_min_gross` and at least 67% of the changes cancel out, the bucket scores its raw net instead. `impact_wash_min_gross` (default `200`) prevents small balanced edits from being mistakenly zeroed out.
+
+The exact configured values and computed cap are displayed on the **Impact** tab under "Lines noise filtering."
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `impact_use_net_lines` | `true` | `true` → `\|adds − dels\|` per commit; `false` → raw `adds + dels`. |
+| `impact_wash_window_days` | `7` | Size of the wash-window in days. Set to `0` to disable. |
+| `impact_wash_min_gross` | `200` | Minimum gross lines in a bucket to trigger wash detection. |
+| `impact_line_cap_percentile` | `95` | Per-commit line cap percentile. Set to `0` to disable. |
+
+### Tuning
+
+The defaults suit most open-source projects. To change the metric weights, edit the class constants at the top of `gitstats.py` (must sum to 100):
 
 ```python
 IMPACT_W_COMMITS = 40   # commit count
@@ -148,4 +182,9 @@ IMPACT_W_LINES   = 40   # effective lines changed
 IMPACT_W_TENURE  = 20   # active tenure in days
 ```
 
-The three values must sum to 100.
+- **Raise `IMPACT_W_COMMITS`, lower `IMPACT_W_LINES`** for projects that value steady incremental work over large code drops.
+- **Raise `IMPACT_W_LINES`, lower `IMPACT_W_COMMITS`** for greenfield or research codebases where volume of real code matters more than commit discipline.
+- **Raise `IMPACT_W_TENURE`** to weight long-term contributors more heavily relative to recent high-activity newcomers.
+- **Set `impact_use_net_lines: false`** if gross volume is genuinely meaningful (e.g., large automated test generation).
+- **Lower `impact_line_cap_percentile`** (e.g., `80`) for tighter outlier control; `0` to disable.
+- **Lower `impact_wash_window_days`** (e.g., `3`) for high-frequency repos where revert pairs happen within days.
