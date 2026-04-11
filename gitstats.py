@@ -6,7 +6,9 @@ import datetime
 import argparse
 from collections import Counter, defaultdict
 
-# Distinct colors for up to 12 teams; 'Community' gets slate
+# Default palette cycled through when a team has no explicit "color" in config.
+# Supports up to 12 teams; the 13th wraps back to the first color.
+# The fallback "Community" team is always assigned slate (#94a3b8) separately.
 TEAM_COLORS = [
     '#3b82f6', '#10b981', '#f59e0b', '#ef4444',
     '#8b5cf6', '#ec4899', '#06b6d4', '#84cc16',
@@ -56,73 +58,101 @@ class GitStats:
         self.repo_path = repo_path
         config = self._load_config(config_file)
 
-        # aliases: canonical_name -> [alias, email, ...]
-        # Email keys are lowercased so lookups are case-insensitive.
+        # Build alias lookup: any name/email variant → canonical author name.
+        # Email keys are stored lowercased so matching is case-insensitive.
+        # Config format: {"Canonical Name": ["alias", "old@email.com", ...]}
         aliases = config.get('aliases', {})
         self.alias_to_canonical = {
             (alias.lower() if '@' in alias else alias): canon
             for canon, als in aliases.items() for alias in als
         }
 
-        # teams: team_name -> [author name or email, ...]
-        # Email keys are lowercased so lookups are case-insensitive.
-        # teams: {"Team Name": {"color": "#hex", "members": [name/email, ...]}}
+        # Build team membership and color lookups from config.
+        # Config format: {"Team Name": {"color": "#hex", "members": [name/email, ...]}}
+        # If a team omits "color", it is assigned the next color in TEAM_COLORS.
+        # Email members are stored lowercased for case-insensitive matching.
+        # Authors not listed in any team fall back to the built-in "Community" team.
         teams_config = config.get('teams', {})
-        self.author_to_team = {}
-        self.team_colors = {}
+        self.author_to_team = {}   # name/email → team name
+        self.team_colors = {}      # team name  → hex color string
         for i, (team, value) in enumerate(teams_config.items()):
             self.team_colors[team] = value.get('color') or TEAM_COLORS[i % len(TEAM_COLORS)]
             for m in value.get('members', []):
                 key = m.lower() if '@' in m else m
                 self.author_to_team[key] = team
-        self.team_colors['Community'] = '#94a3b8'
+        self.team_colors['Community'] = '#94a3b8'  # slate — always last / fallback
 
-        # Optional tag prefix filter — only tags starting with this string are
-        # included in the Releases tab. Empty string / absent key = all tags.
+        # Only git tags whose name begins with this prefix are shown in the
+        # Releases tab. An empty string (the default) means all tags are included.
         self.release_tag_prefix = config.get('release_tag_prefix', '')
 
-        # Maximum number of tags to display in the Releases tab (default: 20).
+        # Cap on how many tags to show in the Releases tab.
+        # Set to 0 in config to display all matching tags with no limit.
         self.max_release_tags = int(config.get('max_release_tags', 20))
 
+        # Central data store populated by collect() and consumed by generate_report().
         self.data = {
             'project_name': os.path.basename(os.path.abspath(repo_path)),
             'analysis_date': datetime.datetime.now().strftime("%Y-%m-%d %H:%M"),
             'general': {'total_commits': 0, 'total_files': 0, 'total_lines': 0, 'age_days': 0},
             'activity': {'hour': Counter(), 'weekday': Counter(), 'heatmap': Counter()},
-            'authors': {},
-            'teams': {},
-            'component_contributions': defaultdict(lambda: Counter()),  # component -> {author: commit_count}
-            'team_components': defaultdict(lambda: Counter()),           # team      -> {component: churn}
-            'files': Counter(),
-            'components': Counter(),
-            'tags': [],
-            'loc_history': [],
+            'authors': {},   # canonical name → {commits, add, del, first, last, team, impact}
+            'teams': {},     # team name      → {commits, add, del, members, first, last, impact}
+            'component_contributions': defaultdict(lambda: Counter()),  # component path → {author: commit_count}
+            'team_components': defaultdict(lambda: Counter()),           # team name      → {component path: churn lines}
+            'files': Counter(),      # file extension → count
+            'components': Counter(), # component path → total churn lines
+            'tags': [],              # list of release dicts built in step 3 of collect()
+            'loc_history': [],       # running net LOC per file-change event, oldest-first after reversal
         }
 
     # ------------------------------------------------------------------ helpers
 
     def _load_config(self, path):
+        """Return parsed JSON config, or an empty dict if the file is absent or unspecified."""
         if not path or not os.path.exists(path):
             return {}
         with open(path) as f:
             return json.load(f)
 
     def _get_component(self, path):
-        """Return the component directory for a file path, or None if not within any component."""
+        """Map a repo-relative file path to its component directory.
+
+        A component is any directory that directly contains make.py,
+        pyproject.toml, or setup.py (discovered during collect()).
+        self._component_dirs is pre-sorted longest-first so the most
+        specific (deepest) ancestor wins when directories are nested.
+
+        Returns the component directory string, '(root)' for top-level
+        marker files, or None if the file is not inside any component.
+        """
         for comp in self._component_dirs:
             if comp == '':
+                # Marker file is at the repo root (dirname of 'pyproject.toml' == '')
                 return '(root)'
             if path == comp or path.startswith(comp + '/'):
                 return comp
-        return None
+        return None  # file is not inside any recognized component
 
     def _get_author(self, name, email):
+        """Resolve a raw git author name/email to a canonical name via the alias map.
+
+        Lookup order: email (lowercased) → display name → original name as-is.
+        """
         return self.alias_to_canonical.get(email.lower(), self.alias_to_canonical.get(name, name))
 
     def _get_team(self, author, email):
+        """Return the team name for a given canonical author name and email.
+
+        Lookup order: email (lowercased) → author name → 'Community' fallback.
+        """
         return self.author_to_team.get(email.lower(), self.author_to_team.get(author, 'Community'))
 
     def _run_git(self, args):
+        """Run a git subcommand inside self.repo_path and return its stdout as a string.
+
+        stderr is suppressed. Raises subprocess.CalledProcessError on non-zero exit.
+        """
         return subprocess.check_output(
             ['git', '-C', self.repo_path] + args,
             stderr=subprocess.DEVNULL
@@ -131,10 +161,21 @@ class GitStats:
     # ------------------------------------------------------------------ collect
 
     def collect(self):
+        """Populate self.data by running git commands against the repository.
+
+        Three phases:
+          1. File inventory + component discovery (git ls-files)
+          2. Full commit history with per-file line stats (git log --numstat)
+          3. Release tag breakdown (git tag + git log per tag range)
+
+        Must be called before generate_report().
+        """
         print(f"Analyzing {self.data['project_name']}...")
 
-        # 1. File inventory + component discovery
-        # A component is a directory that directly contains make.py, pyproject.toml, or setup.py.
+        # ── Phase 1: file inventory + component discovery ─────────────────────
+        # git ls-files lists every tracked file. We use it to:
+        #   a) count files by extension for the general stats
+        #   b) find component roots (dirs that contain a marker file)
         ls_files = self._run_git(['ls-files']).splitlines()
         self.data['general']['total_files'] = len(ls_files)
         component_markers = {'make.py', 'pyproject.toml', 'setup.py'}
@@ -143,20 +184,25 @@ class GitStats:
             ext = os.path.splitext(f)[1].lower() or 'source'
             self.data['files'][ext] += 1
             if os.path.basename(f) in component_markers:
-                comp_dir = os.path.dirname(f)
-                component_dirs.add(comp_dir)
-        # Sort longest-first so the most specific ancestor matches first
+                # The directory containing the marker file is the component root.
+                component_dirs.add(os.path.dirname(f))
+        # Longest paths first so _get_component() matches the deepest ancestor.
         self._component_dirs = sorted(component_dirs, key=len, reverse=True)
 
-        # 2. Full commit history with per-file stats
+        # ── Phase 2: commit history ───────────────────────────────────────────
+        # --numstat emits one "COMMIT|..." header per commit followed by
+        # tab-separated (added, deleted, filepath) lines for each changed file.
         log_data = self._run_git(['log', '--numstat', '--pretty=format:COMMIT|%at|%an|%ae'])
+
+        # State carried across lines within the same commit
         current_author = current_team = None
-        running_loc = 0
-        all_ts = []
+        running_loc = 0   # net lines added across all commits so far (used for LOC chart)
+        all_ts = []       # all commit timestamps, used to compute repo age
         ts = 0
 
         for line in log_data.splitlines():
             if line.startswith('COMMIT|'):
+                # ── Commit header ─────────────────────────────────────────────
                 _, ts_str, name, email = line.split('|', 3)
                 ts = int(ts_str)
                 dt = datetime.datetime.fromtimestamp(ts)
@@ -166,6 +212,7 @@ class GitStats:
                 current_author = author
                 current_team = team
 
+                # Initialize author record on first encounter
                 if author not in self.data['authors']:
                     self.data['authors'][author] = {
                         'commits': 0, 'add': 0, 'del': 0,
@@ -176,6 +223,7 @@ class GitStats:
                 au['last'] = max(au['last'], ts)
                 au['first'] = min(au['first'], ts)
 
+                # Initialize team record on first encounter
                 if team not in self.data['teams']:
                     self.data['teams'][team] = {
                         'commits': 0, 'add': 0, 'del': 0,
@@ -187,15 +235,17 @@ class GitStats:
                 tm['first'] = min(tm['first'], ts)
                 tm['members'].add(author)
 
+                # Activity counters used for the heatmap and punchcard charts
                 self.data['general']['total_commits'] += 1
                 self.data['activity']['hour'][dt.hour] += 1
                 self.data['activity']['weekday'][dt.weekday()] += 1
                 self.data['activity']['heatmap'][dt.strftime('%Y-%m-%d')] += 1
 
             elif '\t' in line and current_author:
+                # ── Per-file stat line ────────────────────────────────────────
                 try:
                     parts = line.split('\t', 2)
-                    # Binary files show '-' for add/del counts
+                    # Binary files show '-' instead of a numeric count
                     a = int(parts[0]) if parts[0] and parts[0] != '-' else 0
                     d = int(parts[1]) if parts[1] and parts[1] != '-' else 0
                     path = parts[2] if len(parts) > 2 else ''
@@ -204,9 +254,14 @@ class GitStats:
                     self.data['authors'][current_author]['del'] += d
                     self.data['teams'][current_team]['add'] += a
                     self.data['teams'][current_team]['del'] += d
+
+                    # Track running net LOC for the LOC history chart.
+                    # We append after every file change, then reverse the list
+                    # at the end so it runs oldest → newest.
                     running_loc += (a - d)
                     self.data['loc_history'].append(running_loc)
 
+                    # Attribute churn to the file's component (if any)
                     component = self._get_component(path)
                     if component is not None:
                         self.data['components'][component] += (a + d)
@@ -215,17 +270,24 @@ class GitStats:
                 except (ValueError, IndexError):
                     continue
 
+        # Derive repo age from the span between oldest and newest commit
         if all_ts:
             self.data['general']['age_days'] = (max(all_ts) - min(all_ts)) // 86400
         self.data['general']['total_lines'] = running_loc
+
+        # git log walks newest-first, so reverse to get chronological order
         self.data['loc_history'].reverse()
 
-        # Decimate LOC history for large repos (keep ≤2000 points)
+        # For large repos, decimating to ≤2000 points keeps the chart responsive
+        # without meaningfully reducing visual fidelity.
         if len(self.data['loc_history']) > 2000:
             step = len(self.data['loc_history']) // 2000
             self.data['loc_history'] = self.data['loc_history'][::step]
 
-        # 3. Tag history (top 20 tags)
+        # ── Phase 3: release tag breakdown ───────────────────────────────────
+        # Tags are sorted newest-first. For each tag we attribute the commits
+        # between it and the previous tag (tag_range) to authors and teams.
+        # The oldest tag uses just its name as the range (all commits up to it).
         try:
             tags = self._run_git(['tag', '--sort=-creatordate']).splitlines()
         except subprocess.CalledProcessError:
@@ -234,10 +296,13 @@ class GitStats:
         if self.release_tag_prefix:
             tags = [t for t in tags if t.startswith(self.release_tag_prefix)]
 
+        # 0 means no limit; any positive value caps the list
         if self.max_release_tags:
             tags = tags[:self.max_release_tags]
 
         for i, tag in enumerate(tags):
+            # Range: commits between the next-older tag and this one.
+            # For the oldest tag in the list, include all its commits.
             tag_range = tag if i == len(tags) - 1 else f"{tags[i + 1]}..{tag}"
             try:
                 tag_log = self._run_git(['log', tag_range, '--pretty=format:%an|%ae'])
@@ -267,12 +332,19 @@ class GitStats:
     # ------------------------------------------------------------------ impact
 
     def _compute_impact(self):
-        """
-        Impact score (0–100) = normalized(commits)*W_COMMITS
-                              + normalized(lines)*W_LINES
-                              + normalized(tenure_days)*W_TENURE
-        Weights are defined as class constants (IMPACT_W_*).
-        Separately computed for authors and teams.
+        """Compute and store impact scores for every author and team.
+
+        Score formula (produces a value in the range 0–100):
+            score = (commits / max_commits) * IMPACT_W_COMMITS
+                  + ((add + del) / max_lines) * IMPACT_W_LINES
+                  + (tenure_days / max_tenure) * IMPACT_W_TENURE
+
+        Each metric is normalized against the top performer in that metric,
+        so the best contributor in each dimension always contributes the full
+        weight for that dimension. Weights are class-level constants and must
+        sum to 100. Authors and teams are scored independently (separate maxima).
+
+        Results are written back into the author/team dicts as 'impact'.
         """
         wc = self.IMPACT_W_COMMITS
         wl = self.IMPACT_W_LINES
@@ -307,6 +379,12 @@ class GitStats:
     # ------------------------------------------------------------------ HTML helpers
 
     def _render_tags_html(self):
+        """Return an HTML string of release cards for the Releases tab.
+
+        Each card shows the tag name, per-team commit badges (with impact score),
+        and a grid of top authors with their commit counts for that release.
+        Returns a placeholder card when no tags were collected.
+        """
         if not self.data['tags']:
             return ('<div class="card text-center text-slate-400 font-bold py-16">'
                     'No tags found in this repository.</div>')
@@ -350,23 +428,32 @@ class GitStats:
     # ------------------------------------------------------------------ report
 
     def generate_report(self, output="index.html"):
-        # Finalize sets → sorted lists for JSON serialization
+        """Render all collected data into a self-contained HTML file.
+
+        Serializes self.data to JSON and injects it directly into the HTML
+        as JavaScript constants, so the output file has zero external data
+        dependencies (Chart.js and Tailwind are loaded from CDN).
+        """
+        # Convert member sets to sorted lists so they are JSON-serializable
         for t in self.data['teams'].values():
             t['members'] = sorted(list(t['members']))
 
-        # Serialize data for JavaScript
+        # ── JSON blobs injected into the <script> block ───────────────────────
         authors_json    = json.dumps(self.data['authors'])
         teams_json      = json.dumps(self.data['teams'])
         team_colors_json = json.dumps(self.team_colors)
+        # component_contributions: {path: {author: commit_count}} — used by the
+        # Components tab click-to-filter feature in the Authors tab.
         component_json      = json.dumps({k: dict(v) for k, v in self.data['component_contributions'].items()})
+        # team_components: top 8 components per team — used by the Teams tab cards.
         team_component_json = json.dumps({k: dict(v.most_common(8)) for k, v in self.data['team_components'].items()})
         heatmap_json        = json.dumps(dict(self.data['activity']['heatmap']))
         loc_json            = json.dumps(self.data['loc_history'])
         hour_data           = json.dumps([self.data['activity']['hour'][i] for i in range(24)])
 
-        sorted_components   = self.data['components'].most_common(30)
-        component_labels    = json.dumps([c[0] for c in sorted_components])
-        component_values    = json.dumps([c[1] for c in sorted_components])
+        sorted_components      = self.data['components'].most_common(30)
+        component_labels       = json.dumps([c[0] for c in sorted_components])
+        component_values       = json.dumps([c[1] for c in sorted_components])
 
         pname  = self.data['project_name']
         adate  = self.data['analysis_date']
@@ -564,7 +651,7 @@ class GitStats:
 
     <!-- ═══ COMPONENTS ════════════════════════════════════════════════════════ -->
     <div id="tab-components" class="tab-content hidden">
-        <div class="card" style="height:700px">
+        <div class="card" id="componentChartCard">
             <div class="mb-6">
                 <h3 class="text-xl font-black">Component Churn Analysis</h3>
                 <p class="text-sm text-slate-400 font-medium mt-1">Click any bar to filter contributors by component.</p>
@@ -583,6 +670,14 @@ const teamColors     = {team_colors_json};
 const componentData     = {component_json};
 const teamComponentData = {team_component_json};
 const totalCommits   = {tcom};
+
+// Pre-compute how many component paths share each short (last-segment) name.
+// Used by compLabel() to decide whether to show the short name or the full path.
+const _compShortCount = {{}};
+Object.keys(componentData).forEach(k => {{
+    const s = k.includes('/') ? k.split('/').pop() : k;
+    _compShortCount[s] = (_compShortCount[s] || 0) + 1;
+}});
 
 let currentSortKey   = 'impact';
 let currentFilter    = null;
@@ -616,6 +711,14 @@ function navToAuthors() {{
 function teamColor(team) {{ return teamColors[team] || '#94a3b8'; }}
 
 function fmt(n) {{ return Number(n).toLocaleString(); }}
+
+// Return a display label for a component path.
+// Uses only the last path segment unless that segment is ambiguous (shared by
+// multiple components), in which case the full path is returned instead.
+function compLabel(path) {{
+    const short = path.includes('/') ? path.split('/').pop() : path;
+    return _compShortCount[short] > 1 ? path : short;
+}}
 
 function impactBar(score, color) {{
     return `<div class="impact-bar"><div class="impact-fill" style="width:${{score}}%;background:${{color}}"></div></div>`;
@@ -661,7 +764,7 @@ function renderAuthorTable(filter, filterType) {{
         const filtered = componentData[currentFilter] || {{}};
         authors      = authors.filter(([n]) => filtered[n]);
         displayTotal = Object.values(filtered).reduce((a,b) => a+b, 0) || 1;
-        title.innerText = `Component: ${{currentFilter}}`;
+        title.innerText = `Component: ${{compLabel(currentFilter)}}`;
         resetBtn.classList.remove('hidden');
     }} else if (currentFilter && currentFilterType === 'team') {{
         authors      = authors.filter(([,d]) => d.team === currentFilter);
@@ -905,7 +1008,7 @@ function renderTeamsGrid() {{
                 <div class="flex flex-wrap gap-1">
                     ${{topDomains.map(([d]) =>
                         `<span class="text-[10px] px-2 py-0.5 rounded font-black uppercase"
-                               style="background:${{color}}22;color:${{color}}">${{d}}</span>`
+                               style="background:${{color}}22;color:${{color}}">${{compLabel(d)}}</span>`
                     ).join('')}}
                 </div>
             </div>` : ''}}
@@ -929,10 +1032,15 @@ function filterByTeam(team) {{
 }}
 
 function initComponentChart() {{
-    const dChart = new Chart(document.getElementById('componentChart'), {{
+    const componentKeys = {component_labels};
+    const canvas = document.getElementById('componentChart');
+    const chartHeight = Math.max(300, componentKeys.length * 36 + 80);
+    canvas.style.height = chartHeight + 'px';
+    document.getElementById('componentChartCard').style.height = (chartHeight + 120) + 'px';
+    const dChart = new Chart(canvas, {{
         type: 'bar',
         data: {{
-            labels: {component_labels},
+            labels: componentKeys.map(compLabel),
             datasets: [{{ label:'Churn', data:{component_values}, backgroundColor:'#3b82f6', borderRadius:8, barThickness:16 }}],
         }},
         options: {{
@@ -940,7 +1048,7 @@ function initComponentChart() {{
             plugins: {{ legend: {{ display: false }} }},
             onClick: (e, elements) => {{
                 if (!elements.length) return;
-                const component = dChart.data.labels[elements[0].index];
+                const component = componentKeys[elements[0].index];
                 renderAuthorTable(component, 'component');
                 navToAuthors();
             }},
@@ -1009,6 +1117,7 @@ renderTeamsGrid();
 
 
 def main() -> int:
+    """CLI entry point. Parse arguments, run analysis, write report. Returns exit code."""
     parser = argparse.ArgumentParser(
         description="Generate a self-contained HTML statistics report for a Git repository."
     )
@@ -1025,6 +1134,7 @@ def main() -> int:
         help="Output HTML file path (default: /tmp/index.html)"
     )
     args = parser.parse_args()
+
     if not os.path.isdir(args.source):
         print(f"Provided source Git repository directory does not exist at {args.source}")
         return 1
