@@ -26,7 +26,7 @@ TEAM_COLORS = [
 class GitStats:
     """
     Analyzes a Git repository and generates a self-contained HTML report with:
-      - Activity heatmap, LOC history, hourly punchcard
+      - Summary tab: project overview, commit velocity, bus factor, punchcard
       - Impact leaderboard (authors + teams) with a weighted score
       - Sortable contributors table with team badges
       - Team cards showing stats, ownership, members
@@ -183,6 +183,19 @@ class GitStats:
         # full control over which directories are detected as component boundaries.
         cfg_markers = config.get('component_markers')
         self.component_markers = set(cfg_markers) if cfg_markers is not None else self.COMPONENT_MARKERS
+
+        # ── Summary tab configuration ─────────────────────────────────────────
+        # Day windows for commit velocity cards.  Each entry produces one card
+        # comparing commits in the last N days vs the prior N days.  The default
+        # [30, 90] shows a 30-day and a 90-day view side by side.  Uses the
+        # combined heatmap (main repo + all support repos).
+        self.summary_velocity_days = list(config.get('summary_velocity_days', [30, 90]))
+
+        # Fraction of total commits that defines bus-factor ownership (0–1).
+        # The bus factor is the minimum number of contributors whose combined
+        # commits reach this fraction.  For example, 0.5 = the fewest people
+        # whose commits add up to 50% of the total.  Default: 0.5.
+        self.bus_factor_threshold = float(config.get('bus_factor_threshold', 0.5))
 
         # ── Impact score noise-reduction options ──────────────────────────────
         # These filter out commits that inflate the lines metric without
@@ -478,7 +491,9 @@ class GitStats:
 
         # Age and total LOC derive from the main repo only.
         if main_all_ts:
-            self.data['general']['age_days'] = (max(main_all_ts) - min(main_all_ts)) // 86400
+            self.data['general']['age_days']         = (max(main_all_ts) - min(main_all_ts)) // 86400
+            self.data['general']['first_commit_ts']  = min(main_all_ts)
+            self.data['general']['last_commit_ts']   = max(main_all_ts)
         self.data['general']['total_lines'] = main_running_loc
 
         # git log walks newest-first, so reverse to get chronological order.
@@ -531,6 +546,10 @@ class GitStats:
 
         if self.release_tag_prefix:
             tags = [t for t in tags if t.startswith(self.release_tag_prefix)]
+
+        # Record the full count before capping so the Summary tab can show the
+        # true total even when display is limited by max_release_tags.
+        self.data['general']['total_tags'] = len(tags)
 
         # 0 means no limit; any positive value caps the list
         if self.max_release_tags:
@@ -799,8 +818,6 @@ class GitStats:
         # Drawn from the main repo only; support repo component data appears in
         # the separate per-repo cards on the Components tab.
         team_component_json = json.dumps({k: dict(v.most_common(8)) for k, v in self.data['team_components'].items()})
-        heatmap_json        = json.dumps(dict(self.data['activity']['heatmap']))
-        loc_json            = json.dumps(self.data['loc_history'])
         hour_data           = json.dumps([self.data['activity']['hour'][i] for i in range(24)])
 
         # ── Per-repo component chart data ─────────────────────────────────────
@@ -864,19 +881,13 @@ class GitStats:
             )
         component_cards_html = '\n'.join(component_cards)
 
-        # LOC History card subtitle — shown when support repos are configured
-        # to make clear the chart covers the main repository only.
-        loc_note_html = (
-            '<p class="text-xs text-slate-400 font-medium mb-2">Main repository only.</p>'
-            if self.support_paths else ''
-        )
-
         pname  = self.data['project_name']
         adate  = self.data['analysis_date']
         tcom   = self.data['general']['total_commits']
         tlines = self.data['general']['total_lines']
         nauth  = len(self.data['authors'])
         nteams = len(self.data['teams'])
+        age_days = self.data['general'].get('age_days', 0)
 
         iw_commits = self.IMPACT_W_COMMITS
         iw_lines   = self.IMPACT_W_LINES
@@ -894,6 +905,144 @@ class GitStats:
         cfg_wash_status  = f'{cfg_wash_days}-day window, ≥{cfg_wash_min} gross lines' if cfg_wash_days else 'off'
         cfg_cap_status   = f'{cfg_cap_pct}th percentile' if cfg_cap_pct else 'off'
 
+        # ── Summary tab computed values ───────────────────────────────────────
+
+        # First commit date for display
+        _first_ts = self.data['general'].get('first_commit_ts', 0)
+        first_commit_date = (
+            datetime.datetime.fromtimestamp(_first_ts).strftime('%b %d, %Y')
+            if _first_ts else 'N/A'
+        )
+
+        # Average weekly commit cadence over the lifetime of the repo
+        _age_weeks = age_days / 7
+        avg_weekly = round(tcom / _age_weeks, 1) if _age_weeks > 0 else 0
+
+        # Total release tags (before any display cap)
+        total_tags_count  = self.data['general'].get('total_tags', len(self.data['tags']))
+        shown_tags_count  = len(self.data['tags'])
+        tags_note_html    = (
+            f'<div class="text-xs text-slate-400 mt-1">Showing {shown_tags_count} of {total_tags_count}</div>'
+            if shown_tags_count < total_tags_count else
+            '<div class="text-xs text-slate-400 mt-1">&nbsp;</div>'
+        )
+
+        # Support repo pills for summary card header
+        if self.support_paths:
+            _pills = ' '.join(
+                f'<span class="text-[10px] px-2 py-0.5 rounded font-black uppercase '
+                f'bg-slate-100 text-slate-500">'
+                f'+ {os.path.basename(os.path.abspath(p))}</span>'
+                for p in self.support_paths
+            )
+            support_repos_html = f'<div class="flex flex-wrap gap-1 mt-1.5">{_pills}</div>'
+        else:
+            support_repos_html = ''
+
+        # Commit velocity — last N days vs prior N days, from the combined heatmap.
+        _heatmap   = self.data['activity']['heatmap']
+        _today_dt  = datetime.date.today()
+        _today_str = _today_dt.isoformat()
+        velocity_windows = []
+        for _days in self.summary_velocity_days:
+            _cur_start  = (_today_dt - datetime.timedelta(days=_days)).isoformat()
+            _prev_start = (_today_dt - datetime.timedelta(days=_days * 2)).isoformat()
+            _current = sum(v for k, v in _heatmap.items() if _cur_start <= k <= _today_str)
+            _prior   = sum(v for k, v in _heatmap.items() if _prev_start <= k < _cur_start)
+            _delta   = round((_current - _prior) / _prior * 100, 1) if _prior else None
+            velocity_windows.append({'days': _days, 'current': _current, 'prior': _prior, 'delta': _delta})
+
+        _ncols    = min(len(velocity_windows), 4)
+        _vcols_cls = f'md:grid-cols-{_ncols}' if _ncols > 1 else ''
+        _vcards   = []
+        for _vw in velocity_windows:
+            _d, _cur, _pri, _dlt = _vw['days'], _vw['current'], _vw['prior'], _vw['delta']
+            if _dlt is None:
+                _trend = '<span class="text-slate-400 text-sm font-medium">— no prior data</span>'
+            elif _dlt > 0:
+                _trend = (f'<span class="text-emerald-600 text-sm font-bold">'
+                          f'&#8593; +{_dlt}% vs prior {_d}d</span>')
+            elif _dlt < 0:
+                _trend = (f'<span class="text-red-500 text-sm font-bold">'
+                          f'&#8595; {_dlt}% vs prior {_d}d</span>')
+            else:
+                _trend = (f'<span class="text-slate-500 text-sm font-bold">'
+                          f'&rarr; 0% vs prior {_d}d</span>')
+            _all_repos = ' (all repos)' if self.support_paths else ''
+            _vcards.append(
+                f'        <div class="card">\n'
+                f'            <div class="text-[10px] uppercase font-bold text-slate-400 mb-2 tracking-widest">Last {_d} Days</div>\n'
+                f'            <div class="text-4xl font-black text-slate-900 mb-1">{_cur:,}</div>\n'
+                f'            <div class="text-sm text-slate-500 mb-3">commits{_all_repos}</div>\n'
+                f'            {_trend}\n'
+                f'            <div class="text-xs text-slate-400 mt-2">Prior {_d}d: {_pri:,}</div>\n'
+                f'        </div>'
+            )
+        velocity_cards_html = (
+            f'    <div class="grid grid-cols-1 {_vcols_cls} gap-6">\n'
+            + '\n'.join(_vcards)
+            + '\n    </div>'
+        )
+
+        # Bus factor — fewest contributors whose combined commits reach the threshold.
+        _sorted_authors = sorted(
+            self.data['authors'].items(), key=lambda x: x[1]['commits'], reverse=True
+        )
+        _total_for_bf = sum(a['commits'] for _, a in _sorted_authors) or 1
+        _threshold    = _total_for_bf * self.bus_factor_threshold
+        _running      = 0
+        _bf_authors   = []
+        for _aname, _adata in _sorted_authors:
+            _running += _adata['commits']
+            _bf_authors.append({
+                'name':    _aname,
+                'commits': _adata['commits'],
+                'pct':     round(_adata['commits'] / _total_for_bf * 100, 1),
+                'team':    _adata.get('team', 'Community'),
+            })
+            if _running >= _threshold:
+                break
+        _bus_count = len(_bf_authors)
+        _bus_pct   = int(self.bus_factor_threshold * 100)
+
+        _bf_rows = []
+        for _ba in _bf_authors:
+            _c = self.team_colors.get(_ba['team'], '#94a3b8') if self.has_teams else '#3b82f6'
+            _bf_rows.append(
+                f'                <div class="flex items-center gap-3 py-2">\n'
+                f'                    <span class="text-sm font-bold text-slate-700 w-36 truncate shrink-0">{_ba["name"]}</span>\n'
+                f'                    <div class="flex-1 h-2 bg-slate-100 rounded-full overflow-hidden">\n'
+                f'                        <div class="h-full rounded-full" style="width:{min(_ba["pct"], 100)}%;background:{_c}"></div>\n'
+                f'                    </div>\n'
+                f'                    <span class="text-sm font-mono font-bold text-slate-500 w-10 text-right shrink-0">{_ba["pct"]}%</span>\n'
+                f'                    <span class="text-xs text-slate-400 w-24 text-right shrink-0">{_ba["commits"]:,} commits</span>\n'
+                f'                </div>'
+            )
+        _bf_rows_html = '\n'.join(_bf_rows)
+        _plural_s    = 's' if _bus_count != 1 else ''
+        _plural_verb = 'account' if _bus_count != 1 else 'accounts'
+        bus_factor_card_html = (
+            f'    <div class="card">\n'
+            f'        <div class="flex items-start gap-8 flex-wrap">\n'
+            f'            <div class="shrink-0 text-center min-w-[5rem]">\n'
+            f'                <div class="text-5xl font-black text-slate-900">{_bus_count}</div>\n'
+            f'                <div class="text-[10px] uppercase font-bold text-slate-400 mt-1 tracking-widest">Bus Factor</div>\n'
+            f'            </div>\n'
+            f'            <div class="flex-1 min-w-0">\n'
+            f'                <p class="text-sm text-slate-600 font-medium mb-4">\n'
+            f'                    <strong>{_bus_count} contributor{_plural_s}</strong> {_plural_verb} for\n'
+            f'                    {_bus_pct}% of all commits.\n'
+            f'                </p>\n'
+            f'{_bf_rows_html}\n'
+            f'            </div>\n'
+            f'        </div>\n'
+            f'        <p class="text-xs text-slate-400 mt-4 border-t border-slate-100 pt-3">\n'
+            f'            Threshold: {_bus_pct}% \u00b7 configurable via\n'
+            f'            <span class="font-mono">bus_factor_threshold</span> in config.json\n'
+            f'        </p>\n'
+            f'    </div>'
+        )
+
         html = f"""<!DOCTYPE html>
 <html class="scroll-smooth">
 <head>
@@ -902,10 +1051,6 @@ class GitStats:
     <script src="chart.js"></script>
     <title>GitStats: {pname}</title>
     <style>
-        .heatmap-cell {{ width:12px; height:12px; border-radius:2px; transition:transform 0.1s; cursor:help; }}
-        .heatmap-cell:hover {{ transform:scale(1.3); }}
-        .lvl-0 {{ background:#f1f5f9; }} .lvl-1 {{ background:#93c5fd; }}
-        .lvl-2 {{ background:#3b82f6; }} .lvl-3 {{ background:#2563eb; }} .lvl-4 {{ background:#1e3a8a; }}
         .card {{ background:white; padding:2rem; border-radius:1.5rem; border:1px solid #e2e8f0; box-shadow:0 1px 3px rgba(0,0,0,0.04); }}
         .tab-btn {{ padding:0.5rem 1.25rem; border-radius:0.75rem; font-weight:700; font-size:0.875rem;
                     transition:all 0.15s; color:#64748b; cursor:pointer; border:none; background:none; }}
@@ -957,7 +1102,7 @@ class GitStats:
     <nav class="sticky-header mb-12">
         <div class="bg-white/70 backdrop-blur-xl p-1.5 rounded-2xl shadow-xl shadow-slate-200/50
                     flex gap-1 justify-center max-w-fit mx-auto border border-slate-200">
-            <button onclick="showTab('activity',this)" class="tab-btn active">Activity</button>
+            <button onclick="showTab('summary',this)" class="tab-btn active">Summary</button>
             <button onclick="showTab('impact',this)"   class="tab-btn">Impact</button>
             <button onclick="showTab('authors',this)"  class="tab-btn">Authors</button>
             <button onclick="showTab('teams',this)"    class="tab-btn{teams_tab_hidden}">Teams</button>
@@ -966,18 +1111,52 @@ class GitStats:
         </div>
     </nav>
 
-    <!-- ═══ ACTIVITY ═════════════════════════════════════════════════════════ -->
-    <div id="tab-activity" class="tab-content space-y-10">
+    <!-- ═══ SUMMARY ════════════════════════════════════════════════════════════ -->
+    <div id="tab-summary" class="tab-content space-y-8">
+
+        <!-- Project info + key stats -->
         <div class="card">
-            <h3 class="text-xs font-black uppercase text-slate-400 mb-6 tracking-widest">Contribution Heatmap</h3>
-            <div class="overflow-x-auto pb-4">
-                <div id="heatmap" class="flex flex-wrap gap-1.5" style="width:950px"></div>
+            <div class="flex items-start justify-between gap-4 flex-wrap mb-6 pb-6 border-b border-slate-100">
+                <div>
+                    <h2 class="text-2xl font-black text-slate-900">{pname}</h2>
+                    {support_repos_html}
+                    <p class="text-xs text-slate-400 font-medium mt-1">Analyzed {adate}</p>
+                </div>
+            </div>
+            <div class="grid grid-cols-2 lg:grid-cols-4 gap-4">
+                <div class="text-center p-4 bg-slate-50 rounded-2xl">
+                    <div class="text-3xl font-black text-slate-900">{age_days:,}</div>
+                    <div class="text-[10px] uppercase font-bold text-slate-400 mt-0.5 tracking-widest">Days Old</div>
+                    <div class="text-xs text-slate-400 mt-1">Since {first_commit_date}</div>
+                </div>
+                <div class="text-center p-4 bg-slate-50 rounded-2xl">
+                    <div class="text-3xl font-black text-blue-600">{tlines:,}</div>
+                    <div class="text-[10px] uppercase font-bold text-slate-400 mt-0.5 tracking-widest">Net Lines</div>
+                    <div class="text-xs text-slate-400 mt-1">Main repository</div>
+                </div>
+                <div class="text-center p-4 bg-slate-50 rounded-2xl">
+                    <div class="text-3xl font-black text-slate-900">{avg_weekly}</div>
+                    <div class="text-[10px] uppercase font-bold text-slate-400 mt-0.5 tracking-widest">Commits / Week</div>
+                    <div class="text-xs text-slate-400 mt-1">Lifetime average</div>
+                </div>
+                <div class="text-center p-4 bg-slate-50 rounded-2xl">
+                    <div class="text-3xl font-black text-slate-900">{total_tags_count:,}</div>
+                    <div class="text-[10px] uppercase font-bold text-slate-400 mt-0.5 tracking-widest">Releases</div>
+                    {tags_note_html}
+                </div>
             </div>
         </div>
-        <div class="grid grid-cols-1 md:grid-cols-2 gap-10">
-            <div class="card" style="height:400px"><h3 class="font-bold mb-2">LOC History</h3>{loc_note_html}<canvas id="locChart"></canvas></div>
-            <div class="card" style="height:400px"><h3 class="font-bold mb-4">Hourly Punchcard</h3><canvas id="hourChart"></canvas></div>
+
+{velocity_cards_html}
+
+{bus_factor_card_html}
+
+        <!-- Hourly Punchcard -->
+        <div class="card" style="height:400px">
+            <h3 class="font-bold mb-4">Hourly Punchcard</h3>
+            <canvas id="hourChart"></canvas>
         </div>
+
     </div>
 
     <!-- ═══ IMPACT ═══════════════════════════════════════════════════════════ -->
@@ -1511,36 +1690,8 @@ function initComponentChart() {{
     }});
 }}
 
-// ─── Heatmap ──────────────────────────────────────────────────────────────────
-const hmd  = {heatmap_json};
-const hmc  = document.getElementById('heatmap');
-const today = new Date();
-for (let i = 364; i >= 0; i--) {{
-    const d  = new Date(); d.setDate(today.getDate() - i);
-    const ds = d.toISOString().split('T')[0];
-    const c  = hmd[ds] || 0;
-    const cell = document.createElement('div');
-    cell.className = `heatmap-cell lvl-${{c === 0 ? 0 : Math.min(4, Math.ceil(c / 5))}}`;
-    cell.title = `${{ds}}: ${{c}} commits`;
-    hmc.appendChild(cell);
-}}
-
 // ─── Charts ───────────────────────────────────────────────────────────────────
 const commonOpts = {{ responsive:true, maintainAspectRatio:false, plugins:{{ legend:{{ display:false }} }} }};
-
-const locData = {loc_json};
-new Chart(document.getElementById('locChart'), {{
-    type: 'line',
-    data: {{
-        labels: locData.map((_,i) => i),
-        datasets: [{{
-            label: 'LOC', data: locData,
-            borderColor: '#3b82f6', pointRadius: 0, fill: true,
-            backgroundColor: 'rgba(59,130,246,0.05)', tension: 0.1,
-        }}],
-    }},
-    options: {{ ...commonOpts, scales: {{ x: {{ display:false }} }} }},
-}});
 
 new Chart(document.getElementById('hourChart'), {{
     type: 'bar',
@@ -1552,8 +1703,8 @@ new Chart(document.getElementById('hourChart'), {{
 }});
 
 // ─── Init ─────────────────────────────────────────────────────────────────────
-// Activity tab is visible by default — init its charts immediately
-_chartInited['activity'] = true;
+// Summary tab is visible by default — hourChart is initialized above at load time
+_chartInited['summary'] = true;
 renderAuthorTable();
 renderImpactLeaderboard();
 renderTeamsGrid();

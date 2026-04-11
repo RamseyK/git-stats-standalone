@@ -4,7 +4,7 @@ A Python script that analyzes a Git repository and generates a self-contained HT
 
 ## Primary Metrics
 
-- **Activity** — commit heatmap, lines-of-code history, and hourly punchcard
+- **Summary** — project age, net lines, weekly cadence, release count, commit velocity trend, bus factor, and hourly punchcard
 - **Impact** — weighted leaderboard ranking authors and teams by commit volume, lines changed, and active tenure
 - **Authors** — sortable contributor table with team badges, filterable by component or team
 - **Teams** — per-team stats, member lists, and top components
@@ -119,7 +119,10 @@ All configuration lives in a single JSON file. Every key is optional.
   "impact_use_net_lines": true,
   "impact_wash_window_days": 7,
   "impact_wash_min_gross": 200,
-  "impact_line_cap_percentile": 95
+  "impact_line_cap_percentile": 95,
+
+  "summary_velocity_days": [30, 90],
+  "bus_factor_threshold": 0.5
 }
 ```
 
@@ -130,6 +133,8 @@ All configuration lives in a single JSON file. Every key is optional.
 | `release_tag_prefix` | `""` | Only tags whose name starts with this prefix appear in the Releases tab. For example, `"v"` includes `v1.0`, `v2.3.1` but excludes `nightly-20240101`. An empty string includes all tags. |
 | `max_release_tags` | `20` | Maximum number of release tags to display, taken from the most recent. Set to `0` to show all tags with no limit. |
 | `component_markers` | *(see below)* | List of filenames that identify a component boundary. Any directory directly containing one of these files becomes a component root in the Components tab churn chart. When omitted, the built-in default set is used. |
+| `summary_velocity_days` | `[30, 90]` | List of day windows shown as commit velocity cards on the Summary tab. Each entry produces one card comparing commits in the last N days against the prior N days. Uses the combined commit history across all repositories. |
+| `bus_factor_threshold` | `0.5` | Fraction of total commits (0–1) used to compute the bus factor. The bus factor is the fewest contributors whose combined commits reach this fraction. For example, `0.5` answers "how many people own 50% of the codebase?" |
 
 #### Component markers
 

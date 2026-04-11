@@ -598,8 +598,8 @@ class TestSupportRepos:
         sr_name = os.path.basename(os.path.abspath(recipes_repo_path))
         # The support repo card must have a canvas with id="componentChart-support-0"
         assert 'id="componentChart-support-0"' in html
-        # The LOC note must be present since support repos are configured.
-        assert 'Main repository only.' in html
+        # The support repo pill must appear on the Summary tab header.
+        assert f'+ {sr_name}' in html
         # Both "Main Repository" and "Support Repository" labels must appear.
         assert 'Main Repository' in html
         assert 'Support Repository' in html
