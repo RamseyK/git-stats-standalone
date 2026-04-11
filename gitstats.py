@@ -38,7 +38,30 @@ class GitStats:
       },
       "aliases": {
         "Canonical Name": ["alias", "old@email.com", ...]
-      }
+      },
+
+      // Impact score noise-reduction options (all optional, defaults shown):
+      "impact_use_net_lines": true,
+        // true  → each commit contributes abs(adds - dels) to the lines metric.
+        //         A reformatting commit that deletes and re-adds 10,000 lines
+        //         scores near zero instead of 20,000 gross lines.
+        // false → use raw adds + dels (original behavior).
+
+      "impact_wash_window_days": 7,
+        // Group each author's commits into non-overlapping N-day buckets.
+        // If a bucket's raw gross lines exceed impact_wash_min_gross AND
+        // at least 40% of the changes cancel out (e.g., mass delete on Monday,
+        // mass re-add on Friday), the bucket scores only its net |adds - dels|.
+        // Set to 0 to disable this check entirely.
+
+      "impact_wash_min_gross": 200,
+        // Minimum gross lines in a time bucket to trigger wash detection.
+        // Prevents small day-to-day edits from being mistakenly zeroed out.
+
+      "impact_line_cap_percentile": 95
+        // Cap each commit's effective line contribution at this percentile
+        // of all commits in the repo. A one-time 500,000-line import won't
+        // drown out years of regular work. Set to 0 to disable.
     }
 
     Members in "teams" are matched against git author names and emails.
@@ -89,6 +112,29 @@ class GitStats:
         # Cap on how many tags to show in the Releases tab.
         # Set to 0 in config to display all matching tags with no limit.
         self.max_release_tags = int(config.get('max_release_tags', 20))
+
+        # ── Impact score noise-reduction options ──────────────────────────────
+        # These filter out commits that inflate the lines metric without
+        # representing real work (reformats, mass moves, revert pairs).
+        # See the class docstring for a full explanation of each option.
+
+        # Replace adds+dels with abs(adds-dels) per commit so that a reformat
+        # that deletes and re-adds the same lines scores near zero.
+        self.use_net_lines = bool(config.get('impact_use_net_lines', True))
+
+        # Width (in days) of the time buckets used for wash-window detection.
+        # 0 disables the check. When enabled, a bucket whose gross changes are
+        # large and whose adds/dels are roughly balanced is replaced by its net.
+        self.wash_window_days = int(config.get('impact_wash_window_days', 7))
+
+        # Minimum gross lines in a bucket to trigger wash-window detection.
+        # Keeps small, balanced daily edits from being incorrectly zeroed out.
+        self.wash_min_gross = int(config.get('impact_wash_min_gross', 200))
+
+        # Winsorization percentile: cap each commit's effective lines at this
+        # percentile of all commits, preventing one-time bulk imports from
+        # dominating the lines metric. 0 disables the cap.
+        self.line_cap_percentile = int(config.get('impact_line_cap_percentile', 95))
 
         # Central data store populated by collect() and consumed by generate_report().
         self.data = {
@@ -200,11 +246,28 @@ class GitStats:
         all_ts = []       # all commit timestamps, used to compute repo age
         ts = 0
 
+        # Per-commit line accumulators for the current commit being processed.
+        # Flushed into commit_lines[] on each new COMMIT header (and after the loop).
+        # _compute_impact() uses these lists to filter out meaningless mass changes.
+        current_commit_ts = 0
+        current_commit_adds = 0
+        current_commit_dels = 0
+
         for line in log_data.splitlines():
             if line.startswith('COMMIT|'):
                 # ── Commit header ─────────────────────────────────────────────
+                # Before moving on, flush the previous commit's accumulated line
+                # counts into that author's commit_lines list so _compute_impact()
+                # can apply per-commit noise filtering later.
+                if current_author is not None:
+                    self.data['authors'][current_author]['commit_lines'].append(
+                        (current_commit_ts, current_commit_adds, current_commit_dels))
+                current_commit_adds = 0
+                current_commit_dels = 0
+
                 _, ts_str, name, email = line.split('|', 3)
                 ts = int(ts_str)
+                current_commit_ts = ts
                 dt = datetime.datetime.fromtimestamp(ts)
                 author = self._get_author(name, email)
                 team = self._get_team(author, email)
@@ -212,11 +275,14 @@ class GitStats:
                 current_author = author
                 current_team = team
 
-                # Initialize author record on first encounter
+                # Initialize author record on first encounter.
+                # commit_lines stores (timestamp, adds, dels) per commit —
+                # used by _compute_impact() to filter noise before scoring.
                 if author not in self.data['authors']:
                     self.data['authors'][author] = {
                         'commits': 0, 'add': 0, 'del': 0,
                         'first': ts, 'last': ts, 'team': team,
+                        'commit_lines': [],
                     }
                 au = self.data['authors'][author]
                 au['commits'] += 1
@@ -255,6 +321,11 @@ class GitStats:
                     self.data['teams'][current_team]['add'] += a
                     self.data['teams'][current_team]['del'] += d
 
+                    # Accumulate this file's lines into the current commit bucket
+                    # so they can be flushed as a single (ts, adds, dels) entry.
+                    current_commit_adds += a
+                    current_commit_dels += d
+
                     # Track running net LOC for the LOC history chart.
                     # We append after every file change, then reverse the list
                     # at the end so it runs oldest → newest.
@@ -269,6 +340,12 @@ class GitStats:
                         self.data['team_components'][current_team][component] += (a + d)
                 except (ValueError, IndexError):
                     continue
+
+        # Flush the final commit's line stats (the loop only flushes on the *next*
+        # COMMIT header, so the last commit in the log would otherwise be lost).
+        if current_author is not None:
+            self.data['authors'][current_author]['commit_lines'].append(
+                (current_commit_ts, current_commit_adds, current_commit_dels))
 
         # Derive repo age from the span between oldest and newest commit
         if all_ts:
@@ -335,46 +412,153 @@ class GitStats:
         """Compute and store impact scores for every author and team.
 
         Score formula (produces a value in the range 0–100):
-            score = (commits / max_commits) * IMPACT_W_COMMITS
-                  + ((add + del) / max_lines) * IMPACT_W_LINES
-                  + (tenure_days / max_tenure) * IMPACT_W_TENURE
+            score = (commits / max_commits)         * IMPACT_W_COMMITS
+                  + (effective_lines / max_eff)     * IMPACT_W_LINES
+                  + (tenure_days / max_tenure)      * IMPACT_W_TENURE
 
-        Each metric is normalized against the top performer in that metric,
-        so the best contributor in each dimension always contributes the full
-        weight for that dimension. Weights are class-level constants and must
-        sum to 100. Authors and teams are scored independently (separate maxima).
+        "effective_lines" is derived from the per-commit line stats collected
+        during collect() via a three-step noise-reduction pipeline:
+
+          Step 1 — Net lines per commit (use_net_lines, default on):
+            Each commit contributes abs(adds - dels) instead of adds + dels.
+            A reformatting commit that deletes and re-adds 10,000 lines scores
+            near zero rather than 20,000.
+
+          Step 2 — Winsorization (line_cap_percentile, default 95):
+            Per-commit effective values are capped at the given percentile of
+            all commits in the repo. One 500,000-line import won't overshadow
+            years of regular contributions.
+
+          Step 3 — Wash-window detection (wash_window_days, default 7):
+            Commits are grouped into non-overlapping N-day buckets. If a
+            bucket's raw gross lines exceed wash_min_gross AND at least 40%
+            of changes cancel out (min(adds,dels)/gross > 0.4), the bucket's
+            contribution is replaced by its raw net |adds - dels|. This catches
+            the two-commit revert pattern: mass-delete on Monday, mass-re-add
+            on Wednesday.
+
+        Team effective_lines = sum of their members' author-level effective lines
+        (consistent with per-author filtering). Authors and teams are otherwise
+        normalized against their own group maxima.
 
         Results are written back into the author/team dicts as 'impact'.
+        commit_lines and internal scratch fields are removed before returning.
         """
         wc = self.IMPACT_W_COMMITS
         wl = self.IMPACT_W_LINES
         wt = self.IMPACT_W_TENURE
 
+        use_net   = self.use_net_lines
+        wash_days = self.wash_window_days
+        wash_min  = self.wash_min_gross
+        cap_pct   = self.line_cap_percentile
+
         authors = self.data['authors']
+
+        # ── Step 1: per-commit effective lines ───────────────────────────────
+        # Compute abs(adds - dels) or adds + dels for each commit depending on
+        # the use_net_lines setting. Stored as a parallel list (_eff) per author.
+        for a in authors.values():
+            a['_eff'] = [
+                abs(adds - dels) if use_net else (adds + dels)
+                for _, adds, dels in a.get('commit_lines', [])
+            ]
+
+        # ── Step 2: winsorization ─────────────────────────────────────────────
+        # Find the cap value from the cross-author distribution, then apply it.
+        if cap_pct > 0:
+            all_eff = sorted(v for a in authors.values() for v in a['_eff'])
+            if all_eff:
+                cap_idx = min(int(len(all_eff) * cap_pct / 100), len(all_eff) - 1)
+                cap_val = all_eff[cap_idx]
+            else:
+                cap_val = float('inf')
+        else:
+            cap_val = float('inf')
+
+        for a in authors.values():
+            a['_eff'] = [min(v, cap_val) for v in a['_eff']]
+
+        # ── Step 3: wash-window bucketing ─────────────────────────────────────
+        def effective_lines(author):
+            """Return total effective lines for an author after wash detection.
+
+            Without wash_days, this is simply sum(_eff). With it, each time
+            bucket that looks like a revert (large gross, balanced adds/dels)
+            is replaced by its raw net to avoid crediting the reversal.
+            """
+            commits = author.get('commit_lines', [])
+            eff     = author.get('_eff', [])
+            if not commits:
+                return 0
+            if not wash_days:
+                return sum(eff)
+
+            window_secs = wash_days * 86400
+            # Each bucket accumulates per-commit effective lines AND the raw
+            # adds/dels needed to detect the wash condition.
+            buckets = defaultdict(lambda: {'eff': 0, 'raw_a': 0, 'raw_d': 0})
+            for (ts, raw_a, raw_d), e in zip(commits, eff):
+                b = ts // window_secs
+                buckets[b]['eff']   += e
+                buckets[b]['raw_a'] += raw_a
+                buckets[b]['raw_d'] += raw_d
+
+            total = 0
+            for b in buckets.values():
+                gross = b['raw_a'] + b['raw_d']
+                net   = abs(b['raw_a'] - b['raw_d'])
+                # Wash condition: bucket is large AND adds/dels are roughly balanced.
+                # min/gross > 0.4 → min/(min+max) > 0.4 → min/max > 2/3 ≈ 67%,
+                # meaning the smaller side is at least 67% of the larger side,
+                # indicating substantial cancellation (e.g. delete 1000 + add 900).
+                # Apply cap_val to the net for consistency with the non-wash path,
+                # which uses per-commit effective values already capped at cap_val.
+                if gross > wash_min and gross > 0 and min(b['raw_a'], b['raw_d']) / gross > 0.4:
+                    total += min(net, cap_val)    # discard the cancelled-out churn
+                else:
+                    total += b['eff']
+            return total
+
+        # ── Score authors ─────────────────────────────────────────────────────
+        eff_map = {}   # author name → effective lines (used for team rollup too)
         if authors:
+            eff_map = {name: effective_lines(a) for name, a in authors.items()}
             max_c = max(a['commits'] for a in authors.values()) or 1
-            max_k = max(a['add'] + a['del'] for a in authors.values()) or 1
+            max_k = max(eff_map.values()) or 1
             max_d = max((a['last'] - a['first']) // 86400 for a in authors.values()) or 1
-            for a in authors.values():
+            for name, a in authors.items():
                 days = (a['last'] - a['first']) // 86400
                 a['impact'] = round(
                     (a['commits'] / max_c) * wc +
-                    ((a['add'] + a['del']) / max_k) * wl +
-                    (days / max_d) * wt, 1
+                    (eff_map[name]  / max_k) * wl +
+                    (days / max_d)           * wt, 1
                 )
 
+        # ── Score teams ───────────────────────────────────────────────────────
+        # Team effective lines = sum of member effective lines so that the same
+        # noise filtering applied to authors flows through to the team score.
         teams = self.data['teams']
         if teams:
+            team_eff = defaultdict(float)
+            for name, a in authors.items():
+                team_eff[a.get('team', 'Community')] += eff_map.get(name, 0)
+
             max_c = max(t['commits'] for t in teams.values()) or 1
-            max_k = max(t['add'] + t['del'] for t in teams.values()) or 1
+            max_k = max(team_eff.values()) or 1
             max_d = max((t['last'] - t['first']) // 86400 for t in teams.values()) or 1
-            for t in teams.values():
+            for tname, t in teams.items():
                 days = (t['last'] - t['first']) // 86400
                 t['impact'] = round(
-                    (t['commits'] / max_c) * wc +
-                    ((t['add'] + t['del']) / max_k) * wl +
-                    (days / max_d) * wt, 1
+                    (t['commits']        / max_c) * wc +
+                    (team_eff[tname]     / max_k) * wl +
+                    (days                / max_d) * wt, 1
                 )
+
+        # Clean up internal scratch fields — they must not appear in JSON output.
+        for a in authors.values():
+            a.pop('commit_lines', None)
+            a.pop('_eff', None)
 
     # ------------------------------------------------------------------ HTML helpers
 
@@ -465,6 +649,15 @@ class GitStats:
         iw_commits = self.IMPACT_W_COMMITS
         iw_lines   = self.IMPACT_W_LINES
         iw_tenure  = self.IMPACT_W_TENURE
+
+        # Noise-reduction settings — displayed in the impact explanation section
+        # so viewers know exactly what filtering was applied to this report.
+        cfg_use_net      = 'on' if self.use_net_lines else 'off'
+        cfg_wash_days    = self.wash_window_days
+        cfg_wash_min     = self.wash_min_gross
+        cfg_cap_pct      = self.line_cap_percentile
+        cfg_wash_status  = f'{cfg_wash_days}-day window, ≥{cfg_wash_min} gross lines' if cfg_wash_days else 'off'
+        cfg_cap_status   = f'{cfg_cap_pct}th percentile' if cfg_cap_pct else 'off'
 
         html = f"""<!DOCTYPE html>
 <html class="scroll-smooth">
@@ -597,8 +790,8 @@ class GitStats:
                         <span class="text-2xl font-black text-blue-600">{iw_lines}%</span>
                     </div>
                     <div class="impact-bar mb-3"><div class="impact-fill" style="width:{iw_lines}%"></div></div>
-                    <p class="text-xs text-slate-500">Sum of lines added and deleted across all commits. Captures the raw volume of code touched.</p>
-                    <p class="text-[11px] text-slate-400 mt-2 font-mono">score += ((add + del) / max_lines) × {iw_lines}</p>
+                    <p class="text-xs text-slate-500">Effective lines changed, filtered to remove noise. Reformats, mass moves, and revert pairs are discounted before scoring.</p>
+                    <p class="text-[11px] text-slate-400 mt-2 font-mono">score += (effective_lines / max_lines) × {iw_lines}</p>
                 </div>
                 <div class="bg-slate-50 rounded-2xl p-5">
                     <div class="flex items-center justify-between mb-2">
@@ -610,10 +803,19 @@ class GitStats:
                     <p class="text-[11px] text-slate-400 mt-2 font-mono">score += (tenure_days / max_tenure) × {iw_tenure}</p>
                 </div>
             </div>
-            <div class="bg-blue-50 border border-blue-100 rounded-xl p-4 text-xs text-blue-800">
+            <div class="bg-blue-50 border border-blue-100 rounded-xl p-4 text-xs text-blue-800 mb-4">
                 <span class="font-black">Formula: </span>
-                Impact = (commits / max_commits) × {iw_commits} &nbsp;+&nbsp; ((add + del) / max_lines) × {iw_lines} &nbsp;+&nbsp; (tenure_days / max_tenure) × {iw_tenure}
+                Impact = (commits / max_commits) × {iw_commits} &nbsp;+&nbsp; (effective_lines / max_lines) × {iw_lines} &nbsp;+&nbsp; (tenure_days / max_tenure) × {iw_tenure}
                 <br><span class="text-blue-500 mt-1 block">All normalizations are computed independently for authors and for teams.</span>
+            </div>
+            <div class="bg-slate-50 border border-slate-200 rounded-xl p-4 text-xs text-slate-700">
+                <span class="font-black text-slate-800">Lines noise filtering</span>
+                <span class="text-slate-400 ml-2">(configured via config.json)</span>
+                <ul class="mt-2 space-y-1 text-slate-500 leading-relaxed">
+                    <li><span class="font-bold text-slate-600">Net lines per commit</span> <span class="font-mono bg-slate-200 text-slate-700 rounded px-1">{cfg_use_net}</span> — each commit scores <span class="font-mono">|adds − dels|</span> instead of <span class="font-mono">adds + dels</span>, so reformatting commits that delete and re-add the same code count near zero. Config key: <span class="font-mono">impact_use_net_lines</span>.</li>
+                    <li><span class="font-bold text-slate-600">Winsorization</span> <span class="font-mono bg-slate-200 text-slate-700 rounded px-1">{cfg_cap_status}</span> — per-commit effective lines are capped at this percentile of all commits in the repo, preventing a single mass import from dominating the metric. Config key: <span class="font-mono">impact_line_cap_percentile</span>.</li>
+                    <li><span class="font-bold text-slate-600">Wash-window detection</span> <span class="font-mono bg-slate-200 text-slate-700 rounded px-1">{cfg_wash_status}</span> — commits are grouped into time buckets; if a bucket's raw changes exceed the minimum and adds ≈ dels, the bucket scores only its net <span class="font-mono">|adds − dels|</span>, catching the pattern of a mass delete followed by a mass re-add. Config keys: <span class="font-mono">impact_wash_window_days</span>, <span class="font-mono">impact_wash_min_gross</span>.</li>
+                </ul>
             </div>
         </div>
     </div>
