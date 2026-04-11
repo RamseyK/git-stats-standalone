@@ -16,7 +16,6 @@ import json
 import os
 import subprocess
 import sys
-import tempfile
 
 import pytest
 
@@ -334,8 +333,10 @@ class TestImpactScoring:
         net_path   = make_config(net_dir,   impact_use_net_lines=True,  **base_cfg)
         gross_path = make_config(gross_dir, impact_use_net_lines=False, **base_cfg)
 
-        gs_net   = gitstats.GitStats(repo_path, net_path);   gs_net.collect()
-        gs_gross = gitstats.GitStats(repo_path, gross_path); gs_gross.collect()
+        gs_net   = gitstats.GitStats(repo_path, net_path)
+        gs_net.collect()
+        gs_gross = gitstats.GitStats(repo_path, gross_path)
+        gs_gross.collect()
 
         net_scores   = {n: a['impact'] for n, a in gs_net.data['authors'].items()}
         gross_scores = {n: a['impact'] for n, a in gs_gross.data['authors'].items()}

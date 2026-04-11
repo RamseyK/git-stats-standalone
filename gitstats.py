@@ -1,3 +1,9 @@
+# /// script
+# requires-python = ">=3.11"
+# dependencies = [
+# ]
+# ///
+
 import os
 import shutil
 import subprocess
@@ -275,7 +281,7 @@ class GitStats:
         #   b) find component roots (dirs that contain a marker file)
         ls_files = self._run_git(['ls-files']).splitlines()
         self.data['general']['total_files'] = len(ls_files)
-        component_markers = {'make.py', 'pyproject.toml', 'setup.py'}
+        component_markers = {'make.py', 'pyproject.toml', 'setup.py', 'Makefile'}
         component_dirs = set()
         for f in ls_files:
             ext = os.path.splitext(f)[1].lower() or 'source'
