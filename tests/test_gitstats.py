@@ -1095,6 +1095,100 @@ class TestComponentMarkers:
 
 
 # ---------------------------------------------------------------------------
+# Lines of code extensions
+# ---------------------------------------------------------------------------
+
+class TestLocExtensions:
+    """Verify that loc_extensions controls which files contribute to total_repo_lines."""
+
+    # ── Config defaults and overrides ────────────────────────────────────────
+
+    def test_omitting_config_key_uses_class_default(self, repo_path, tmp_path):
+        """When 'loc_extensions' is absent from config, LOC_EXTENSIONS is used."""
+        cfg = make_config(tmp_path)
+        gs = gitstats.GitStats(repo_path, cfg)
+        assert gs.loc_extensions == gitstats.GitStats.LOC_EXTENSIONS
+
+    def test_config_key_replaces_default_entirely(self, repo_path, tmp_path):
+        """Providing loc_extensions must replace the default set, not extend it."""
+        cfg = make_config(tmp_path, loc_extensions=['.ts', '.tsx'])
+        gs = gitstats.GitStats(repo_path, cfg)
+        assert gs.loc_extensions == {'.ts', '.tsx'}
+        assert '.py' not in gs.loc_extensions
+
+    def test_extensions_stored_lowercased(self, repo_path, tmp_path):
+        """Extensions from config must be normalized to lowercase."""
+        cfg = make_config(tmp_path, loc_extensions=['.PY', '.CPP'])
+        gs = gitstats.GitStats(repo_path, cfg)
+        assert '.py' in gs.loc_extensions
+        assert '.cpp' in gs.loc_extensions
+        assert '.PY' not in gs.loc_extensions
+
+    def test_default_extensions_include_expected_languages(self, repo_path, tmp_path):
+        """The built-in default set must include the documented extensions."""
+        cfg = make_config(tmp_path)
+        gs = gitstats.GitStats(repo_path, cfg)
+        for ext in ('.py', '.cc', '.c', '.cpp', '.h', '.hpp', '.rs'):
+            assert ext in gs.loc_extensions, f"{ext} missing from LOC_EXTENSIONS"
+
+    # ── Data-layer correctness ───────────────────────────────────────────────
+
+    def test_empty_extensions_yields_zero_loc(self, repo_path, tmp_path):
+        """Setting loc_extensions to [] must produce total_repo_lines=0."""
+        cfg = make_config(tmp_path, loc_extensions=[])
+        gs = gitstats.GitStats(repo_path, cfg)
+        gs.collect()
+        assert gs.data['general']['total_repo_lines'] == 0
+
+    def test_python_only_less_than_default(self, repo_path, tmp_path_factory):
+        """Counting only .py files must give fewer lines than the full default set.
+
+        Pyodide contains .py, .c, .h, .cpp, and .rs files, so restricting to .py
+        alone should reduce the total compared to the default set of extensions.
+        """
+        py_dir  = str(tmp_path_factory.mktemp('py_only'))
+        def_dir = str(tmp_path_factory.mktemp('default'))
+        cfg_py  = make_config(py_dir,  loc_extensions=['.py'])
+        cfg_def = make_config(def_dir)  # default set
+
+        gs_py  = gitstats.GitStats(repo_path, cfg_py)
+        gs_py.collect()
+        gs_def = gitstats.GitStats(repo_path, cfg_def)
+        gs_def.collect()
+
+        assert gs_py.data['general']['total_repo_lines'] < gs_def.data['general']['total_repo_lines']
+
+    def test_custom_extensions_change_loc(self, repo_path, tmp_path_factory):
+        """A different extension set must produce a different line count than the default."""
+        # .md files are present in pyodide but not in the default loc_extensions set.
+        md_dir  = str(tmp_path_factory.mktemp('md_only'))
+        def_dir = str(tmp_path_factory.mktemp('default2'))
+        cfg_md  = make_config(md_dir,  loc_extensions=['.md'])
+        cfg_def = make_config(def_dir)
+
+        gs_md  = gitstats.GitStats(repo_path, cfg_md)
+        gs_md.collect()
+        gs_def = gitstats.GitStats(repo_path, cfg_def)
+        gs_def.collect()
+
+        assert gs_md.data['general']['total_repo_lines'] != gs_def.data['general']['total_repo_lines']
+
+    def test_loc_extensions_does_not_affect_file_count(self, repo_path, tmp_path_factory):
+        """total_files counts all tracked files regardless of loc_extensions."""
+        empty_dir = str(tmp_path_factory.mktemp('empty_ext'))
+        def_dir   = str(tmp_path_factory.mktemp('default3'))
+        cfg_empty = make_config(empty_dir, loc_extensions=[])
+        cfg_def   = make_config(def_dir)
+
+        gs_empty = gitstats.GitStats(repo_path, cfg_empty)
+        gs_empty.collect()
+        gs_def   = gitstats.GitStats(repo_path, cfg_def)
+        gs_def.collect()
+
+        assert gs_empty.data['general']['total_files'] == gs_def.data['general']['total_files']
+
+
+# ---------------------------------------------------------------------------
 # Summary tab
 # ---------------------------------------------------------------------------
 
@@ -1339,6 +1433,157 @@ class TestSummaryTab:
         contribute to this metric.
         """
         assert combined_gs.data['general']['total_repo_lines'] == std_gs.data['general']['total_repo_lines']
+
+    # ── Monthly commit chart ──────────────────────────────────────────────────
+
+    def test_monthly_chart_canvas_present(self, std_html):
+        """The monthly commit chart canvas must be present in the Summary tab."""
+        assert 'id="monthlyChart"' in std_html
+
+    def test_monthly_chart_data_in_html(self, std_html):
+        """The monthly chart initialization block must be present with line type and labels."""
+        assert "getElementById('monthlyChart')" in std_html
+        assert "type: 'line'" in std_html
+
+    def test_monthly_chart_ordered_chronologically(self, std_gs, tmp_path_factory):
+        """Monthly labels must be in ascending chronological order."""
+        import re, json as _json
+        tmp = str(tmp_path_factory.mktemp('monthly_order'))
+        out = os.path.join(tmp, 'report.html')
+        std_gs.generate_report(os.path.join(PROJECT_ROOT, 'externals'), out)
+        html = open(out).read()
+
+        # Extract the labels array passed to monthlyChart.
+        # The JS line is: labels: ["Jan 2020", "Feb 2020", ...]
+        m = re.search(r'id="monthlyChart".*?labels:\s*(\[[^\]]*\])', html, re.DOTALL)
+        assert m, "Could not find monthlyChart labels array in HTML"
+        labels = _json.loads(m.group(1))
+        assert len(labels) > 0
+        # Parse back to dates and verify ascending order.
+        from datetime import datetime as _dt
+        parsed = [_dt.strptime(lbl, '%b %Y') for lbl in labels]
+        assert parsed == sorted(parsed), "Monthly labels are not in chronological order"
+
+    def test_monthly_chart_counts_sum_to_total_commits(self, std_gs, tmp_path_factory):
+        """Sum of all monthly commit counts must equal total_commits (all repos combined)."""
+        import re, json as _json
+        tmp = str(tmp_path_factory.mktemp('monthly_sum'))
+        out = os.path.join(tmp, 'report.html')
+        std_gs.generate_report(os.path.join(PROJECT_ROOT, 'externals'), out)
+        html = open(out).read()
+
+        # Extract the data array for monthlyChart (the counts, not the labels).
+        # Pattern: after the labels array, the datasets data array follows.
+        m = re.search(
+            r'new Chart\(document\.getElementById\(\'monthlyChart\'\).*?datasets:\s*\[\{.*?data:\s*(\[[^\]]*\])',
+            html, re.DOTALL
+        )
+        assert m, "Could not find monthlyChart data array in HTML"
+        counts = _json.loads(m.group(1))
+        assert sum(counts) == std_gs.data['general']['total_commits']
+
+    def test_monthly_chart_includes_support_repo_commits(self, combined_gs, std_gs, tmp_path_factory):
+        """Monthly counts must include support repo commits (heatmap accumulates all repos)."""
+        tmp_c = str(tmp_path_factory.mktemp('monthly_combined'))
+        tmp_s = str(tmp_path_factory.mktemp('monthly_single'))
+        out_c = os.path.join(tmp_c, 'report.html')
+        out_s = os.path.join(tmp_s, 'report.html')
+        combined_gs.generate_report(os.path.join(PROJECT_ROOT, 'externals'), out_c)
+        std_gs.generate_report(os.path.join(PROJECT_ROOT, 'externals'), out_s)
+
+        import re, json as _json
+        def extract_counts(html):
+            m = re.search(
+                r'new Chart\(document\.getElementById\(\'monthlyChart\'\).*?datasets:\s*\[\{.*?data:\s*(\[[^\]]*\])',
+                html, re.DOTALL
+            )
+            return sum(_json.loads(m.group(1))) if m else 0
+
+        combined_total = extract_counts(open(out_c).read())
+        single_total   = extract_counts(open(out_s).read())
+        assert combined_total > single_total
+
+    # ── Monthly chart tooltip ─────────────────────────────────────────────────
+
+    def test_monthly_top_authors_default_is_three(self, repo_path, tmp_path):
+        """monthly_top_n must default to 3 when 'monthly_top_authors' is absent from config."""
+        cfg = make_config(tmp_path)
+        gs = gitstats.GitStats(repo_path, cfg)
+        assert gs.monthly_top_n == 3
+
+    def test_monthly_top_authors_config_override(self, repo_path, tmp_path):
+        """monthly_top_n must reflect the value set in config."""
+        cfg = make_config(tmp_path, monthly_top_authors=5)
+        gs = gitstats.GitStats(repo_path, cfg)
+        assert gs.monthly_top_n == 5
+
+    def test_monthly_top_authors_zero_disables_list(self, repo_path, tmp_path):
+        """Setting monthly_top_authors=0 must store monthly_top_n=0."""
+        cfg = make_config(tmp_path, monthly_top_authors=0)
+        gs = gitstats.GitStats(repo_path, cfg)
+        assert gs.monthly_top_n == 0
+
+    def test_monthly_author_commits_populated(self, std_gs):
+        """monthly_author_commits must be populated with at least one month of data."""
+        mac = std_gs.data['monthly_author_commits']
+        assert len(mac) > 0
+
+    def test_monthly_author_commits_keys_are_yyyy_mm(self, std_gs):
+        """All keys in monthly_author_commits must be in 'YYYY-MM' format."""
+        import re
+        for key in std_gs.data['monthly_author_commits']:
+            assert re.fullmatch(r'\d{4}-\d{2}', key), f"Bad key: {key!r}"
+
+    def test_monthly_author_commits_values_sum_to_total(self, std_gs):
+        """Sum of all per-author monthly commits must equal total_commits."""
+        mac = std_gs.data['monthly_author_commits']
+        total = sum(sum(counts.values()) for counts in mac.values())
+        assert total == std_gs.data['general']['total_commits']
+
+    def test_monthly_author_commits_top_author_plausible(self, std_gs):
+        """The top author in any given month must have a positive commit count."""
+        mac = std_gs.data['monthly_author_commits']
+        for month, counts in mac.items():
+            top_name, top_count = counts.most_common(1)[0]
+            assert top_count > 0, f"Month {month}: top author has 0 commits"
+
+    def test_monthly_tooltip_data_in_html(self, std_gs, tmp_path_factory):
+        """The generated HTML must include the monthlyKeys and monthlyTopAuthors JS variables."""
+        tmp = str(tmp_path_factory.mktemp('tooltip_html'))
+        out = os.path.join(tmp, 'report.html')
+        std_gs.generate_report(os.path.join(PROJECT_ROOT, 'externals'), out)
+        html = open(out).read()
+        assert 'const monthlyKeys' in html
+        assert 'const monthlyTopAuthors' in html
+
+    def test_monthly_tooltip_afterbody_callback_in_html(self, std_html):
+        """The afterBody tooltip callback must be present in the monthlyChart JS block."""
+        assert 'afterBody' in std_html
+        assert 'monthlyTopAuthors' in std_html
+
+    def test_monthly_tooltip_top_n_respected_in_html(self, repo_path, tmp_path_factory):
+        """With monthly_top_authors=2, each month in monthlyTopAuthors has at most 2 entries."""
+        import json as _json, re
+        tmp = str(tmp_path_factory.mktemp('top_n'))
+        cfg = make_config(tmp, monthly_top_authors=2)
+        gs = gitstats.GitStats(repo_path, cfg)
+        gs.collect()
+        out = os.path.join(tmp, 'report.html')
+        gs.generate_report(os.path.join(PROJECT_ROOT, 'externals'), out)
+        html = open(out).read()
+
+        m = re.search(r'const monthlyTopAuthors\s*=\s*(\{.*?\});', html, re.DOTALL)
+        assert m, "monthlyTopAuthors not found in HTML"
+        data = _json.loads(m.group(1))
+        for month, authors in data.items():
+            assert len(authors) <= 2, f"Month {month} has {len(authors)} authors, expected ≤ 2"
+
+    def test_monthly_chart_interaction_mode_index(self, std_html):
+        """The monthlyChart options must set interaction.mode='index' and intersect=false
+        so the tooltip fires anywhere along the x-axis, not just over a rendered point."""
+        assert "mode: 'index'" in std_html
+        assert "intersect: false" in std_html
+
 
 if __name__ == "__main__":
     sys.exit(pytest.main())

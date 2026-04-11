@@ -103,6 +103,13 @@ class GitStats:
     #     repo where every subdirectory has one) to avoid over-fragmenting the chart.
     COMPONENT_MARKERS = {'make.py', 'pyproject.toml', 'setup.py', 'Makefile', 'meta.yaml'}
 
+    # ── Source file extensions counted toward "Lines of Code" ───────────────────
+    # Only files whose extension (lowercased) is in this set contribute to the
+    # total_repo_lines metric shown on the Summary tab.  The config key
+    # "loc_extensions" replaces this set entirely — include every extension you
+    # want counted.  Extensions must include the leading dot (e.g. ".py").
+    LOC_EXTENSIONS = {'.py', '.cc', '.c', '.cpp', '.h', '.hpp', '.rs'}
+
     def __init__(self, repo_path, config_file=None, support_paths=None):
         self.repo_path = repo_path
         # Additional git repositories whose commit histories contribute to the
@@ -184,12 +191,25 @@ class GitStats:
         cfg_markers = config.get('component_markers')
         self.component_markers = set(cfg_markers) if cfg_markers is not None else self.COMPONENT_MARKERS
 
+        # Source file extensions counted toward "Lines of Code" on the Summary tab.
+        # Overridable via "loc_extensions" in config.  The config list replaces the
+        # default set entirely; include every extension you want counted.
+        # Extensions must include the leading dot (e.g. ".py", ".rs").
+        cfg_loc_ext = config.get('loc_extensions')
+        self.loc_extensions = (
+            {e.lower() for e in cfg_loc_ext} if cfg_loc_ext is not None
+            else self.LOC_EXTENSIONS
+        )
+
         # ── Summary tab configuration ─────────────────────────────────────────
         # Day windows for commit velocity cards.  Each entry produces one card
         # comparing commits in the last N days vs the prior N days.  The default
         # [30, 90] shows a 30-day and a 90-day view side by side.  Uses the
         # combined heatmap (main repo + all support repos).
         self.summary_velocity_days = list(config.get('summary_velocity_days', [30, 90]))
+
+        # Number of top authors shown in the monthly chart tooltip.
+        self.monthly_top_n = int(config.get('monthly_top_authors', 3))
 
         # Fraction of total commits that defines bus-factor ownership (0–1).
         # The bus factor is the minimum number of contributors whose combined
@@ -227,6 +247,7 @@ class GitStats:
             'general': {'total_commits': 0, 'total_files': 0, 'total_lines': 0,
                         'total_repo_lines': 0, 'age_days': 0},
             'activity': {'hour': Counter(), 'weekday': Counter(), 'heatmap': Counter()},
+            'monthly_author_commits': defaultdict(Counter),  # 'YYYY-MM' → {author: count}
             'authors': {},   # canonical name → {commits, add, del, first, last, team, impact}
             'teams': {},     # team name      → {commits, add, del, members, first, last, impact}
             'component_contributions': defaultdict(lambda: Counter()),  # component path → {author: commit_count}
@@ -398,6 +419,7 @@ class GitStats:
                 self.data['activity']['hour'][dt.hour] += 1
                 self.data['activity']['weekday'][dt.weekday()] += 1
                 self.data['activity']['heatmap'][dt.strftime('%Y-%m-%d')] += 1
+                self.data['monthly_author_commits'][dt.strftime('%Y-%m')][author] += 1
 
             elif '\t' in line and current_author:
                 # ── Per-file stat line ────────────────────────────────────────
@@ -461,8 +483,8 @@ class GitStats:
         # git ls-files lists every tracked file. We use it to:
         #   a) count files by extension for the general stats
         #   b) find component roots (dirs that contain a marker file)
-        #   c) count current lines of code (binary newline count — fast, works for
-        #      all encodings; binary files contribute negligibly to the total)
+        #   c) count current lines of code — binary newline count restricted to
+        #      files whose extension is in self.loc_extensions (configurable)
         ls_files = self._run_git(['ls-files']).splitlines()
         self.data['general']['total_files'] = len(ls_files)
         component_dirs_set = set()
@@ -472,11 +494,12 @@ class GitStats:
             self.data['files'][ext] += 1
             if os.path.basename(f) in self.component_markers:
                 component_dirs_set.add(os.path.dirname(f))
-            try:
-                with open(os.path.join(self.repo_path, f), 'rb') as _fh:
-                    _repo_lines += _fh.read().count(b'\n')
-            except OSError:
-                pass
+            if ext in self.loc_extensions:
+                try:
+                    with open(os.path.join(self.repo_path, f), 'rb') as _fh:
+                        _repo_lines += _fh.read().count(b'\n')
+                except OSError:
+                    pass
         self.data['general']['total_repo_lines'] = _repo_lines
         # Longest paths first so _get_component() matches the deepest ancestor.
         main_component_dirs = sorted(component_dirs_set, key=len, reverse=True)
@@ -1106,12 +1129,20 @@ class GitStats:
 
 {velocity_html}
 
+        <!-- Monthly commit activity -->
+        <div class="card" style="height:280px;display:flex;flex-direction:column">
+            <h3 class="font-bold mb-1">Monthly Commit Activity</h3>
+            <p class="text-xs text-slate-400 font-medium mb-3">Commits per calendar month — all repositories</p>
+            <div style="flex:1;position:relative;min-height:0"><canvas id="monthlyChart"></canvas></div>
+        </div>
+
 {bus_factor_html}
 
         <!-- Hourly Punchcard -->
-        <div class="card" style="height:400px">
-            <h3 class="font-bold mb-4">Hourly Punchcard</h3>
-            <canvas id="hourChart"></canvas>
+        <div class="card" style="height:420px;display:flex;flex-direction:column">
+            <h3 class="font-bold mb-1">Hourly Punchcard</h3>
+            <p class="text-xs text-slate-400 font-medium mb-3">Commits per hour of day over repository lifetime</p>
+            <div style="flex:1;position:relative;min-height:0"><canvas id="hourChart"></canvas></div>
         </div>
 
     </div>"""
@@ -1139,6 +1170,24 @@ class GitStats:
         # the separate per-repo cards on the Components tab.
         team_component_json = json.dumps({k: dict(v.most_common(8)) for k, v in self.data['team_components'].items()})
         hour_data           = json.dumps([self.data['activity']['hour'][i] for i in range(24)])
+
+        # Monthly commit counts — aggregate the daily heatmap (all repos combined)
+        # into calendar months for the line chart on the Summary tab.
+        monthly: Counter = Counter()
+        for date_str, count in self.data['activity']['heatmap'].items():
+            monthly[date_str[:7]] += count          # 'YYYY-MM-DD' → 'YYYY-MM'
+        sorted_months       = sorted(monthly.keys())
+        monthly_labels_json = json.dumps([
+            datetime.datetime.strptime(m, '%Y-%m').strftime('%b %Y')
+            for m in sorted_months
+        ])
+        monthly_counts_json = json.dumps([monthly[m] for m in sorted_months])
+        monthly_keys_json   = json.dumps(sorted_months)
+        monthly_top_authors_json = json.dumps({
+            m: [{'name': n, 'commits': c}
+                for n, c in self.data['monthly_author_commits'].get(m, Counter()).most_common(self.monthly_top_n)]
+            for m in sorted_months
+        })
 
         # ── Component section ─────────────────────────────────────────────────
         repo_charts, repo_charts_json, component_json, component_cards_html = (
@@ -1781,6 +1830,56 @@ function initComponentChart() {{
 // ─── Charts ───────────────────────────────────────────────────────────────────
 const commonOpts = {{ responsive:true, maintainAspectRatio:false, plugins:{{ legend:{{ display:false }} }} }};
 
+const monthlyKeys       = {monthly_keys_json};
+const monthlyTopAuthors = {monthly_top_authors_json};
+new Chart(document.getElementById('monthlyChart'), {{
+    type: 'line',
+    data: {{
+        labels: {monthly_labels_json},
+        datasets: [{{
+            data: {monthly_counts_json},
+            borderColor: '#3b82f6',
+            backgroundColor: 'rgba(59,130,246,0.07)',
+            fill: true,
+            tension: 0.4,
+            pointRadius: 0,
+            pointHoverRadius: 4,
+            borderWidth: 2,
+        }}],
+    }},
+    options: {{
+        responsive: true,
+        maintainAspectRatio: false,
+        interaction: {{ mode: 'index', intersect: false }},
+        plugins: {{
+            legend: {{ display: false }},
+            tooltip: {{
+                callbacks: {{
+                    afterBody: (items) => {{
+                        const key  = monthlyKeys[items[0].dataIndex];
+                        const top3 = (monthlyTopAuthors[key] || []);
+                        if (!top3.length) return [];
+                        return ['', 'Top authors:',
+                            ...top3.map((a, i) => `  ${{i+1}}. ${{a.name}} (${{a.commits}})`),
+                        ];
+                    }},
+                }},
+            }},
+        }},
+        scales: {{
+            x: {{
+                ticks: {{ maxTicksLimit: 12, maxRotation: 0, font: {{ size: 11 }} }},
+                grid:  {{ display: false }},
+            }},
+            y: {{
+                beginAtZero: true,
+                ticks: {{ precision: 0, font: {{ size: 11 }} }},
+                grid:  {{ color: 'rgba(0,0,0,0.04)' }},
+            }},
+        }},
+    }},
+}});
+
 new Chart(document.getElementById('hourChart'), {{
     type: 'bar',
     data: {{
@@ -1791,7 +1890,8 @@ new Chart(document.getElementById('hourChart'), {{
 }});
 
 // ─── Init ─────────────────────────────────────────────────────────────────────
-// Summary tab is visible by default — hourChart is initialized above at load time
+// Summary tab is visible by default — monthlyChart and hourChart are initialized
+// above at load time.
 _chartInited['summary'] = true;
 renderAuthorTable();
 renderImpactLeaderboard();
