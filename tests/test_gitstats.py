@@ -3393,6 +3393,108 @@ class TestDetectMerge:
 
 
 # ---------------------------------------------------------------------------
+# _is_pr_merge — direction-aware PR merge detection for the tag loop
+# ---------------------------------------------------------------------------
+
+class TestIsPrMerge:
+    """Unit tests for _is_pr_merge.
+
+    _is_pr_merge wraps _detect_merge and adds an exclusion for true merge
+    commits that pull the primary branch INTO another branch (sync commits).
+    _collect_merges avoids these naturally via --first-parent; the tag loop
+    uses _is_pr_merge to apply the equivalent filter.
+
+    Line exclusion (current_skip_lines) continues to use _detect_merge so
+    sync-commit diffs are still suppressed even when merge credit is withheld.
+    """
+
+    _PRIMARY     = 'main'
+    _NO_PARENTS  = ''
+    _TWO_PARENTS = 'abc def'
+    _SAME_EMAIL  = 'a@x.com'
+
+    @pytest.fixture
+    def gs(self, tmp_path):
+        cfg = make_config(str(tmp_path), primary_branch=self._PRIMARY)
+        return gitstats.GitStats(str(tmp_path), cfg)
+
+    # ── Must pass through everything _detect_merge accepts ────────────────────
+
+    def test_ordinary_commit_not_a_pr_merge(self, gs):
+        assert gs._is_pr_merge(self._NO_PARENTS, self._SAME_EMAIL, self._SAME_EMAIL,
+                                'Fix crash in parser') is False
+
+    def test_pull_request_subject_is_pr_merge(self, gs):
+        assert gs._is_pr_merge(self._NO_PARENTS, self._SAME_EMAIL, self._SAME_EMAIL,
+                                'Merge pull request #42 from user/branch') is True
+
+    def test_committer_differs_is_pr_merge(self, gs):
+        assert gs._is_pr_merge(self._NO_PARENTS, 'bot@github.com', 'author@x.com',
+                                'Regular commit message') is True
+
+    def test_feature_branch_true_merge_is_pr_merge(self, gs):
+        """True merge of a feature branch into primary is a PR merge."""
+        assert gs._is_pr_merge(self._TWO_PARENTS, self._SAME_EMAIL, self._SAME_EMAIL,
+                                "Merge branch 'feature/my-thing'") is True
+
+    # ── Primary-branch sync commits must be excluded ──────────────────────────
+
+    def test_true_merge_of_primary_into_other_excluded(self, gs):
+        """True merge whose subject indicates the primary branch being pulled in
+        is a sync commit — must NOT be credited as a PR merge."""
+        assert gs._is_pr_merge(self._TWO_PARENTS, self._SAME_EMAIL, self._SAME_EMAIL,
+                                "Merge branch 'main'") is False
+
+    def test_true_merge_primary_into_feature_excluded(self, gs):
+        assert gs._is_pr_merge(self._TWO_PARENTS, self._SAME_EMAIL, self._SAME_EMAIL,
+                                "Merge branch 'main' into feature/foo") is False
+
+    def test_true_merge_primary_double_quote_excluded(self, gs):
+        assert gs._is_pr_merge(self._TWO_PARENTS, self._SAME_EMAIL, self._SAME_EMAIL,
+                                'Merge branch "main" into feature/bar') is False
+
+    def test_true_merge_remote_tracking_primary_excluded(self, gs):
+        assert gs._is_pr_merge(self._TWO_PARENTS, self._SAME_EMAIL, self._SAME_EMAIL,
+                                "Merge remote-tracking branch 'origin/main'") is False
+
+    def test_true_merge_remote_tracking_other_branch_is_pr_merge(self, gs):
+        """Remote-tracking merge of a non-primary branch is a PR merge."""
+        assert gs._is_pr_merge(self._TWO_PARENTS, self._SAME_EMAIL, self._SAME_EMAIL,
+                                "Merge remote-tracking branch 'origin/feature/x'") is True
+
+    def test_sync_commit_single_parent_not_excluded(self, gs):
+        """Single-parent commit with primary-branch subject is not a true merge;
+        the sync exclusion applies only to true merges (two parents)."""
+        # A heuristic match with primary-branch wording that isn't a true merge
+        # is not excluded (this pattern wouldn't normally occur in practice).
+        # The key invariant: _is_pr_merge is only MORE restrictive than
+        # _detect_merge, never less.
+        result = gs._is_pr_merge(self._NO_PARENTS, self._SAME_EMAIL, self._SAME_EMAIL,
+                                  "Merge branch 'main'")
+        # _detect_merge returns False for this (excluded by subject heuristic),
+        # so _is_pr_merge must also return False.
+        assert result is False
+
+    # ── Custom merge_heuristics ───────────────────────────────────────────────
+
+    def test_custom_heuristics_sync_true_merge_still_excluded(self, tmp_path):
+        """Even with custom merge_heuristics, a true merge that syncs the primary
+        branch into another branch must not be credited as a PR merge."""
+        cfg = make_config(str(tmp_path), primary_branch=self._PRIMARY,
+                          merge_heuristics=['landed via', 'squash merge'])
+        gs = gitstats.GitStats(str(tmp_path), cfg)
+        assert gs._is_pr_merge(self._TWO_PARENTS, self._SAME_EMAIL, self._SAME_EMAIL,
+                                "Merge branch 'main' into feature/x") is False
+
+    def test_custom_heuristics_feature_true_merge_is_pr_merge(self, tmp_path):
+        cfg = make_config(str(tmp_path), primary_branch=self._PRIMARY,
+                          merge_heuristics=['landed via'])
+        gs = gitstats.GitStats(str(tmp_path), cfg)
+        assert gs._is_pr_merge(self._TWO_PARENTS, self._SAME_EMAIL, self._SAME_EMAIL,
+                                "Merge branch 'feature/x'") is True
+
+
+# ---------------------------------------------------------------------------
 # Time-ranged team membership — impact attribution
 # ---------------------------------------------------------------------------
 

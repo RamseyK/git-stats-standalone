@@ -407,6 +407,39 @@ class GitStats:
         )
         return is_true_merge or is_subject_heuristic or is_committer_merge
 
+    def _is_pr_merge(self, parents_str: str, c_email: str, a_email: str, subject: str) -> bool:
+        """Return True when a commit is a PR merge *into* the primary branch.
+
+        Extends _detect_merge with an additional exclusion for sync commits —
+        true merges whose subject indicates the primary branch being pulled
+        into another branch (e.g. "Merge branch 'main' into feature/x").
+
+        _collect_merges avoids this naturally by walking ``--first-parent``
+        on the primary branch, which only visits commits that sit on that
+        branch's history.  The tag loop has no such constraint and sees all
+        commits between tags, so this check provides the equivalent filter.
+
+        Line exclusion always uses _detect_merge so that sync-commit diffs
+        are still suppressed even though the committer is not credited.
+        """
+        if not self._detect_merge(parents_str, c_email, a_email, subject):
+            return False
+        # True merge commits need a direction check: two-parent merges that
+        # pull the primary branch into another branch are sync commits, not PRs.
+        if len(parents_str.split()) >= 2:
+            s  = subject.lower().strip()
+            pb = self.primary_branch.lower()
+            is_pb_sync = (
+                s.startswith(f"merge branch '{pb}'")
+                or s.startswith(f'merge branch "{pb}"')
+                or s.startswith(f'merge branch {pb} ')
+                or s == f'merge branch {pb}'
+                or (s.startswith('merge remote-tracking branch') and f'/{pb}' in s)
+            )
+            if is_pb_sync:
+                return False
+        return True
+
     def _collect_commits(self, repo_path, component_dirs, components,
                          component_contributions, team_components, record_loc=False):
         """Process git log --numstat for one repository.
@@ -803,9 +836,13 @@ class GitStats:
                     tt['first_ts']  = min(tt['first_ts'], ts)
                     tt['last_ts']   = max(tt['last_ts'],  ts)
 
-                    # Credit the committer with the merge (consistent with
-                    # _collect_merges which also uses committer, not author).
-                    if current_skip_lines:
+                    # Credit the committer with the merge only when the commit
+                    # is a PR merge INTO the primary branch.  _is_pr_merge adds
+                    # a direction check on top of _detect_merge so that sync
+                    # commits (merging the primary branch into a feature branch)
+                    # are excluded here even though their lines are still
+                    # suppressed via current_skip_lines above.
+                    if self._is_pr_merge(parents_str, c_email, a_email, subject):
                         committer = self._get_author(c_name, c_email)
                         c_team    = self._get_team(committer, c_email, ts)
                         if committer not in tag_authors:
