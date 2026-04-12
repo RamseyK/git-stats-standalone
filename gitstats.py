@@ -18,6 +18,8 @@ from collections import Counter, defaultdict
 # Default palette cycled through when a team has no explicit "color" in config.
 # Supports up to 12 teams; the 13th wraps back to the first color.
 # The fallback "Community" team is always assigned slate (#94a3b8) separately.
+_DEBUG_MERGES = os.getenv('GITSTATS_DEBUG_MERGES', '').lower() in ('1', 'true', 'yes')
+
 TEAM_COLORS = [
     '#3b82f6', '#10b981', '#f59e0b', '#ef4444',
     '#8b5cf6', '#ec4899', '#06b6d4', '#84cc16',
@@ -650,6 +652,8 @@ class GitStats:
             # Store per-merge timestamps so team attribution can use the team
             # the committer belonged to *at the time of each merge*.
             au.setdefault('merge_timestamps', []).append((ts, c_email.strip()))
+            if _DEBUG_MERGES:
+                print(f'[merge credit] {author} | {subject.strip()}')
 
     def collect(self):
         """Populate self.data by running git commands against all repositories.
@@ -852,6 +856,8 @@ class GitStats:
                             }
                         tag_authors[committer]['merges'] += 1
                         tag_teams[c_team]['merges'] += 1
+                        if _DEBUG_MERGES:
+                            print(f'[merge credit] {committer} | {subject.strip()} [tag]')
 
                 elif current_author and '\t' in line:
                     if current_skip_lines:
