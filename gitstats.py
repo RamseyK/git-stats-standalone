@@ -271,6 +271,21 @@ class GitStats:
             else [s.lower() for s in raw_h]
         )
 
+        # Patterns identifying commits whose line counts should be excluded from
+        # all metrics (add/del totals, commit_lines for impact scoring, LOC history).
+        # Matched case-insensitively as substrings of the commit subject.
+        # None means use the built-in defaults, which discard line counts for:
+        #   • commits containing "merge conflict"
+        #   • commits merging the primary branch back into another branch
+        #     (e.g. "Merge branch 'main'" / "Merge remote-tracking branch 'origin/main'")
+        # These are sync/conflict-resolution commits whose diffs do not represent
+        # original work by the author.  Set to [] to disable all filtering.
+        raw_um = config.get('useless_merge_heuristics', None)
+        self.useless_merge_heuristics = (
+            None if raw_um is None
+            else [s.lower() for s in raw_um]
+        )
+
         # ── Impact score weights (config-overridable) ─────────────────────────
         # Each key maps to the corresponding class-level default.  Set a weight
         # to 0 to remove that dimension from scoring entirely; the remaining
@@ -404,6 +419,38 @@ class GitStats:
 
     # ------------------------------------------------------------------ collect
 
+    def _is_useless_merge(self, subject: str) -> bool:
+        """Return True when a commit's line counts should be excluded from all metrics.
+
+        Matches case-insensitively against the lowercased subject.  When
+        useless_merge_heuristics is None the built-in defaults are used:
+          • Subject contains 'merge conflict'
+          • Subject matches 'merge branch '<primary_branch>'' — the primary branch
+            being pulled into another branch to resolve conflicts
+          • Subject matches 'merge remote-tracking branch 'origin/<primary_branch>''
+        When useless_merge_heuristics is a list (including empty) it replaces the
+        built-in defaults entirely.
+        """
+        s = subject.lower().strip()
+        pb = self.primary_branch.lower()
+
+        if self.useless_merge_heuristics is not None:
+            return any(h in s for h in self.useless_merge_heuristics)
+
+        # Built-in defaults
+        if 'merge conflict' in s:
+            return True
+        # "Merge branch 'main'" or "Merge branch 'main' into ..."
+        if s.startswith(f"merge branch '{pb}'") or s.startswith(f'merge branch "{pb}"') \
+                or s.startswith(f'merge branch {pb} ') or s == f'merge branch {pb}':
+            return True
+        # "Merge remote-tracking branch 'origin/main'" (any variant)
+        if s.startswith(f"merge remote-tracking branch 'origin/{pb}'") \
+                or s.startswith(f'merge remote-tracking branch "origin/{pb}"') \
+                or s.startswith(f'merge remote-tracking branch origin/{pb}'):
+            return True
+        return False
+
     def _collect_commits(self, repo_path, component_dirs, components,
                          component_contributions, team_components, record_loc=False):
         """Process git log --numstat for one repository.
@@ -430,7 +477,7 @@ class GitStats:
             main repo.
         """
         log_data = self._run_git(
-            ['log', '--numstat', '--pretty=format:COMMIT|%at|%an|%ae'], repo_path
+            ['log', '--numstat', '--pretty=format:COMMIT|%at|%an|%ae|%s'], repo_path
         )
 
         # State carried across lines within the same commit
@@ -443,6 +490,8 @@ class GitStats:
         current_commit_ts = 0
         current_commit_adds = 0
         current_commit_dels = 0
+        # When True, skip line accumulation for the current commit's numstat lines.
+        current_skip_lines = False
 
         for line in log_data.splitlines():
             if line.startswith('COMMIT|'):
@@ -456,7 +505,7 @@ class GitStats:
                 current_commit_adds = 0
                 current_commit_dels = 0
 
-                _, ts_str, name, email = line.split('|', 3)
+                _, ts_str, name, email, subject = line.split('|', 4)
                 ts = int(ts_str)
                 current_commit_ts = ts
                 dt = datetime.datetime.fromtimestamp(ts)
@@ -465,6 +514,7 @@ class GitStats:
                 all_ts.append(ts)
                 current_author = author
                 current_team = team
+                current_skip_lines = self._is_useless_merge(subject)
                 # Track the most-recently-seen email for each canonical author so
                 # we can resolve email-keyed team membership entries later.
 
@@ -515,22 +565,24 @@ class GitStats:
                     d = int(parts[1]) if parts[1] and parts[1] != '-' else 0
                     path = parts[2] if len(parts) > 2 else ''
 
-                    self.data['authors'][current_author]['add'] += a
-                    self.data['authors'][current_author]['del'] += d
-                    self.data['teams'][current_team]['add'] += a
-                    self.data['teams'][current_team]['del'] += d
+                    if not current_skip_lines:
+                        self.data['authors'][current_author]['add'] += a
+                        self.data['authors'][current_author]['del'] += d
+                        self.data['teams'][current_team]['add'] += a
+                        self.data['teams'][current_team]['del'] += d
 
-                    # Accumulate into the current commit bucket for impact scoring.
-                    current_commit_adds += a
-                    current_commit_dels += d
+                        # Accumulate into the current commit bucket for impact scoring.
+                        current_commit_adds += a
+                        current_commit_dels += d
 
-                    if record_loc:
-                        # Track running net LOC for the LOC history chart.
-                        # Reversed to chronological order in collect() after the loop.
-                        running_loc += (a - d)
-                        self.data['loc_history'].append(running_loc)
+                        if record_loc:
+                            # Track running net LOC for the LOC history chart.
+                            # Reversed to chronological order in collect() after the loop.
+                            running_loc += (a - d)
+                            self.data['loc_history'].append(running_loc)
 
-                    # Attribute churn to this repo's component (if any)
+                    # Component churn is tracked regardless of skip_lines — churn
+                    # reflects file activity, not authorship credit.
                     component = self._get_component(path, component_dirs)
                     if component is not None:
                         components[component] += (a + d)
