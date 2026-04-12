@@ -183,6 +183,18 @@ def make_config(tmp_path, **overrides):
     return p
 
 
+def generate_html(gs, tmp_path_factory, name='report'):
+    """Generate an HTML report for *gs* and return its contents as a string.
+
+    Writes the file under a fresh mktemp directory so concurrent tests never
+    collide.  The externals directory is resolved relative to PROJECT_ROOT.
+    """
+    tmp = str(tmp_path_factory.mktemp(name))
+    out = os.path.join(tmp, 'report.html')
+    gs.generate_report(os.path.join(PROJECT_ROOT, 'externals'), out)
+    return open(out).read()
+
+
 # ---------------------------------------------------------------------------
 # Basic stats
 # ---------------------------------------------------------------------------
@@ -284,30 +296,21 @@ class TestTeams:
 
     def test_author_aliases_in_html_script(self, std_gs, tmp_path_factory):
         """authorAliases must be present in the rendered HTML with correct data."""
-        tmp = str(tmp_path_factory.mktemp('alias_html'))
-        out = os.path.join(tmp, 'report.html')
-        std_gs.generate_report(os.path.join(PROJECT_ROOT, 'externals'), out)
-        html = open(out).read()
+        html = generate_html(std_gs, tmp_path_factory, 'alias_html')
         assert 'const authorAliases' in html
         # The aliases for Hood Chatham must appear somewhere in the script block.
         assert 'roberthoodchatham@gmail.com' in html
 
     def test_member_badge_has_tooltip_with_full_name(self, std_gs, tmp_path_factory):
         """Each member badge in the Teams grid must carry a title= attribute with the full name."""
-        tmp = str(tmp_path_factory.mktemp('tooltip_html'))
-        out = os.path.join(tmp, 'report.html')
-        std_gs.generate_report(os.path.join(PROJECT_ROOT, 'externals'), out)
-        html = open(out).read()
+        html = generate_html(std_gs, tmp_path_factory, 'tooltip_html')
         # The JS template generates title="${{tip}}" which resolves to title="Full Name..."
         # The literal text 'title="${{tip}}"' must appear in the template source.
         assert "title=\"${tip}\"" in html
 
     def test_member_badge_tooltip_includes_aliases_label(self, std_gs, tmp_path_factory):
         """The tooltip template must include the 'Aliases:' label for authors that have them."""
-        tmp = str(tmp_path_factory.mktemp('alias_label_html'))
-        out = os.path.join(tmp, 'report.html')
-        std_gs.generate_report(os.path.join(PROJECT_ROOT, 'externals'), out)
-        html = open(out).read()
+        html = generate_html(std_gs, tmp_path_factory, 'alias_label_html')
         assert 'Aliases:' in html
 
 
@@ -1242,9 +1245,7 @@ class TestImpactWeightConfig:
                           impact_w_merges=0)
         gs = gitstats.GitStats(repo_path, cfg)
         gs.collect()
-        out = os.path.join(tmp, 'report.html')
-        gs.generate_report(os.path.join(PROJECT_ROOT, 'externals'), out)
-        html = open(out).read()
+        html = generate_html(gs, tmp_path_factory, 'weight_html')
 
         # The weight cards must show the configured values.
         assert '>50%<' in html or '50%' in html
@@ -1268,9 +1269,7 @@ class TestImpactWeightConfig:
                           impact_w_merges=0)
         gs = gitstats.GitStats(repo_path, cfg)
         gs.collect()
-        out = os.path.join(tmp, 'report.html')
-        gs.generate_report(os.path.join(PROJECT_ROOT, 'externals'), out)
-        html = open(out).read()
+        html = generate_html(gs, tmp_path_factory, 'formula_html')
 
         # Formula line must reference the configured values.
         assert '× 40' in html     # commits and lines
@@ -1529,9 +1528,7 @@ class TestZeroCommitTeams:
         cfg = make_config(tmp, teams=teams)
         gs = gitstats.GitStats(repo_path, cfg)
         gs.collect()
-        out = os.path.join(tmp, 'report.html')
-        gs.generate_report(os.path.join(PROJECT_ROOT, 'externals'), out)
-        data = _extract_teams_data(open(out).read())
+        data = _extract_teams_data(generate_html(gs, tmp_path_factory, 'zero_commit_team'))
         assert data is not None
         assert 'Phantom' in data, "Zero-commit team must appear in teamsData"
 
@@ -1545,9 +1542,7 @@ class TestZeroCommitTeams:
         cfg = make_config(tmp, teams=teams)
         gs = gitstats.GitStats(repo_path, cfg)
         gs.collect()
-        out = os.path.join(tmp, 'report.html')
-        gs.generate_report(os.path.join(PROJECT_ROOT, 'externals'), out)
-        data = _extract_teams_data(open(out).read())
+        data = _extract_teams_data(generate_html(gs, tmp_path_factory, 'zero_impact'))
         assert data is not None
         assert data['Phantom']['impact'] == 0
         assert data['Phantom']['commits'] == 0
@@ -1562,9 +1557,7 @@ class TestZeroCommitTeams:
         cfg = make_config(tmp, teams=teams)
         gs = gitstats.GitStats(repo_path, cfg)
         gs.collect()
-        out = os.path.join(tmp, 'report.html')
-        gs.generate_report(os.path.join(PROJECT_ROOT, 'externals'), out)
-        data = _extract_teams_data(open(out).read())
+        data = _extract_teams_data(generate_html(gs, tmp_path_factory, 'empty_members'))
         assert data is not None
         assert 'Ghost' not in data, "Team with empty members must not appear in teamsData"
 
@@ -1582,13 +1575,8 @@ class TestZeroCommitTeams:
         gs_base  = gitstats.GitStats(repo_path, cfg_base);  gs_base.collect()
         gs_extra = gitstats.GitStats(repo_path, cfg_extra); gs_extra.collect()
 
-        out_base  = os.path.join(tmp_base,  'report.html')
-        out_extra = os.path.join(tmp_extra, 'report.html')
-        gs_base.generate_report(os.path.join(PROJECT_ROOT, 'externals'), out_base)
-        gs_extra.generate_report(os.path.join(PROJECT_ROOT, 'externals'), out_extra)
-
-        base_data  = _extract_teams_data(open(out_base).read())
-        extra_data = _extract_teams_data(open(out_extra).read())
+        base_data  = _extract_teams_data(generate_html(gs_base,  tmp_path_factory, 'base'))
+        extra_data = _extract_teams_data(generate_html(gs_extra, tmp_path_factory, 'extra'))
 
         assert base_data['Core']['impact'] == extra_data['Core']['impact']
         assert base_data['Core']['commits'] == extra_data['Core']['commits']
@@ -1729,20 +1717,14 @@ class TestNoTeams:
         assert list(no_teams_gs.data['teams'].keys()) == ['Community']
 
     def test_teams_tab_hidden_in_html(self, no_teams_gs, tmp_path_factory):
-        tmp = str(tmp_path_factory.mktemp('html_no_teams'))
-        out = os.path.join(tmp, 'report.html')
-        no_teams_gs.generate_report(os.path.join(PROJECT_ROOT, 'externals'), out)
-        html = open(out).read()
+        html = generate_html(no_teams_gs, tmp_path_factory, 'html_no_teams')
         # The Teams tab button must carry the hidden class.
         assert 'class="tab-btn hidden"' in html or "tab-btn hidden" in html
         # The JS constant must be false.
         assert 'const hasTeams       = false;' in html
 
     def test_teams_tab_visible_with_teams(self, std_gs, tmp_path_factory):
-        tmp = str(tmp_path_factory.mktemp('html_with_teams'))
-        out = os.path.join(tmp, 'report.html')
-        std_gs.generate_report(os.path.join(PROJECT_ROOT, 'externals'), out)
-        html = open(out).read()
+        html = generate_html(std_gs, tmp_path_factory, 'html_with_teams')
         assert 'const hasTeams       = true;' in html
         # The Teams button must NOT be hidden.
         assert 'showTab(\'teams\',this)"    class="tab-btn"' in html or \
@@ -1871,10 +1853,7 @@ class TestSupportRepos:
 
     def test_html_support_repo_component_card(self, combined_gs, recipes_repo_path, tmp_path_factory):
         """The generated HTML must contain a separate component card for the support repo."""
-        tmp = str(tmp_path_factory.mktemp('html_combined'))
-        out = os.path.join(tmp, 'report.html')
-        combined_gs.generate_report(os.path.join(PROJECT_ROOT, 'externals'), out)
-        html = open(out).read()
+        html = generate_html(combined_gs, tmp_path_factory, 'html_combined')
         sr_name = os.path.basename(os.path.abspath(recipes_repo_path))
         # The support repo card must have a canvas with id="componentChart-support-0"
         assert 'id="componentChart-support-0"' in html
@@ -1970,11 +1949,9 @@ class TestComponentMarkers:
         component labels produced by the active marker set."""
         tmp = str(tmp_path_factory.mktemp('html_markers'))
         cfg = make_config(tmp, component_markers=['pyproject.toml'])
-        out = os.path.join(tmp, 'report.html')
         gs = gitstats.GitStats(repo_path, cfg)
         gs.collect()
-        gs.generate_report(os.path.join(PROJECT_ROOT, 'externals'), out)
-        html = open(out).read()
+        html = generate_html(gs, tmp_path_factory, 'html_markers')
 
         # src/py is detected by pyproject.toml; must appear in the chart data.
         assert '"src/py"' in html
@@ -1986,11 +1963,9 @@ class TestComponentMarkers:
         (empty chart), and the repoCharts labels list must be empty."""
         tmp = str(tmp_path_factory.mktemp('html_empty'))
         cfg = make_config(tmp, component_markers=[])
-        out = os.path.join(tmp, 'report.html')
         gs = gitstats.GitStats(repo_path, cfg)
         gs.collect()
-        gs.generate_report(os.path.join(PROJECT_ROOT, 'externals'), out)
-        html = open(out).read()
+        html = generate_html(gs, tmp_path_factory, 'html_empty')
 
         # The main repo chart card must still be present.
         assert 'id="componentChart-main"' in html
@@ -2114,10 +2089,7 @@ class TestSummaryTab:
     @pytest.fixture(scope='class')
     def std_html(self, std_gs, tmp_path_factory):
         """Generate the standard-config report HTML once for all HTML-checking tests."""
-        tmp = str(tmp_path_factory.mktemp('summary_std_html'))
-        out = os.path.join(tmp, 'report.html')
-        std_gs.generate_report(os.path.join(PROJECT_ROOT, 'externals'), out)
-        return open(out).read()
+        return generate_html(std_gs, tmp_path_factory, 'summary_std_html')
 
     # ── Data collected by collect() ──────────────────────────────────────────
 
@@ -2286,9 +2258,7 @@ class TestSummaryTab:
                           impact_w_merges=0)
         gs = gitstats.GitStats(repo_path, cfg)
         gs.collect()
-        out = os.path.join(tmp, 'report.html')
-        gs.generate_report(os.path.join(PROJECT_ROOT, 'externals'), out)
-        html = open(out).read()
+        html = generate_html(gs, tmp_path_factory, 'bf_commits_only')
         assert 'of all commits' in html
         assert 'PR Merges' not in html
         assert 'of all PR merges' not in html
@@ -2332,11 +2302,9 @@ class TestSummaryTab:
         """Custom summary_velocity_days must produce exactly the configured day-window labels."""
         tmp = str(tmp_path_factory.mktemp('vel_custom_html'))
         cfg = make_config(tmp, summary_velocity_days=[7, 180])
-        out = os.path.join(tmp, 'report.html')
         gs = gitstats.GitStats(repo_path, cfg)
         gs.collect()
-        gs.generate_report(os.path.join(PROJECT_ROOT, 'externals'), out)
-        html = open(out).read()
+        html = generate_html(gs, tmp_path_factory, 'vel_custom_html')
 
         assert 'Last 7 Days' in html
         assert 'Last 180 Days' in html
@@ -2409,10 +2377,7 @@ class TestSummaryTab:
     def test_monthly_chart_ordered_chronologically(self, std_gs, tmp_path_factory):
         """Monthly labels must be in ascending chronological order."""
         import re, json as _json
-        tmp = str(tmp_path_factory.mktemp('monthly_order'))
-        out = os.path.join(tmp, 'report.html')
-        std_gs.generate_report(os.path.join(PROJECT_ROOT, 'externals'), out)
-        html = open(out).read()
+        html = generate_html(std_gs, tmp_path_factory, 'monthly_order')
 
         # Extract the labels array passed to monthlyChart.
         # The JS line is: labels: ["Jan 2020", "Feb 2020", ...]
@@ -2428,10 +2393,7 @@ class TestSummaryTab:
     def test_monthly_chart_counts_sum_to_total_commits(self, std_gs, tmp_path_factory):
         """Sum of all monthly commit counts must equal total_commits (all repos combined)."""
         import re, json as _json
-        tmp = str(tmp_path_factory.mktemp('monthly_sum'))
-        out = os.path.join(tmp, 'report.html')
-        std_gs.generate_report(os.path.join(PROJECT_ROOT, 'externals'), out)
-        html = open(out).read()
+        html = generate_html(std_gs, tmp_path_factory, 'monthly_sum')
 
         # Extract the data array for monthlyChart (the counts, not the labels).
         # Pattern: after the labels array, the datasets data array follows.
@@ -2445,13 +2407,6 @@ class TestSummaryTab:
 
     def test_monthly_chart_includes_support_repo_commits(self, combined_gs, std_gs, tmp_path_factory):
         """Monthly counts must include support repo commits (heatmap accumulates all repos)."""
-        tmp_c = str(tmp_path_factory.mktemp('monthly_combined'))
-        tmp_s = str(tmp_path_factory.mktemp('monthly_single'))
-        out_c = os.path.join(tmp_c, 'report.html')
-        out_s = os.path.join(tmp_s, 'report.html')
-        combined_gs.generate_report(os.path.join(PROJECT_ROOT, 'externals'), out_c)
-        std_gs.generate_report(os.path.join(PROJECT_ROOT, 'externals'), out_s)
-
         import re, json as _json
         def extract_counts(html):
             m = re.search(
@@ -2460,8 +2415,8 @@ class TestSummaryTab:
             )
             return sum(_json.loads(m.group(1))) if m else 0
 
-        combined_total = extract_counts(open(out_c).read())
-        single_total   = extract_counts(open(out_s).read())
+        combined_total = extract_counts(generate_html(combined_gs, tmp_path_factory, 'monthly_combined'))
+        single_total   = extract_counts(generate_html(std_gs,      tmp_path_factory, 'monthly_single'))
         assert combined_total > single_total
 
     # ── Monthly chart tooltip ─────────────────────────────────────────────────
@@ -2510,10 +2465,7 @@ class TestSummaryTab:
 
     def test_monthly_tooltip_data_in_html(self, std_gs, tmp_path_factory):
         """The generated HTML must include the monthlyKeys and monthlyTopAuthors JS variables."""
-        tmp = str(tmp_path_factory.mktemp('tooltip_html'))
-        out = os.path.join(tmp, 'report.html')
-        std_gs.generate_report(os.path.join(PROJECT_ROOT, 'externals'), out)
-        html = open(out).read()
+        html = generate_html(std_gs, tmp_path_factory, 'tooltip_html')
         assert 'const monthlyKeys' in html
         assert 'const monthlyTopAuthors' in html
 
@@ -2529,9 +2481,7 @@ class TestSummaryTab:
         cfg = make_config(tmp, monthly_top_authors=2)
         gs = gitstats.GitStats(repo_path, cfg)
         gs.collect()
-        out = os.path.join(tmp, 'report.html')
-        gs.generate_report(os.path.join(PROJECT_ROOT, 'externals'), out)
-        html = open(out).read()
+        html = generate_html(gs, tmp_path_factory, 'top_n')
 
         m = re.search(r'const monthlyTopAuthors\s*=\s*(\{.*?\});', html, re.DOTALL)
         assert m, "monthlyTopAuthors not found in HTML"
@@ -2932,10 +2882,7 @@ class TestPRMergeRate:
 
     def test_merges_in_author_data_json(self, std_gs, tmp_path_factory):
         """The merges field must appear in the serialized authorData JS constant in the HTML."""
-        tmp = str(tmp_path_factory.mktemp('merges_json'))
-        out = os.path.join(tmp, 'report.html')
-        std_gs.generate_report(os.path.join(PROJECT_ROOT, 'externals'), out)
-        html = open(out).read()
+        html = generate_html(std_gs, tmp_path_factory, 'merges_json')
 
         # Extract authorData JSON
         for line in html.splitlines():
@@ -2953,10 +2900,7 @@ class TestPRMergeRate:
 
     @pytest.fixture(scope='class')
     def std_html(self, std_gs, tmp_path_factory):
-        tmp = str(tmp_path_factory.mktemp('merges_html'))
-        out = os.path.join(tmp, 'report.html')
-        std_gs.generate_report(os.path.join(PROJECT_ROOT, 'externals'), out)
-        return open(out).read()
+        return generate_html(std_gs, tmp_path_factory, 'merges_html')
 
     def test_merges_column_header_in_authors_table(self, std_html):
         """The Authors table must have a 'Merges' column header."""
@@ -2985,9 +2929,7 @@ class TestPRMergeRate:
                           impact_w_merges=0)
         gs = gitstats.GitStats(repo_path, cfg)
         gs.collect()
-        out = os.path.join(tmp, 'report.html')
-        gs.generate_report(os.path.join(PROJECT_ROOT, 'externals'), out)
-        html = open(out).read()
+        html = generate_html(gs, tmp_path_factory, 'no_merges_html')
         # Impact weight card and formula token must be absent.
         assert 'max_merges' not in html
         # Bus factor PR Merges section must also be absent.
