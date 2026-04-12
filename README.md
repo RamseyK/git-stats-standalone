@@ -298,3 +298,15 @@ The same weights can also be changed permanently by editing the class constants 
 - **Set `impact_use_net_lines: false`** if gross volume is genuinely meaningful (e.g., large automated test generation).
 - **Lower `impact_line_cap_percentile`** (e.g., `80`) for tighter outlier control; `0` to disable.
 - **Lower `impact_wash_window_days`** (e.g., `3`) for high-frequency repos where revert pairs happen within days.
+
+## Potential Shortfalls
+
+### Tenure rewards clock-time, not contribution density
+
+The Active Tenure dimension is computed as the number of days between an author's first and last commit in the repository. This means an author who made a single commit on day 1 and a single commit on day 1000 receives 999 days of tenure — identical to a contributor who made hundreds of commits across that same span. A dormant author who returns years later with a minor fix receives a significant tenure boost that can rank them above steady, recent contributors.
+
+**This is a deliberate design choice for individual authors.** Tenure is intended to reward sustained, long-term engagement with a project. A contributor who has been present across many years of a repository's history represents a form of institutional knowledge and staying power that pure commit counts do not capture. Whether a dormant period reflects disengagement or appropriate prioritization is context-dependent and outside what a commit log can determine.
+
+**For teams, dormancy is structurally unlikely by design.** A well-defined team is expected to maintain a diversity of active members such that the team as a whole rarely goes dormant — individual members may be less active at any given time, but the team's collective tenure reflects real, ongoing presence in the codebase. A team whose tenure span is largely empty (e.g., one historical member from years ago and no recent activity) is likely a team that no longer exists in a meaningful sense and probably should not be defined in the configuration, or should use time-ranged membership entries to reflect its actual active period.
+
+If tenure distortion is a concern for a specific repository, it can be reduced or eliminated by lowering `impact_w_tenure` or setting it to `0`.

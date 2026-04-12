@@ -1007,7 +1007,8 @@ class GitStats:
                     ((days               / max_d) * wt if wt > 0 else 0.0) +
                     ((a.get('merges', 0) / max_m) * wm if wm > 0 else 0.0)
                 )
-                a['impact'] = round(raw * scale, 1)
+                a['impact']   = round(raw * scale, 1)
+                a['eff_lines'] = int(eff_map[name])
 
         # ── Score teams ───────────────────────────────────────────────────────
         # Team effective lines apply the same three-step noise-reduction pipeline
@@ -1839,6 +1840,9 @@ class GitStats:
         # Impact tab: two-column layout only when teams are configured
         impact_grid_cls  = 'grid grid-cols-1 lg:grid-cols-2 gap-8' if self.has_teams else 'grid grid-cols-1 gap-8'
         has_teams_js     = json.dumps(self.has_teams)
+        iw_commits_js    = json.dumps(self.IMPACT_W_COMMITS)
+        iw_lines_js      = json.dumps(self.IMPACT_W_LINES)
+        iw_tenure_js     = json.dumps(self.IMPACT_W_TENURE)
         iw_merges_js     = json.dumps(self.IMPACT_W_MERGES)
         tags_tab_html    = self._render_tags_html()
 
@@ -2018,6 +2022,9 @@ const teamsData      = {teams_json};
 const authorAliases  = {author_aliases_json};
 const teamColors     = {team_colors_json};
 const hasTeams       = {has_teams_js};
+const impactWCommits = {iw_commits_js};
+const impactWLines   = {iw_lines_js};
+const impactWTenure  = {iw_tenure_js};
 const impactWMerges  = {iw_merges_js};
 const componentData     = {component_json};
 const teamComponentData = {team_component_json};
@@ -2109,6 +2116,22 @@ function teamBadges(s) {{
         return b[1] - a[1];
     }});
     return sorted.map(([t]) => teamBadge(t)).join(' ');
+}}
+
+function authorImpactTooltip(name, s) {{
+    // Build the title attribute value for the impact score cell.
+    // Shows per-dimension factors used to compute the lifetime impact score.
+    const days   = Math.floor((s.last - s.first) / 86400);
+    const plural = days !== 1 ? 's' : '';
+    const lines  = [];
+    lines.push(name);
+    lines.push('Impact score breakdown:');
+    if (impactWCommits > 0) lines.push(`  Commits: ${{(s.commits || 0).toLocaleString()}}`);
+    if (impactWLines   > 0) lines.push(`  Eff. Lines: ${{(s.eff_lines || 0).toLocaleString()}}`);
+    if (impactWTenure  > 0) lines.push(`  Tenure: ${{days}} day${{plural}}`);
+    if (impactWMerges  > 0) lines.push(`  Merges: ${{(s.merges || 0).toLocaleString()}}`);
+    lines.push(`Score: ${{s.impact || 0}} / 100`);
+    return lines.join('&#10;');
 }}
 
 function authorImpactBar(impact, s) {{
@@ -2223,7 +2246,8 @@ function renderAuthorTable(filter, filterType) {{
             <td class="px-4 font-mono text-sm font-bold text-slate-600">${{merges > 0 ? merges : '<span class="text-slate-300">—</span>'}}</td>
             <td>
                 <div class="flex items-center gap-2" style="min-width:140px">
-                    <span class="text-xs font-black text-slate-700 w-8">${{impact}}</span>
+                    <span class="text-xs font-black text-slate-700 w-8 cursor-default"
+                          title="${{authorImpactTooltip(name, s)}}">${{impact}}</span>
                     ${{authorImpactBar(impact, s)}}
                 </div>
             </td>
