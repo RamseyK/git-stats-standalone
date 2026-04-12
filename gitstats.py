@@ -1764,7 +1764,13 @@ class GitStats:
         for team_name, t in self.data['teams'].items():
             current, previous = [], []
             for author in sorted(t['members']):
-                # Check all lookup keys for this author at now_ts.
+                # Community is an implicit fallback — authors land here because
+                # they have no active configured team, so they are always current.
+                if team_name == self._DEFAULT_TEAM:
+                    current.append(author)
+                    continue
+                # For explicitly configured teams, check all lookup keys for
+                # this author at now_ts against the configured date ranges.
                 is_current = any(
                     any(t_name == team_name and from_ts <= now_ts <= to_ts
                         for t_name, from_ts, to_ts in self.author_to_team_ranges.get(key, []))

@@ -3664,6 +3664,33 @@ class TestTimeRangedMembership:
         ]
         assert 'Alice' in current
 
+    def test_unassigned_community_members_always_current(self, tmp_path, tmp_path_factory):
+        """Unassigned authors binned to Community must appear as current members,
+        never as previous members, even when they have no author_to_team_ranges entry.
+
+        In the real collect() flow, only explicitly configured team members appear
+        in author_to_team_ranges. An author with no config entry has an empty range
+        list; the old is_current check would return False and push them to previous.
+        The fix treats all Community members as current since Community is an
+        implicit fallback with no concept of expired membership.
+        """
+        import time as time_mod
+        now = int(time_mod.time())
+        past_ts = now - _DAY * 500  # committed 500 days ago — no recent activity
+        gs = _make_synthetic_gs(tmp_path, {
+            'Alice': {'commit_lines': [(past_ts, 100, 0, 'Community')], 'team': 'Community'},
+        }, wash_window_days=0, line_cap_percentile=0)
+        # Remove Alice's Community range to simulate an unassigned author —
+        # real collect() never writes Community entries into author_to_team_ranges.
+        gs.author_to_team_ranges.pop('Alice', None)
+        gs._compute_impact()
+        generate_html(gs, tmp_path_factory, 'community_current_test')
+        community = gs.data['teams'].get('Community', {})
+        assert 'Alice' in community.get('members', []), \
+            "Unassigned Community member must be in current members"
+        assert 'Alice' not in community.get('previous_members', []), \
+            "Unassigned Community member must not appear in previous members"
+
 
 if __name__ == "__main__":
     sys.exit(pytest.main())
