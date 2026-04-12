@@ -268,6 +268,48 @@ class TestTeams:
         # all three have commits in the locked repo.
         assert len(core['members']) >= 3
 
+    # ── Alias tooltip in HTML ────────────────────────────────────────────────
+
+    def test_canonical_to_aliases_populated(self, std_gs):
+        """canonical_to_aliases must be built from the config aliases block."""
+        # STD_CONFIG defines aliases for Hood Chatham and Roman Yurchak.
+        assert 'Hood Chatham' in std_gs.canonical_to_aliases
+        assert 'Roman Yurchak' in std_gs.canonical_to_aliases
+
+    def test_canonical_to_aliases_correct_entries(self, std_gs):
+        """The alias list for Hood Chatham must match what STD_CONFIG declares."""
+        aliases = std_gs.canonical_to_aliases['Hood Chatham']
+        assert 'roberthoodchatham@gmail.com' in aliases
+        assert 'hood@mit.edu' in aliases
+
+    def test_author_aliases_in_html_script(self, std_gs, tmp_path_factory):
+        """authorAliases must be present in the rendered HTML with correct data."""
+        tmp = str(tmp_path_factory.mktemp('alias_html'))
+        out = os.path.join(tmp, 'report.html')
+        std_gs.generate_report(os.path.join(PROJECT_ROOT, 'externals'), out)
+        html = open(out).read()
+        assert 'const authorAliases' in html
+        # The aliases for Hood Chatham must appear somewhere in the script block.
+        assert 'roberthoodchatham@gmail.com' in html
+
+    def test_member_badge_has_tooltip_with_full_name(self, std_gs, tmp_path_factory):
+        """Each member badge in the Teams grid must carry a title= attribute with the full name."""
+        tmp = str(tmp_path_factory.mktemp('tooltip_html'))
+        out = os.path.join(tmp, 'report.html')
+        std_gs.generate_report(os.path.join(PROJECT_ROOT, 'externals'), out)
+        html = open(out).read()
+        # The JS template generates title="${{tip}}" which resolves to title="Full Name..."
+        # The literal text 'title="${{tip}}"' must appear in the template source.
+        assert "title=\"${tip}\"" in html
+
+    def test_member_badge_tooltip_includes_aliases_label(self, std_gs, tmp_path_factory):
+        """The tooltip template must include the 'Aliases:' label for authors that have them."""
+        tmp = str(tmp_path_factory.mktemp('alias_label_html'))
+        out = os.path.join(tmp, 'report.html')
+        std_gs.generate_report(os.path.join(PROJECT_ROOT, 'externals'), out)
+        html = open(out).read()
+        assert 'Aliases:' in html
+
 
 # ---------------------------------------------------------------------------
 # Time-ranged team membership

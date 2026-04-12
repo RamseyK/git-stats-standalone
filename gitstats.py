@@ -132,6 +132,8 @@ class GitStats:
             (alias.lower() if '@' in alias else alias): canon
             for canon, als in aliases.items() for alias in als
         }
+        # Preserved for HTML output: canonical name → list of alias strings.
+        self.canonical_to_aliases = {canon: list(als) for canon, als in aliases.items()}
 
         # Build team membership and color lookups from config.
         #
@@ -992,11 +994,16 @@ class GitStats:
             return ('<div class="card text-center text-slate-400 font-bold py-16">'
                     'No tags found in this repository.</div>')
         parts = []
+        _release_medals = ['🥇', '🥈', '🥉']
         for t in self.data['tags']:
+            def _author_prefix(i):
+                if i < 3:
+                    return f'<span class="mr-1">{_release_medals[i]}</span>{i + 1}. '
+                return f'{i + 1}. '
             author_items = ''.join([
                 f'<div class="flex justify-between items-center text-sm bg-slate-50 p-2 rounded-xl '
                 f'border border-transparent hover:border-slate-200 transition-all">'
-                f'<span class="truncate font-bold text-slate-600">{i + 1}. {auth}</span>'
+                f'<span class="truncate font-bold text-slate-600">{_author_prefix(i)}{auth}</span>'
                 f'<b class="text-blue-600 ml-2 shrink-0">{count}</b></div>'
                 for i, (auth, count) in enumerate(t['top_authors'])
             ])
@@ -1518,8 +1525,9 @@ class GitStats:
             t['members'] = sorted(list(t['members']))
 
         # ── JSON blobs injected into the <script> block ───────────────────────
-        authors_json    = json.dumps(self.data['authors'])
-        teams_json      = json.dumps(self.data['teams'])
+        authors_json        = json.dumps(self.data['authors'])
+        teams_json          = json.dumps(self.data['teams'])
+        author_aliases_json = json.dumps(self.canonical_to_aliases)
         team_colors_json = json.dumps(self.team_colors)
         # team_components: top 8 components per team — used by the Teams tab cards.
         # Drawn from the main repo only; support repo component data appears in
@@ -1794,6 +1802,7 @@ class GitStats:
 <script>
 const authorData     = {authors_json};
 const teamsData      = {teams_json};
+const authorAliases  = {author_aliases_json};
 const teamColors     = {team_colors_json};
 const hasTeams       = {has_teams_js};
 const componentData     = {component_json};
@@ -1976,9 +1985,11 @@ function renderAuthorTable(filter, filterType) {{
         const color      = teamColor(s.team);
         const impact     = s.impact || 0;
         const merges     = s.merges || 0;
+        const als = authorAliases[name] || [];
+        const authorTip = als.length ? `${{name}}\nAliases: ${{als.join(', ')}}` : name;
         return `<tr class="hover:bg-slate-50 transition-colors">
             <td class="px-8 py-4">
-                <div class="font-bold text-slate-800">${{name}}</div>
+                <div class="font-bold text-slate-800 cursor-default" title="${{authorTip}}">${{name}}</div>
                 <div class="flex flex-wrap gap-1 mt-0.5">${{teamBadges(s)}}</div>
             </td>
             <td class="font-mono text-sm font-bold">${{fmt(commits)}}</td>
@@ -2203,9 +2214,14 @@ function renderTeamsGrid() {{
             <div>
                 <div class="text-[10px] font-black uppercase text-slate-400 mb-1.5">Members</div>
                 <div class="flex flex-wrap gap-1">
-                    ${{members.map(m =>
-                        `<span class="text-xs px-2 py-0.5 rounded bg-slate-100 text-slate-600 font-bold">${{m.split(' ')[0]}}</span>`
-                    ).join('')}}
+                    ${{members.map(m => {{
+                        const als = authorAliases[m] || [];
+                        const tip = als.length
+                            ? `${{m}}\nAliases: ${{als.join(', ')}}`
+                            : m;
+                        return `<span class="text-xs px-2 py-0.5 rounded bg-slate-100 text-slate-600 font-bold cursor-default"
+                                      title="${{tip}}">${{m.split(' ')[0]}}</span>`;
+                    }}).join('')}}
                 </div>
             </div>
         </div>`;
