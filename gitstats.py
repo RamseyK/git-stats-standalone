@@ -253,6 +253,16 @@ class GitStats:
         # counted in the merges dimension of the impact score.
         self.primary_branch = config.get('primary_branch', 'develop')
 
+        # Heuristic patterns for detecting squash/rebase merges by commit subject.
+        # Each string is matched as a case-insensitive substring of the subject.
+        # None means use the built-in defaults (pull request #, merge remote-tracking
+        # branch, merge branch) which include primary-branch exclusion logic.
+        raw_h = config.get('merge_heuristics', None)
+        self.merge_heuristics = (
+            None if raw_h is None
+            else [s.lower() for s in raw_h]
+        )
+
         # ── Impact score weights (config-overridable) ─────────────────────────
         # Each key maps to the corresponding class-level default.  Set a weight
         # to 0 to remove that dimension from scoring entirely; the remaining
@@ -556,17 +566,22 @@ class GitStats:
             is_true_merge = len(parents) >= 2
 
             s = subject.lower().strip()
-            is_heuristic = (
-                'pull request #' in s
-                or s.startswith('merge remote-tracking branch')
-                or (
-                    s.startswith('merge branch')
-                    and not s.startswith(f"merge branch '{pb_lower}'")
-                    and not s.startswith(f'merge branch "{pb_lower}"')
-                    and not s.startswith(f'merge branch {pb_lower} ')
-                    and s != f'merge branch {pb_lower}'
+            if self.merge_heuristics is None:
+                # Built-in defaults with primary-branch exclusion for "merge branch".
+                is_heuristic = (
+                    'pull request #' in s
+                    or s.startswith('merge remote-tracking branch')
+                    or (
+                        s.startswith('merge branch')
+                        and not s.startswith(f"merge branch '{pb_lower}'")
+                        and not s.startswith(f'merge branch "{pb_lower}"')
+                        and not s.startswith(f'merge branch {pb_lower} ')
+                        and s != f'merge branch {pb_lower}'
+                    )
                 )
-            )
+            else:
+                # User-supplied patterns: each is a case-insensitive substring match.
+                is_heuristic = any(h in s for h in self.merge_heuristics)
 
             if not (is_true_merge or is_heuristic):
                 continue
@@ -1120,40 +1135,47 @@ class GitStats:
             f'        </div>'
         )
 
-    def _render_bus_factor_card(self, bus_count: int, bus_pct: int, bf_authors: list) -> str:
-        """Render the bus factor card for the Summary tab.
+    def _render_bf_rows(self, bf_entries: list, metric_key: str) -> str:
+        """Render contributor rows for one bus-factor section.
 
         Args:
-            bus_count:  Number of contributors that make up the bus factor.
-            bus_pct:    Threshold as an integer percentage (e.g. 50 for 50%).
-            bf_authors: List of dicts with keys name, commits, pct, team —
-                        one entry per contributor in the bus factor, sorted by
-                        commit count descending.
+            bf_entries:  List of dicts with keys: name, count, pct, team,
+                         and optionally team_commits (for segmented commit bars).
+            metric_key:  'commits' or 'merges' — controls the label on the right.
         """
         rows = []
-        for ba in bf_authors:
-            # Build a segmented bar when the author has commits across multiple teams;
-            # fall back to a solid bar when teams are not configured.
-            team_commits = ba.get('team_commits', {})
-            author_total = sum(team_commits.values()) or 1
-            if self.has_teams and len(team_commits) > 1:
-                # Sort segments largest-first so dominant team leads left.
-                segments = sorted(team_commits.items(), key=lambda kv: kv[1], reverse=True)
-                seg_html = ''.join(
-                    f'<div style="width:{tc / author_total * 100:.2f}%;'
-                    f'background:{self.team_colors.get(t, "#94a3b8")};flex-shrink:0"></div>'
-                    for t, tc in segments
-                )
-                bar_inner = (
-                    f'<div style="width:{min(ba["pct"], 100)}%;height:100%;display:flex">'
-                    f'{seg_html}</div>'
-                )
+        metric_label = 'commit' if metric_key == 'commits' else 'merge'
+        for ba in bf_entries:
+            if metric_key == 'commits':
+                # Build a segmented bar when the author has commits across multiple
+                # teams; fall back to a solid bar when teams are not configured.
+                team_commits = ba.get('team_commits', {})
+                author_total = sum(team_commits.values()) or 1
+                if self.has_teams and len(team_commits) > 1:
+                    segments = sorted(team_commits.items(), key=lambda kv: kv[1], reverse=True)
+                    seg_html = ''.join(
+                        f'<div style="width:{tc / author_total * 100:.2f}%;'
+                        f'background:{self.team_colors.get(t, "#94a3b8")};flex-shrink:0"></div>'
+                        for t, tc in segments
+                    )
+                    bar_inner = (
+                        f'<div style="width:{min(ba["pct"], 100)}%;height:100%;display:flex">'
+                        f'{seg_html}</div>'
+                    )
+                else:
+                    color = self.team_colors.get(ba['team'], '#94a3b8') if self.has_teams else '#3b82f6'
+                    bar_inner = (
+                        f'<div class="h-full rounded-full"'
+                        f' style="width:{min(ba["pct"], 100)}%;background:{color}"></div>'
+                    )
             else:
+                # Merges: simple solid bar using the author's team color.
                 color = self.team_colors.get(ba['team'], '#94a3b8') if self.has_teams else '#3b82f6'
                 bar_inner = (
                     f'<div class="h-full rounded-full"'
                     f' style="width:{min(ba["pct"], 100)}%;background:{color}"></div>'
                 )
+            plural_v = 's' if ba['count'] != 1 else ''
             rows.append(
                 f'                <div class="flex items-center gap-3 py-2">\n'
                 f'                    <span class="text-sm font-bold text-slate-700 w-36 truncate shrink-0">{ba["name"]}</span>\n'
@@ -1161,26 +1183,128 @@ class GitStats:
                 f'                        {bar_inner}\n'
                 f'                    </div>\n'
                 f'                    <span class="text-sm font-mono font-bold text-slate-500 w-10 text-right shrink-0">{ba["pct"]}%</span>\n'
-                f'                    <span class="text-xs text-slate-400 w-24 text-right shrink-0">{ba["commits"]:,} commits</span>\n'
+                f'                    <span class="text-xs text-slate-400 w-24 text-right shrink-0">{ba["count"]:,} {metric_label}{plural_v}</span>\n'
                 f'                </div>'
             )
-        plural_s    = 's' if bus_count != 1 else ''
-        plural_verb = 'account' if bus_count != 1 else 'accounts'
-        rows_html   = '\n'.join(rows)
+        return '\n'.join(rows)
+
+    def _render_bus_factor_card(self,
+                                commit_bus_count: int,
+                                commit_bf_authors: list,
+                                merge_bus_count: int,
+                                merge_bf_authors: list,
+                                total_merges: int,
+                                bus_pct: int,
+                                show_merges_section: bool = True) -> str:
+        """Render the bus factor card for the Summary tab.
+
+        When show_merges_section is True (default) the card contains two side-by-side
+        sections — Commits and PR Merges.  When False only the Commits section is
+        rendered and it occupies the full width of the card.
+
+        Args:
+            commit_bus_count:    Bus factor based on commit counts.
+            commit_bf_authors:   Entries for the commits section (see _render_bf_rows).
+            merge_bus_count:     Bus factor based on PR merge counts.
+            merge_bf_authors:    Entries for the merges section.
+            total_merges:        Total PR merges across all authors; 0 → no merge history.
+            bus_pct:             Threshold as an integer percentage (e.g. 50 for 50%).
+            show_merges_section: Show the PR Merges section.  Pass False when
+                                 impact_w_merges == 0.
+        """
+        # ── Commits section ──────────────────────────────────────────────────
+        cplural_s    = 's' if commit_bus_count != 1 else ''
+        cplural_verb = 'account' if commit_bus_count != 1 else 'accounts'
+        commit_rows  = self._render_bf_rows(commit_bf_authors, 'commits')
+
+        if show_merges_section:
+            # Two-column layout: add a section label above the commits content.
+            commits_section = (
+                f'            <div>\n'
+                f'                <div class="text-[10px] uppercase font-bold text-slate-400 tracking-widest mb-4">Commits</div>\n'
+                f'                <div class="flex items-start gap-6 flex-wrap">\n'
+                f'                    <div class="shrink-0 text-center min-w-[4rem]">\n'
+                f'                        <div class="text-5xl font-black text-slate-900">{commit_bus_count}</div>\n'
+                f'                        <div class="text-[10px] uppercase font-bold text-slate-400 mt-1 tracking-widest">Bus Factor</div>\n'
+                f'                    </div>\n'
+                f'                    <div class="flex-1 min-w-0">\n'
+                f'                        <p class="text-sm text-slate-600 font-medium mb-4">\n'
+                f'                            <strong>{commit_bus_count} contributor{cplural_s}</strong> {cplural_verb} for\n'
+                f'                            {bus_pct}% of all commits.\n'
+                f'                        </p>\n'
+                f'{commit_rows}\n'
+                f'                    </div>\n'
+                f'                </div>\n'
+                f'            </div>'
+            )
+        else:
+            # Full-width layout: original single-section style without a label.
+            commits_section = (
+                f'            <div class="flex items-start gap-8 flex-wrap">\n'
+                f'                <div class="shrink-0 text-center min-w-[5rem]">\n'
+                f'                    <div class="text-5xl font-black text-slate-900">{commit_bus_count}</div>\n'
+                f'                    <div class="text-[10px] uppercase font-bold text-slate-400 mt-1 tracking-widest">Bus Factor</div>\n'
+                f'                </div>\n'
+                f'                <div class="flex-1 min-w-0">\n'
+                f'                    <p class="text-sm text-slate-600 font-medium mb-4">\n'
+                f'                        <strong>{commit_bus_count} contributor{cplural_s}</strong> {cplural_verb} for\n'
+                f'                        {bus_pct}% of all commits.\n'
+                f'                    </p>\n'
+                f'{commit_rows}\n'
+                f'                </div>\n'
+                f'            </div>'
+            )
+
+        if not show_merges_section:
+            # Single-section card — commits only, full width.
+            return (
+                f'    <div class="card">\n'
+                f'{commits_section}\n'
+                f'        <p class="text-xs text-slate-400 mt-4 border-t border-slate-100 pt-3">\n'
+                f'            Threshold: {bus_pct}% \u00b7 configurable via\n'
+                f'            <span class="font-mono">bus_factor_threshold</span> in config.json\n'
+                f'        </p>\n'
+                f'    </div>'
+            )
+
+        # ── PR Merges section ────────────────────────────────────────────────
+        if total_merges == 0:
+            merges_section = (
+                f'            <div>\n'
+                f'                <div class="text-[10px] uppercase font-bold text-slate-400 tracking-widest mb-4">PR Merges</div>\n'
+                f'                <p class="text-sm text-slate-400 italic">No PR merge history detected.</p>\n'
+                f'            </div>'
+            )
+        else:
+            mplural_s    = 's' if merge_bus_count != 1 else ''
+            mplural_verb = 'account' if merge_bus_count != 1 else 'accounts'
+            merge_rows   = self._render_bf_rows(merge_bf_authors, 'merges')
+            merges_section = (
+                f'            <div>\n'
+                f'                <div class="text-[10px] uppercase font-bold text-slate-400 tracking-widest mb-4">PR Merges</div>\n'
+                f'                <div class="flex items-start gap-6 flex-wrap">\n'
+                f'                    <div class="shrink-0 text-center min-w-[4rem]">\n'
+                f'                        <div class="text-5xl font-black text-slate-900">{merge_bus_count}</div>\n'
+                f'                        <div class="text-[10px] uppercase font-bold text-slate-400 mt-1 tracking-widest">Bus Factor</div>\n'
+                f'                    </div>\n'
+                f'                    <div class="flex-1 min-w-0">\n'
+                f'                        <p class="text-sm text-slate-600 font-medium mb-4">\n'
+                f'                            <strong>{merge_bus_count} contributor{mplural_s}</strong> {mplural_verb} for\n'
+                f'                            {bus_pct}% of all PR merges.\n'
+                f'                        </p>\n'
+                f'{merge_rows}\n'
+                f'                    </div>\n'
+                f'                </div>\n'
+                f'            </div>'
+            )
+
+        # Two-section card — commits | PR merges side by side.
         return (
             f'    <div class="card">\n'
-            f'        <div class="flex items-start gap-8 flex-wrap">\n'
-            f'            <div class="shrink-0 text-center min-w-[5rem]">\n'
-            f'                <div class="text-5xl font-black text-slate-900">{bus_count}</div>\n'
-            f'                <div class="text-[10px] uppercase font-bold text-slate-400 mt-1 tracking-widest">Bus Factor</div>\n'
-            f'            </div>\n'
-            f'            <div class="flex-1 min-w-0">\n'
-            f'                <p class="text-sm text-slate-600 font-medium mb-4">\n'
-            f'                    <strong>{bus_count} contributor{plural_s}</strong> {plural_verb} for\n'
-            f'                    {bus_pct}% of all commits.\n'
-            f'                </p>\n'
-            f'{rows_html}\n'
-            f'            </div>\n'
+            f'        <div class="grid grid-cols-1 md:grid-cols-2 gap-8">\n'
+            f'{commits_section}\n'
+            f'            <div class="hidden md:block w-px bg-slate-100 self-stretch"></div>\n'
+            f'{merges_section}\n'
             f'        </div>\n'
             f'        <p class="text-xs text-slate-400 mt-4 border-t border-slate-100 pt-3">\n'
             f'            Threshold: {bus_pct}% \u00b7 configurable via\n'
@@ -1257,27 +1381,57 @@ class GitStats:
             + '\n    </div>'
         )
 
-        # Bus factor — fewest contributors whose combined commits reach the threshold
-        sorted_authors = sorted(
+        bus_pct = int(self.bus_factor_threshold * 100)
+
+        # Commits bus factor — fewest contributors whose combined commits reach the threshold
+        sorted_by_commits = sorted(
             self.data['authors'].items(), key=lambda x: x[1]['commits'], reverse=True
         )
-        total_commits = sum(a['commits'] for _, a in sorted_authors) or 1
-        cutoff        = total_commits * self.bus_factor_threshold
-        running       = 0
-        bf_authors    = []
-        for name, adata in sorted_authors:
+        total_commits  = sum(a['commits'] for _, a in sorted_by_commits) or 1
+        commit_cutoff  = total_commits * self.bus_factor_threshold
+        running        = 0
+        commit_bf      = []
+        for name, adata in sorted_by_commits:
             running += adata['commits']
-            bf_authors.append({
+            commit_bf.append({
                 'name':         name,
-                'commits':      adata['commits'],
+                'count':        adata['commits'],
                 'pct':          round(adata['commits'] / total_commits * 100, 1),
                 'team':         adata.get('team', 'Community'),
                 'team_commits': adata.get('team_commits', {}),
             })
-            if running >= cutoff:
+            if running >= commit_cutoff:
                 break
-        bus_pct          = int(self.bus_factor_threshold * 100)
-        bus_factor_html  = self._render_bus_factor_card(len(bf_authors), bus_pct, bf_authors)
+
+        # PR merges bus factor — fewest contributors whose combined merges reach the threshold
+        sorted_by_merges = sorted(
+            self.data['authors'].items(), key=lambda x: x[1].get('merges', 0), reverse=True
+        )
+        total_merges = sum(a.get('merges', 0) for _, a in sorted_by_merges)
+        merge_bf     = []
+        if total_merges > 0:
+            merge_cutoff = total_merges * self.bus_factor_threshold
+            running      = 0
+            for name, adata in sorted_by_merges:
+                m = adata.get('merges', 0)
+                if m == 0:
+                    break
+                running += m
+                merge_bf.append({
+                    'name':  name,
+                    'count': m,
+                    'pct':   round(m / total_merges * 100, 1),
+                    'team':  adata.get('team', 'Community'),
+                })
+                if running >= merge_cutoff:
+                    break
+
+        bus_factor_html = self._render_bus_factor_card(
+            len(commit_bf), commit_bf,
+            len(merge_bf),  merge_bf,
+            total_merges,   bus_pct,
+            show_merges_section=(self.IMPACT_W_MERGES > 0),
+        )
 
         return f"""    <!-- ═══ SUMMARY ════════════════════════════════════════════════════════════ -->
     <div id="tab-summary" class="tab-content space-y-8">

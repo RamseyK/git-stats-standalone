@@ -4,8 +4,8 @@ A Python script that analyzes a Git repository and generates a self-contained HT
 
 ## Primary Metrics
 
-- **Summary** — project age, lines of code, weekly cadence, release count, commit velocity trend, monthly commit activity chart, bus factor, and hourly punchcard
-- **Impact** — weighted leaderboard ranking authors and teams by commit volume, lines changed, and active tenure
+- **Summary** — project age, lines of code, weekly cadence, release count, commit velocity trend, monthly commit activity chart, bus factor (commits and PR merges), and hourly punchcard
+- **Impact** — weighted leaderboard ranking authors and teams by commit volume, lines changed, active tenure, and PR merges
 - **Authors** — sortable contributor table with team badges, filterable by component or team
 - **Teams** — per-team stats, member lists, and top components
 - **Releases** — per-release breakdown of commits by author and team
@@ -130,9 +130,26 @@ All configuration lives in a single JSON file. Every key is optional.
 | `primary_branch` | `"develop"` | Name of the primary branch. Pull requests merged into this branch are counted toward each committer's PR Merges impact dimension. |
 | `summary_velocity_days` | `[30, 90]` | Day windows shown as velocity cards on the Summary tab. Each entry produces one card comparing commits in the last N days against the prior N days. |
 | `monthly_top_authors` | `3` | Number of top contributors listed in the monthly commit activity chart tooltip. Set to `0` to show only the total commit count. |
-| `bus_factor_threshold` | `0.5` | Fraction of total commits (0–1) used to compute the bus factor — the fewest contributors whose combined commits reach this fraction. |
+| `bus_factor_threshold` | `0.5` | Fraction (0–1) used to compute both bus factors — the fewest contributors whose combined commits (or PR merges) reach this fraction. The PR Merges bus factor is hidden when `impact_w_merges` is `0`. |
+| `merge_heuristics` | *(see below)* | Substrings matched case-insensitively against commit subjects to detect squash/rebase merges. Replaces the built-in heuristics entirely when present. |
 | `component_markers` | *(see below)* | Filenames that identify a component root. Any directory directly containing one of these files becomes a component in the churn chart. Replaces the default set entirely. |
 | `loc_extensions` | *(see below)* | File extensions (with leading dot) counted toward the **Lines of Code** tile. Matched case-insensitively. Replaces the default set entirely. |
+
+#### Merge heuristics
+
+In addition to true merge commits (two or more parents), GitStats detects squash and rebase merges by matching commit subjects against heuristic patterns. When `merge_heuristics` is absent the built-in patterns are used:
+
+- Subject contains `Pull request #`
+- Subject starts with `Merge remote-tracking branch`
+- Subject starts with `Merge branch` but does **not** merge the primary branch back into itself
+
+When `merge_heuristics` is present in config it **replaces** the built-in patterns entirely. Each string is matched as a case-insensitive substring of the commit subject. The primary-branch self-merge exclusion is not applied to custom patterns — only the built-in defaults include that logic.
+
+```json
+"merge_heuristics": ["Pull request #", "Merge remote-tracking branch"]
+```
+
+Set to an empty array `[]` to count only true merge commits (two-parent merges) and ignore all subject-based detection.
 
 #### Component markers
 
@@ -251,13 +268,7 @@ The exact configured values and computed cap are displayed on the **Impact** tab
 
 ### PR merge detection
 
-The PR Merges dimension counts merges into `primary_branch`. Two detection strategies are applied:
-
-- **True merge commits** — any commit with two or more parents (a `git merge --no-ff`).
-- **Heuristic merges** — single-parent commits whose subject matches one of:
-  - Contains `Pull request #` (GitHub squash/rebase merge)
-  - Starts with `Merge remote-tracking branch` (git push-based workflow)
-  - Starts with `Merge branch <name>` where `<name>` is not the primary branch itself
+The PR Merges dimension counts merges into `primary_branch` using two strategies: true merge commits (two or more parents) and heuristic detection of squash/rebase merges by commit subject — see [Merge heuristics](#merge-heuristics) for the built-in patterns and how to override them.
 
 The committer (`git log %cn/%ce`) receives credit — the author of the merged branch does not. Credit accumulates across all repositories (main and support repos).
 

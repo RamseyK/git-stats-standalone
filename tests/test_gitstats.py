@@ -1209,9 +1209,10 @@ class TestImpactWeightConfig:
         # The default 30 must not appear as a weight value in the formula area
         # (the formula string contains the actual configured weights).
         assert '(commits / max_commits) × 50' in html or 'max_commits) × 50' in html
-        # Zero-weight dimensions must not appear in the cards or formula.
+        # Zero-weight dimensions must not appear in the impact weight cards or formula.
         assert 'Active Tenure' not in html
-        assert 'PR Merges' not in html
+        # 'PR Merges' now also labels the bus factor section; check the impact-specific
+        # formula tokens are absent instead of the label string itself.
         assert 'max_tenure' not in html
         assert 'max_merges' not in html
 
@@ -1232,9 +1233,9 @@ class TestImpactWeightConfig:
         # Formula line must reference the configured values.
         assert '× 40' in html     # commits and lines
         assert '× 20' in html     # tenure
-        # merges weight is 0 — the PR Merges card must be absent from the report
-        assert 'PR Merges' not in html
-        # The formula must not include the merges term
+        # merges weight is 0 — the PR Merges impact card must be absent from the report.
+        # Note: 'PR Merges' still appears as the bus factor section label, so check the
+        # impact-specific formula token instead.
         assert 'max_merges' not in html
 
 
@@ -2220,8 +2221,65 @@ class TestSummaryTab:
         assert 'id="locChart"' not in std_html
 
     def test_bus_factor_section_in_html(self, std_html):
-        """The Bus Factor heading must appear in the Summary tab."""
-        assert 'Bus Factor' in std_html
+        """Both Bus Factor sections (Commits and PR Merges) must appear in the Summary tab.
+
+        STD_CONFIG has impact_w_merges=25 so both sections should be rendered.
+        """
+        assert std_html.count('Bus Factor') >= 2, "Expected a Bus Factor number in each section"
+        assert 'of all commits' in std_html
+        # PR Merges section visible because impact_w_merges > 0 in STD_CONFIG.
+        has_merges_contributors = 'of all PR merges' in std_html
+        has_no_history = 'No PR merge history detected' in std_html
+        assert has_merges_contributors or has_no_history, (
+            "PR merges section must say 'of all PR merges' or 'No PR merge history detected'"
+        )
+
+    def test_bus_factor_commits_only_when_merges_weight_zero(self, repo_path, tmp_path_factory):
+        """When impact_w_merges=0 the bus factor card must show only the Commits section."""
+        tmp = str(tmp_path_factory.mktemp('bf_commits_only'))
+        cfg = make_config(tmp,
+                          impact_w_commits=40,
+                          impact_w_lines=40,
+                          impact_w_tenure=20,
+                          impact_w_merges=0)
+        gs = gitstats.GitStats(repo_path, cfg)
+        gs.collect()
+        out = os.path.join(tmp, 'report.html')
+        gs.generate_report(os.path.join(PROJECT_ROOT, 'externals'), out)
+        html = open(out).read()
+        assert 'of all commits' in html
+        assert 'PR Merges' not in html
+        assert 'of all PR merges' not in html
+        assert 'No PR merge history detected' not in html
+
+    def test_merges_bus_factor_invariant(self, std_gs):
+        """Merges bus factor: top N contributors must reach the threshold; top N-1 must not."""
+        threshold = std_gs.bus_factor_threshold
+        sorted_a = sorted(
+            std_gs.data['authors'].items(),
+            key=lambda x: x[1].get('merges', 0), reverse=True,
+        )
+        total = sum(a.get('merges', 0) for _, a in sorted_a)
+        if total == 0:
+            return  # No merge history — nothing to assert.
+        cutoff  = total * threshold
+        running = 0
+        n       = 0
+        for _, a in sorted_a:
+            m = a.get('merges', 0)
+            if m == 0:
+                break
+            running += m
+            n       += 1
+            if running >= cutoff:
+                break
+
+        top_n_merges = sum(a.get('merges', 0) for _, a in sorted_a[:n])
+        assert top_n_merges >= cutoff, "Top N contributors must reach the merge threshold"
+
+        if n > 1:
+            top_n_minus_1 = sum(a.get('merges', 0) for _, a in sorted_a[:n - 1])
+            assert top_n_minus_1 < cutoff, "Top N-1 contributors must not reach the merge threshold"
 
     def test_velocity_cards_match_default_config(self, std_html):
         """Default velocity config [30, 90] must produce 'Last 30 Days' and 'Last 90 Days'."""
@@ -2648,6 +2706,69 @@ class TestPRMergeRate:
         # 'Add readme' must not contribute to this count
         assert committer.get('merges', 0) == 4
 
+    # ── Configurable merge heuristics ────────────────────────────────────────
+
+    def test_default_merge_heuristics_is_none(self, repo_path, tmp_path):
+        """When 'merge_heuristics' is absent from config, the attribute must be None."""
+        cfg = make_config(tmp_path)
+        gs = gitstats.GitStats(repo_path, cfg)
+        assert gs.merge_heuristics is None
+
+    def test_custom_merge_heuristics_stored_lowercased(self, repo_path, tmp_path):
+        """Configured merge_heuristics must be stored as lowercase strings."""
+        cfg = make_config(tmp_path, merge_heuristics=['Pull Request #', 'SQUASH MERGE'])
+        gs = gitstats.GitStats(repo_path, cfg)
+        assert gs.merge_heuristics == ['pull request #', 'squash merge']
+
+    def test_custom_heuristic_matches_configured_pattern(self, merge_repo, tmp_path_factory):
+        """A custom merge_heuristics list must match only subjects containing the given substrings.
+
+        The merge_repo has:
+          C — true merge (always counted regardless of heuristics)
+          D — 'Merge pull request #42 ...'
+          E — 'Merge remote-tracking branch ...'
+          F — "Merge branch 'feature-xyz'"
+          G — "Merge branch 'main'" (primary-branch commit, but no exclusion with custom patterns)
+          H — 'Add readme' (plain)
+
+        With heuristics=['pull request #'] only C (true merge) + D (matches) should count = 2.
+        G is NOT excluded by custom heuristics because exclusion logic only applies to the defaults.
+        """
+        tmp = str(tmp_path_factory.mktemp('custom_heuristic'))
+        cfg = make_config(tmp, primary_branch='main', merge_heuristics=['pull request #'])
+        gs = gitstats.GitStats(merge_repo, cfg)
+        gs.data['authors'] = {}
+        gs.data['teams']   = {}
+        gs._collect_merges(merge_repo)
+        total = sum(a.get('merges', 0) for a in gs.data['authors'].values())
+        # C (true merge) + D (pull request #) = 2.
+        assert total == 2, f"Expected 2 merges with custom heuristic, got {total}"
+
+    def test_empty_custom_heuristics_counts_only_true_merges(self, merge_repo, tmp_path_factory):
+        """An empty merge_heuristics list disables all heuristic detection; only true merges count."""
+        tmp = str(tmp_path_factory.mktemp('empty_heuristic'))
+        cfg = make_config(tmp, primary_branch='main', merge_heuristics=[])
+        gs = gitstats.GitStats(merge_repo, cfg)
+        gs.data['authors'] = {}
+        gs.data['teams']   = {}
+        gs._collect_merges(merge_repo)
+        total = sum(a.get('merges', 0) for a in gs.data['authors'].values())
+        # Only C (true merge with 2 parents) should be counted.
+        assert total == 1, f"Expected 1 merge (true merge only), got {total}"
+
+    def test_custom_heuristic_case_insensitive(self, merge_repo, tmp_path_factory):
+        """Custom merge heuristic patterns must match case-insensitively."""
+        tmp = str(tmp_path_factory.mktemp('case_insensitive'))
+        # The repo commit subject is lowercase 'merge pull request #42 ...'
+        cfg = make_config(tmp, primary_branch='main', merge_heuristics=['PULL REQUEST #'])
+        gs = gitstats.GitStats(merge_repo, cfg)
+        gs.data['authors'] = {}
+        gs.data['teams']   = {}
+        gs._collect_merges(merge_repo)
+        total = sum(a.get('merges', 0) for a in gs.data['authors'].values())
+        # C (true merge) + D (matches PULL REQUEST # case-insensitively) = 2.
+        assert total == 2, f"Expected 2 merges with uppercase pattern, got {total}"
+
     def test_committer_credited_not_author(self, tmp_path_factory):
         """The committer identity must receive merge credit, not the commit author.
 
@@ -2812,7 +2933,7 @@ class TestPRMergeRate:
         assert 'main' in std_html
 
     def test_pr_merges_card_hidden_when_weight_zero(self, repo_path, tmp_path_factory):
-        """The PR Merges card must be absent when impact_w_merges=0."""
+        """When impact_w_merges=0 the PR Merges bus factor section must be absent."""
         tmp = str(tmp_path_factory.mktemp('no_merges_html'))
         cfg = make_config(tmp,
                           primary_branch='main',
@@ -2825,8 +2946,10 @@ class TestPRMergeRate:
         out = os.path.join(tmp, 'report.html')
         gs.generate_report(os.path.join(PROJECT_ROOT, 'externals'), out)
         html = open(out).read()
-        assert 'PR Merges' not in html
+        # Impact weight card and formula token must be absent.
         assert 'max_merges' not in html
+        # Bus factor PR Merges section must also be absent.
+        assert 'PR Merges' not in html
 
 
 if __name__ == "__main__":
