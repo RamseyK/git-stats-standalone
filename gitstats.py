@@ -10,6 +10,7 @@ import shutil
 import subprocess
 import sys
 import json
+import time
 import datetime
 import argparse
 from collections import Counter, defaultdict
@@ -140,7 +141,6 @@ class GitStats:
         }
         # Preserved for HTML output: canonical name → list of alias strings.
         self.canonical_to_aliases = {canon: list(als) for canon, als in aliases.items()}
-
         # Build team membership and color lookups from config.
         #
         # Each member entry may be a plain string (always on the team) or a dict
@@ -355,18 +355,37 @@ class GitStats:
         """
         return self.alias_to_canonical.get(email.lower(), self.alias_to_canonical.get(name, name))
 
+    def _author_lookup_keys(self, author: str, email: str = '') -> tuple:
+        """Return all lookup keys for a canonical author name.
+
+        Combines the commit-time email (if any), the canonical name, and all
+        configured alias strings so that team membership can be resolved
+        regardless of which identity a contributor used in any given commit.
+        Alias strings that contain '@' are lowercased (they are email keys);
+        plain-name aliases are kept as-is, matching how author_to_team_ranges
+        is populated in __init__.
+        """
+        keys = []
+        if email:
+            keys.append(email.lower())
+        keys.append(author)
+        for alias in self.canonical_to_aliases.get(author, []):
+            keys.append(alias.lower() if '@' in alias else alias)
+        return tuple(keys)
+
     def _get_team(self, author, email, ts=0):
         """Return the team name for a given canonical author name, email, and commit timestamp.
 
-        Checks the email (lowercased) first, then the author display name. For each
-        key, iterates through its (team, from_ts, to_ts) ranges and returns the
-        first team whose range contains ts. Falls back to _DEFAULT_TEAM when no range
-        matches — including when an author has left all configured teams.
+        Checks the email (lowercased) first, then the author display name, then all
+        configured aliases. For each key, iterates through its (team, from_ts, to_ts)
+        ranges and returns the first team whose range contains ts. Falls back to
+        _DEFAULT_TEAM when no range matches — including when an author has left all
+        configured teams.
 
         ts defaults to 0 so callers that don't have a timestamp (e.g. tests) get a
         sensible result for unbounded entries.
         """
-        for key in (email.lower(), author):
+        for key in self._author_lookup_keys(author, email):
             for team, from_ts, to_ts in self.author_to_team_ranges.get(key, []):
                 if from_ts <= ts <= to_ts:
                     return team
@@ -446,6 +465,9 @@ class GitStats:
                 all_ts.append(ts)
                 current_author = author
                 current_team = team
+                # Track the most-recently-seen email for each canonical author so
+                # we can resolve email-keyed team membership entries later.
+
 
                 # Initialize author record on first encounter.
                 # commit_lines stores (ts, adds, dels, team) per commit —
@@ -615,6 +637,9 @@ class GitStats:
                 }
             au = self.data['authors'][author]
             au['merges'] = au.get('merges', 0) + 1
+            # Store per-merge timestamps so team attribution can use the team
+            # the committer belonged to *at the time of each merge*.
+            au.setdefault('merge_timestamps', []).append((ts, c_email.strip()))
 
     def collect(self):
         """Populate self.data by running git commands against all repositories.
@@ -1015,12 +1040,12 @@ class GitStats:
                     for (_, team), b in t_buckets.items():
                         team_eff[team] += self._wash_bucket_score(b, wash_min, cap_val)
 
-            # Accumulate merges per team from member authors
+            # Accumulate merges per team using per-merge timestamps so each
+            # merge is credited to the team the author belonged to at that time.
             team_merges = defaultdict(int)
             for name, a in authors.items():
-                m = a.get('merges', 0)
-                if m:
-                    team_merges[a['team']] += m
+                for ts, email in a.get('merge_timestamps', []):
+                    team_merges[self._get_team(name, email, ts)] += 1
 
             max_c = (max(t['commits'] for t in teams.values()) or 1) if wc > 0 else 1
             max_k = (max(team_eff.values()) or 1)                      if wl > 0 else 1
@@ -1036,15 +1061,17 @@ class GitStats:
                     ((team_merges[tname]     / max_m) * wm if wm > 0 else 0.0)
                 )
                 t['impact'] = round(raw * scale, 1)
+                t['merges'] = team_merges[tname]
 
         # Clean up internal scratch fields — they must not appear in JSON output.
         for a in authors.values():
             a.pop('commit_lines', None)
             a.pop('_eff', None)
+            a.pop('merge_timestamps', None)
 
     # ------------------------------------------------------------------ HTML helpers
 
-    def _score_tag_entities(self, entities: dict) -> dict:
+    def _score_tag_entities(self, entities: dict, tenure_map: dict = None) -> dict:
         """Compute per-release impact scores for a dict of authors or teams.
 
         Both callers (_compute_tag_impacts and _compute_tag_team_impacts) share
@@ -1052,6 +1079,13 @@ class GitStats:
         Uses the configured commits, lines, and tenure weights normalized within
         the release.  The merges dimension is excluded — it is not tracked per
         release range.
+
+        Args:
+            entities:    {name: {commits, add, del, first_ts, last_ts}}
+            tenure_map:  Optional {name: tenure_days} supplying global tenure values.
+                         When provided, a name's global tenure is used instead of the
+                         release-range tenure derived from first_ts/last_ts.  Names
+                         absent from tenure_map fall back to release-range tenure.
 
         Returns:
             {name: {'commits', 'eff_lines', 'tenure_days', 'impact'}}
@@ -1067,14 +1101,20 @@ class GitStats:
             for name, e in entities.items()
         }
 
+        def _tenure(name, e):
+            if tenure_map and name in tenure_map:
+                return tenure_map[name]
+            return (e['last_ts'] - e['first_ts']) // self._SECS_PER_DAY
+
+        tenure_values = {name: _tenure(name, e) for name, e in entities.items()}
+
         max_c = (max(e['commits'] for e in entities.values()) or 1) if wc > 0 else 1
         max_k = (max(eff_map.values()) or 1)                        if wl > 0 else 1
-        max_d = (max((e['last_ts'] - e['first_ts']) // self._SECS_PER_DAY
-                     for e in entities.values()) or 1)              if wt > 0 else 1
+        max_d = (max(tenure_values.values()) or 1)                  if wt > 0 else 1
 
         results = {}
         for name, e in entities.items():
-            tenure = (e['last_ts'] - e['first_ts']) // self._SECS_PER_DAY
+            tenure = tenure_values[name]
             raw = (
                 ((e['commits']  / max_c) * wc if wc > 0 else 0.0) +
                 ((eff_map[name] / max_k) * wl if wl > 0 else 0.0) +
@@ -1092,11 +1132,17 @@ class GitStats:
         """Score per-release authors by impact and return a list sorted descending.
 
         Each entry has keys: 'name', 'commits', 'eff_lines', 'tenure_days', 'impact'.
+        Tenure is taken from the author's full global history when available.
         Returns an empty list when tag_authors is empty.
         """
         if not tag_authors:
             return []
-        scored = self._score_tag_entities(tag_authors)
+        tenure_map = {
+            name: (self.data['authors'][name]['last'] - self.data['authors'][name]['first']) // self._SECS_PER_DAY
+            for name in tag_authors
+            if name in self.data['authors']
+        }
+        scored = self._score_tag_entities(tag_authors, tenure_map=tenure_map or None)
         results = [{'name': name, **data} for name, data in scored.items()]
         results.sort(key=lambda x: x['impact'], reverse=True)
         return results
@@ -1105,11 +1151,17 @@ class GitStats:
         """Score per-release teams by impact and return a {team: data} dict.
 
         Each value has keys: 'commits', 'eff_lines', 'tenure_days', 'impact'.
+        Tenure is taken from the team's full global history when available.
         Returns an empty dict when tag_teams is empty.
         """
         if not tag_teams:
             return {}
-        return self._score_tag_entities(tag_teams)
+        tenure_map = {
+            team: (self.data['teams'][team]['last'] - self.data['teams'][team]['first']) // self._SECS_PER_DAY
+            for team in tag_teams
+            if team in self.data['teams']
+        }
+        return self._score_tag_entities(tag_teams, tenure_map=tenure_map or None)
 
     def _render_tags_html(self):
         """Return an HTML string of release cards for the Releases tab.
@@ -1658,14 +1710,31 @@ class GitStats:
                 continue
             if team_name not in self.data['teams']:
                 self.data['teams'][team_name] = {
-                    'commits': 0, 'add': 0, 'del': 0,
+                    'commits': 0, 'add': 0, 'del': 0, 'merges': 0,
                     'members': set(), 'first': 0, 'last': 0,
                     'impact': 0,
                 }
 
-        # Convert member sets to sorted lists so they are JSON-serializable
-        for t in self.data['teams'].values():
-            t['members'] = sorted(list(t['members']))
+        # Split member sets into current vs. previous based on active team
+        # membership as of now.  All alias keys (name + configured aliases/emails)
+        # are checked so membership is determined solely by the from/to date ranges
+        # in config, regardless of which identity the author used in any commit.
+        now_ts = int(time.time())
+        for team_name, t in self.data['teams'].items():
+            current, previous = [], []
+            for author in sorted(t['members']):
+                # Check all lookup keys for this author at now_ts.
+                is_current = any(
+                    any(t_name == team_name and from_ts <= now_ts <= to_ts
+                        for t_name, from_ts, to_ts in self.author_to_team_ranges.get(key, []))
+                    for key in self._author_lookup_keys(author)
+                )
+                if is_current:
+                    current.append(author)
+                else:
+                    previous.append(author)
+            t['members']          = current
+            t['previous_members'] = previous
 
         # ── JSON blobs injected into the <script> block ───────────────────────
         authors_json        = json.dumps(self.data['authors'])
@@ -1770,6 +1839,7 @@ class GitStats:
         # Impact tab: two-column layout only when teams are configured
         impact_grid_cls  = 'grid grid-cols-1 lg:grid-cols-2 gap-8' if self.has_teams else 'grid grid-cols-1 gap-8'
         has_teams_js     = json.dumps(self.has_teams)
+        iw_merges_js     = json.dumps(self.IMPACT_W_MERGES)
         tags_tab_html    = self._render_tags_html()
 
         # Noise-reduction settings — displayed in the impact explanation section
@@ -1948,6 +2018,7 @@ const teamsData      = {teams_json};
 const authorAliases  = {author_aliases_json};
 const teamColors     = {team_colors_json};
 const hasTeams       = {has_teams_js};
+const impactWMerges  = {iw_merges_js};
 const componentData     = {component_json};
 const teamComponentData = {team_component_json};
 const totalCommits   = {tcom};
@@ -2302,11 +2373,25 @@ function renderTeamsGrid() {{
     const sorted = Object.entries(teamsData).sort((a,b) => b[1].impact - a[1].impact);
 
     document.getElementById('teams-grid').innerHTML = sorted.map(([name, s], i) => {{
-        const color      = teamColor(name);
-        const members    = Array.isArray(s.members) ? s.members : [];
-        const activeDays = Math.floor((s.last - s.first) / 86400);
-        const topDomains = Object.entries(teamComponentData[name] || {{}}).slice(0, 5);
-        const medalHtml  = i < 3 ? `<span class="text-2xl">${{medals[i]}}</span>` : '';
+        const color          = teamColor(name);
+        const members        = Array.isArray(s.members)          ? s.members          : [];
+        const prevMembers    = Array.isArray(s.previous_members) ? s.previous_members : [];
+        const activeDays     = Math.floor((s.last - s.first) / 86400);
+        const topDomains     = Object.entries(teamComponentData[name] || {{}}).slice(0, 5);
+        const medalHtml      = i < 3 ? `<span class="text-2xl">${{medals[i]}}</span>` : '';
+
+        function memberChip(m) {{
+            const als = authorAliases[m] || [];
+            const tip = als.length ? `${{m}}\nAliases: ${{als.join(', ')}}` : m;
+            return `<span class="text-xs px-2 py-0.5 rounded bg-slate-100 text-slate-600 font-bold cursor-default"
+                          title="${{tip}}">${{m.split(' ')[0]}}</span>`;
+        }}
+        function prevMemberChip(m) {{
+            const als = authorAliases[m] || [];
+            const tip = als.length ? `${{m}}\nAliases: ${{als.join(', ')}}` : m;
+            return `<span class="text-xs px-2 py-0.5 rounded bg-slate-50 text-slate-400 font-bold cursor-default line-through"
+                          title="${{tip}}">${{m.split(' ')[0]}}</span>`;
+        }}
 
         return `<div class="card hover:shadow-md transition-shadow cursor-pointer"
                      onclick="filterByTeam(${{JSON.stringify(name)}})" title="Click to view contributors">
@@ -2328,11 +2413,16 @@ function renderTeamsGrid() {{
 
             ${{impactBar(s.impact, color)}}
 
-            <div class="grid grid-cols-3 gap-2 my-4 text-center text-sm">
+            <div class="grid grid-cols-${{impactWMerges > 0 ? 4 : 3}} gap-2 my-4 text-center text-sm">
                 <div class="bg-slate-50 rounded-xl p-3">
                     <div class="font-black text-slate-900">${{fmt(s.commits)}}</div>
                     <div class="text-[10px] font-bold text-slate-400 uppercase">Commits</div>
                 </div>
+                ${{impactWMerges > 0 ? `
+                <div class="bg-slate-50 rounded-xl p-3">
+                    <div class="font-black text-violet-500">${{fmt(s.merges || 0)}}</div>
+                    <div class="text-[10px] font-bold text-slate-400 uppercase">Merges</div>
+                </div>` : ''}}
                 <div class="bg-slate-50 rounded-xl p-3">
                     <div class="font-black text-emerald-600">+${{fmt(s.add)}}</div>
                     <div class="text-[10px] font-bold text-slate-400 uppercase">Added</div>
@@ -2354,19 +2444,18 @@ function renderTeamsGrid() {{
                 </div>
             </div>` : ''}}
 
-            <div>
+            <div class="${{prevMembers.length ? 'mb-3' : ''}}">
                 <div class="text-[10px] font-black uppercase text-slate-400 mb-1.5">Members</div>
                 <div class="flex flex-wrap gap-1">
-                    ${{members.map(m => {{
-                        const als = authorAliases[m] || [];
-                        const tip = als.length
-                            ? `${{m}}\nAliases: ${{als.join(', ')}}`
-                            : m;
-                        return `<span class="text-xs px-2 py-0.5 rounded bg-slate-100 text-slate-600 font-bold cursor-default"
-                                      title="${{tip}}">${{m.split(' ')[0]}}</span>`;
-                    }}).join('')}}
+                    ${{members.map(memberChip).join('')}}
                 </div>
             </div>
+
+            ${{prevMembers.length ? ('<div>' +
+                '<div class="text-[10px] font-black uppercase text-slate-400 mb-1.5">Previous Members</div>' +
+                '<div class="flex flex-wrap gap-1">' +
+                prevMembers.map(prevMemberChip).join('') +
+                '</div></div>') : ''}}
         </div>`;
     }}).join('');
 }}

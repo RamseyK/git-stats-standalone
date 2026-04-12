@@ -212,6 +212,17 @@ Members can belong to a team for a specific date range, useful when contributors
 
 Each commit is credited to whichever team the author belonged to **at the time of that commit**.
 
+#### Impact attribution and membership tenure
+
+A team's impact score reflects only the work performed by its members **during their active membership**. Commits, lines changed, and PR merges made outside a member's `from`/`to` window are credited to whichever team (or **Community**) they belonged to at that time — they never contribute to the current team's score.
+
+- An author with **no `from` or `to` date** is considered a permanent member of the team for the entire repository history. All of their commits count toward that team.
+- An author with a **`from` date only** contributes to the team from that date onward through the present.
+- An author with a **`to` date** no longer contributes to the team after that date. Their work during their active period is still counted.
+- An author who **switches teams** has their contributions split: commits before the switch count for the old team, commits after count for the new team.
+
+The **Teams tab** reflects this split visually: each team card shows a **Members** section (authors whose membership is currently active) and, when applicable, a **Previous Members** section (authors who have contributed historically but whose membership has since ended).
+
 ### Aliases
 
 `aliases` merges multiple git identities into a single canonical name:

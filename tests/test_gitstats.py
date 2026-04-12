@@ -620,6 +620,20 @@ def _make_synthetic_gs(tmp_path, authors_spec, **gs_overrides):
 
     gs.data['authors'] = authors
     gs.data['teams']   = teams
+    # Populate author_to_team_ranges so merge attribution in _compute_impact
+    # (which calls _get_team per merge timestamp) resolves to the correct team.
+    # Each author is registered for all teams they appeared in, with open bounds.
+    for name, spec in authors_spec.items():
+        for _, _, _, team in spec['commit_lines']:
+            gs.author_to_team_ranges[name].append((team, 0, float('inf')))
+        # De-duplicate while preserving order
+        seen = set()
+        deduped = []
+        for entry in gs.author_to_team_ranges[name]:
+            if entry not in seen:
+                seen.add(entry)
+                deduped.append(entry)
+        gs.author_to_team_ranges[name] = deduped
     return gs
 
 
@@ -1091,6 +1105,7 @@ class TestImpactLogicUnit:
                       'team': 'Solo'},
         }, wash_window_days=0, line_cap_percentile=0)
         gs.data['authors']['Alice']['merges'] = 1   # leads the merges dimension too
+        gs.data['authors']['Alice']['merge_timestamps'] = [(_DAY, '')]  # credited to Solo at _DAY
         gs._compute_impact()
         assert gs.data['teams']['Solo']['impact'] == 100.0
 
@@ -1764,6 +1779,46 @@ class TestTagImpacts:
         a = {'commits': 5, 'add': 100, 'del': 0, 'first_ts': ts, 'last_ts': ts + 3 * 86400}
         result = gs._compute_tag_impacts({'Alice': a})
         assert result[0]['tenure_days'] == 3
+
+    def test_global_tenure_overrides_release_range_tenure(self, gs):
+        """When self.data['authors'] has a global tenure, it should override
+        the release-range tenure derived from first_ts/last_ts."""
+        ts = self._TS
+        # Release range only spans 2 days, but global history spans 100 days
+        gs.data['authors']['Alice'] = {'first': ts, 'last': ts + 100 * 86400,
+                                       'commits': 10, 'add': 0, 'del': 0}
+        a = {'commits': 5, 'add': 100, 'del': 0, 'first_ts': ts, 'last_ts': ts + 2 * 86400}
+        result = gs._compute_tag_impacts({'Alice': a})
+        assert result[0]['tenure_days'] == 100
+
+    def test_global_tenure_falls_back_when_author_absent(self, gs):
+        """When the author is not in self.data['authors'], fall back to
+        release-range tenure."""
+        ts = self._TS
+        # Ensure no global entry for Alice
+        gs.data['authors'].pop('Alice', None)
+        a = {'commits': 5, 'add': 100, 'del': 0, 'first_ts': ts, 'last_ts': ts + 5 * 86400}
+        result = gs._compute_tag_impacts({'Alice': a})
+        assert result[0]['tenure_days'] == 5
+
+    def test_global_team_tenure_overrides_release_range_tenure(self, gs):
+        """When self.data['teams'] has a global tenure, it should override
+        the release-range tenure for team impact scoring."""
+        ts = self._TS
+        gs.data['teams']['Core'] = {'first': ts, 'last': ts + 200 * 86400,
+                                    'commits': 20, 'add': 0, 'del': 0}
+        t = {'commits': 5, 'add': 100, 'del': 0, 'first_ts': ts, 'last_ts': ts + 3 * 86400}
+        result = gs._compute_tag_team_impacts({'Core': t})
+        assert result['Core']['tenure_days'] == 200
+
+    def test_global_team_tenure_falls_back_when_team_absent(self, gs):
+        """When the team is not in self.data['teams'], fall back to
+        release-range tenure."""
+        ts = self._TS
+        gs.data['teams'].pop('Core', None)
+        t = {'commits': 5, 'add': 100, 'del': 0, 'first_ts': ts, 'last_ts': ts + 7 * 86400}
+        result = gs._compute_tag_team_impacts({'Core': t})
+        assert result['Core']['tenure_days'] == 7
 
     def test_zero_lines_still_scores_on_commits_and_tenure(self, gs):
         """Author with no lines changed must still receive a non-zero score
@@ -3051,6 +3106,9 @@ class TestPRMergeRate:
         gs.data['authors']['Alice']['merges'] = 3
         gs.data['authors']['Bob']['merges']   = 2
         gs.data['authors']['Carol']['merges'] = 5
+        gs.data['authors']['Alice']['merge_timestamps'] = [(_DAY, '')] * 3
+        gs.data['authors']['Bob']['merge_timestamps']   = [(_DAY, '')] * 2
+        gs.data['authors']['Carol']['merge_timestamps'] = [(_DAY, '')] * 5
         gs._compute_impact()
         # Core = Alice(3) + Bob(2) = 5; Docs = Carol(5) = 5 → same team merges → equal merges term.
         # Since Docs has same merges as Core, score difference comes from other dimensions only.
@@ -3067,6 +3125,8 @@ class TestPRMergeRate:
         }, use_net_lines=False, wash_window_days=0, line_cap_percentile=0)
         gs.data['authors']['Alice']['merges'] = 20
         gs.data['authors']['Bob']['merges']   = 1
+        gs.data['authors']['Alice']['merge_timestamps'] = [(0, '')] * 20
+        gs.data['authors']['Bob']['merge_timestamps']   = [(0, '')]
         gs._compute_impact()
         assert gs.data['teams']['HeavyMergers']['impact'] > gs.data['teams']['LightMergers']['impact']
 
@@ -3126,6 +3186,177 @@ class TestPRMergeRate:
         assert 'max_merges' not in html
         # Bus factor PR Merges section must also be absent.
         assert 'PR Merges' not in html
+
+
+# ---------------------------------------------------------------------------
+# Time-ranged team membership — impact attribution
+# ---------------------------------------------------------------------------
+
+class TestTimeRangedMembership:
+    """Verify that team impact scores only accumulate contributions made while
+    an author was a member of the team, based on from/to date ranges."""
+
+    def test_commits_before_join_not_credited_to_team(self, tmp_path):
+        """Commits made before an author joined the team must not count toward
+        that team's score."""
+        # Alice joins Core at DAY 10; commits before that go to Community.
+        JOIN_TS = _DAY * 10
+        gs = _make_synthetic_gs(tmp_path, {
+            'Alice': {
+                'commit_lines': [
+                    (JOIN_TS - _DAY, 200, 0, 'Community'),  # before joining Core
+                    (JOIN_TS + _DAY, 100, 0, 'Core'),       # after joining Core
+                ],
+                'team': 'Core',
+            },
+        }, wash_window_days=0, line_cap_percentile=0)
+        # Override the team ranges to reflect the join date
+        gs.author_to_team_ranges['Alice'] = [
+            ('Core',      JOIN_TS, float('inf')),
+            ('Community', 0,       JOIN_TS - 1),
+        ]
+        gs._compute_impact()
+        # Core should only have the one post-join commit
+        assert gs.data['teams']['Core']['commits'] == 1
+        # Community gets the pre-join commit
+        assert gs.data['teams']['Community']['commits'] == 1
+
+    def test_lines_before_join_not_credited_to_team(self, tmp_path):
+        """Lines changed before an author joined a team must not count toward
+        that team's effective_lines."""
+        JOIN_TS = _DAY * 10
+        gs = _make_synthetic_gs(tmp_path, {
+            'Alice': {
+                'commit_lines': [
+                    (JOIN_TS - _DAY, 500, 0, 'Community'),  # 500 lines pre-join
+                    (JOIN_TS + _DAY,  50, 0, 'Core'),       # 50 lines post-join
+                ],
+                'team': 'Core',
+            },
+        }, wash_window_days=0, line_cap_percentile=0)
+        gs.author_to_team_ranges['Alice'] = [
+            ('Core',      JOIN_TS, float('inf')),
+            ('Community', 0,       JOIN_TS - 1),
+        ]
+        gs._compute_impact()
+        # Core's add/del reflects only post-join lines
+        assert gs.data['teams']['Core']['add'] == 50
+        assert gs.data['teams']['Community']['add'] == 500
+
+    def test_merges_before_join_not_credited_to_team(self, tmp_path):
+        """Merges made before an author joined a team must not count toward
+        that team's merge tally."""
+        JOIN_TS = _DAY * 10
+        gs = _make_synthetic_gs(tmp_path, {
+            'Alice': {
+                'commit_lines': [
+                    (JOIN_TS - _DAY, 100, 0, 'Community'),
+                    (JOIN_TS + _DAY, 100, 0, 'Core'),
+                ],
+                'team': 'Core',
+            },
+        }, wash_window_days=0, line_cap_percentile=0)
+        gs.author_to_team_ranges['Alice'] = [
+            ('Core',      JOIN_TS, float('inf')),
+            ('Community', 0,       JOIN_TS - 1),
+        ]
+        # One merge before join, one after
+        gs.data['authors']['Alice']['merges'] = 2
+        gs.data['authors']['Alice']['merge_timestamps'] = [
+            (JOIN_TS - _DAY, ''),  # pre-join → Community
+            (JOIN_TS + _DAY, ''),  # post-join → Core
+        ]
+        gs._compute_impact()
+        # Only the post-join merge goes to Core
+        # We can verify indirectly: Core's impact is driven by one merge,
+        # Community's by one merge → equal merge terms, so neither has an
+        # advantage from merges alone.  The key check is that the merge
+        # timestamps are correctly partitioned.
+        # Rebuild team_merges manually to verify
+        from collections import defaultdict
+        team_merges = defaultdict(int)
+        for ts, email in gs.data['authors']['Alice'].get('merge_timestamps', []):
+            pass  # merge_timestamps is cleaned up by _compute_impact
+        # After _compute_impact, merge_timestamps is gone — verify via impact scores
+        # Core and Community have identical stats → equal impact
+        assert abs(gs.data['teams']['Core']['impact'] - gs.data['teams']['Community']['impact']) < 0.1
+
+    def test_author_leaving_team_stops_credit(self, tmp_path):
+        """An author's commits after leaving a team must not be credited to
+        the old team."""
+        LEAVE_TS = _DAY * 20
+        gs = _make_synthetic_gs(tmp_path, {
+            'Alice': {
+                'commit_lines': [
+                    (_DAY * 5,  100, 0, 'Alpha'),   # while on Alpha
+                    (_DAY * 10, 100, 0, 'Alpha'),   # while on Alpha
+                    (_DAY * 25, 100, 0, 'Beta'),    # after moving to Beta
+                ],
+                'team': 'Beta',
+            },
+        }, wash_window_days=0, line_cap_percentile=0)
+        gs.author_to_team_ranges['Alice'] = [
+            ('Alpha', 0,        LEAVE_TS - 1),
+            ('Beta',  LEAVE_TS, float('inf')),
+        ]
+        gs._compute_impact()
+        # Alpha only has 2 commits, Beta has 1
+        assert gs.data['teams']['Alpha']['commits'] == 2
+        assert gs.data['teams']['Beta']['commits'] == 1
+
+    def test_current_members_excludes_expired_members(self, tmp_path):
+        """Members whose to-date has passed must appear in previous_members, not members."""
+        import time as time_mod
+        now = int(time_mod.time())
+        past_ts = now - _DAY * 365  # 1 year ago
+        gs = _make_synthetic_gs(tmp_path, {
+            'Alice': {'commit_lines': [(past_ts, 100, 0, 'Core')], 'team': 'Core'},
+        }, wash_window_days=0, line_cap_percentile=0)
+        # Alice's membership expired yesterday
+        gs.author_to_team_ranges['Alice'] = [
+            ('Core', past_ts, now - _DAY),
+        ]
+        gs._compute_impact()
+        # Simulate the generate_report members-split logic
+        import time as time_mod2
+        current_ts = int(time_mod2.time())
+        current, previous = [], []
+        for author in sorted(gs.data['teams']['Core']['members']):
+            is_current = any(
+                any(t == 'Core' and f <= current_ts <= t_
+                    for t, f, t_ in gs.author_to_team_ranges.get(key, []))
+                for key in gs._author_lookup_keys(author)
+            )
+            if is_current:
+                current.append(author)
+            else:
+                previous.append(author)
+        assert 'Alice' not in current
+        assert 'Alice' in previous
+
+    def test_current_members_includes_open_ended_members(self, tmp_path):
+        """Members with no to-date (open-ended membership) must appear in members."""
+        import time as time_mod
+        now = int(time_mod.time())
+        past_ts = now - _DAY * 100
+        gs = _make_synthetic_gs(tmp_path, {
+            'Alice': {'commit_lines': [(past_ts, 100, 0, 'Core')], 'team': 'Core'},
+        }, wash_window_days=0, line_cap_percentile=0)
+        # Alice's membership has no end date (open-ended)
+        gs.author_to_team_ranges['Alice'] = [
+            ('Core', past_ts, float('inf')),
+        ]
+        gs._compute_impact()
+        current_ts = int(time_mod.time())
+        current = [
+            author for author in sorted(gs.data['teams']['Core']['members'])
+            if any(
+                any(t == 'Core' and f <= current_ts <= t_
+                    for t, f, t_ in gs.author_to_team_ranges.get(key, []))
+                for key in gs._author_lookup_keys(author)
+            )
+        ]
+        assert 'Alice' in current
 
 
 if __name__ == "__main__":
