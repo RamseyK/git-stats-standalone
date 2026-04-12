@@ -114,7 +114,7 @@ class GitStats:
     # total_repo_lines metric shown on the Summary tab.  The config key
     # "loc_extensions" replaces this set entirely — include every extension you
     # want counted.  Extensions must include the leading dot (e.g. ".py").
-    LOC_EXTENSIONS = {'.py', '.cc', '.c', '.cpp', '.h', '.hpp', '.rs'}
+    LOC_EXTENSIONS = {'.py', '.cc', '.c', '.cpp', '.h', '.hpp', '.rs', '.cs'}
 
     def __init__(self, repo_path, config_file=None, support_paths=None):
         self.repo_path = repo_path

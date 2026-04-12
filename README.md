@@ -115,7 +115,7 @@ All configuration lives in a single JSON file. Every key is optional.
   "bus_factor_threshold": 0.5,
 
   "component_markers": ["pyproject.toml", "Cargo.toml", "CMakeLists.txt"],
-  "loc_extensions": [".py", ".cc", ".c", ".cpp", ".h", ".hpp", ".rs"]
+  "loc_extensions": [".py", ".cc", ".c", ".cpp", ".h", ".hpp", ".rs", ".cs"]
 }
 ```
 
@@ -166,7 +166,7 @@ Add build-system-specific markers (`"Cargo.toml"`, `"CMakeLists.txt"`, `"go.mod"
 Only files whose extension matches an entry in `loc_extensions` are counted toward the **Lines of Code** tile. The built-in defaults are:
 
 ```
-.py  .cc  .c  .cpp  .h  .hpp  .rs
+.py  .cc  .c  .cpp  .h  .hpp  .rs, .cs
 ```
 
 Add extensions for languages not in the default set (e.g. `".ts"`, `".go"`, `".java"`, `".swift"`). Extensions must include the leading dot.

@@ -106,7 +106,7 @@ STD_CONFIG = {
     'monthly_top_authors': 3,
     'bus_factor_threshold': 0.5,
     'component_markers': ['pyproject.toml', 'meta.yaml'],
-    'loc_extensions': ['.py', '.cc', '.c', '.cpp', '.h', '.hpp', '.rs'],
+    'loc_extensions': ['.py', '.cc', '.c', '.cpp', '.h', '.hpp', '.rs', '.cs'],
 }
 
 # Support repo — pyodide-recipes
