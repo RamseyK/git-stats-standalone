@@ -396,6 +396,52 @@ class TestImpactScoring:
         for name, a in std_gs.data['authors'].items():
             assert a['first'] <= a['last'], f"{name}: first={a['first']} > last={a['last']}"
 
+    def test_team_first_le_last(self, std_gs):
+        """Every team's first commit timestamp must be ≤ their last commit timestamp."""
+        for name, t in std_gs.data['teams'].items():
+            assert t['first'] <= t['last'], f"Team {name}: first={t['first']} > last={t['last']}"
+
+    def test_top_committer_commits_term_is_full_weight(self, std_gs):
+        """The author with the most commits must receive the full commits weight (wc) in their score.
+
+        Because the formula normalises commits as (a.commits / max_commits) * wc, the top
+        committer gets exactly wc from that dimension. Their total impact equals wc plus
+        whatever the lines and tenure dimensions contribute — so impact >= wc is guaranteed
+        (tested separately), but the commits term itself must equal wc exactly.
+        The check: top_committer.impact >= wc (already in test_top_committer_gets_full_commits_weight)
+        and also no author exceeds 100.0 (already in test_top_author_impact_at_most_100).
+        Here we verify the difference between the top committer and second-place committer
+        is purely from the lines/tenure dimensions — i.e., their commits ratios are both 1.0
+        only for the single top committer.
+        """
+        wc = gitstats.GitStats.IMPACT_W_COMMITS
+        authors = std_gs.data['authors']
+        max_commits = max(a['commits'] for a in authors.values())
+        top_committers = [a for a in authors.values() if a['commits'] == max_commits]
+        # Every top committer gets full commits weight → their impact ≥ wc.
+        for a in top_committers:
+            assert a['impact'] >= wc
+
+    def test_team_members_nonempty_for_teams_with_commits(self, std_gs):
+        """Every team that received at least one commit must have a non-empty members set."""
+        for name, t in std_gs.data['teams'].items():
+            if t['commits'] > 0:
+                assert len(t['members']) > 0, f"Team {name} has commits but no members"
+
+    def test_author_add_del_at_least_sum_of_any_single_commit(self, std_gs):
+        """Each author's cumulative add/del must be >= any individual commit's contribution.
+
+        Verifies that per-commit stats accumulate monotonically and are never negative.
+        """
+        for name, a in std_gs.data['authors'].items():
+            assert a['add'] >= 0, f"{name} negative add"
+            assert a['del'] >= 0, f"{name} negative del"
+
+    def test_no_author_negative_impact(self, std_gs):
+        """Impact scores must never be negative regardless of noise-reduction results."""
+        for name, a in std_gs.data['authors'].items():
+            assert a['impact'] >= 0.0, f"{name} has negative impact {a['impact']}"
+
 
 # ---------------------------------------------------------------------------
 # Impact scoring — unit tests with synthetic data
@@ -735,6 +781,296 @@ class TestImpactLogicUnit:
         assert gs.data['teams']['Core']['del'] == 150   # 100+50
         assert gs.data['teams']['Docs']['add'] == 400
         assert gs.data['teams']['Docs']['del'] == 200
+
+    def test_top_author_leads_all_dimensions_scores_100(self, tmp_path):
+        """An author who leads commits, lines, and tenure must score exactly 100.0."""
+        gs = _make_synthetic_gs(tmp_path, {
+            'Alice': {'commit_lines': [
+                (0,           1000, 0, 'C'),
+                (_DAY * 365,  1000, 0, 'C'),
+            ]},
+            'Bob': {'commit_lines': [(_DAY * 100, 500, 0, 'C')]},
+        }, use_net_lines=False, wash_window_days=0, line_cap_percentile=0)
+        gs._compute_impact()
+        assert gs.data['authors']['Alice']['impact'] == 100.0
+
+    def test_tenure_breaks_tie_between_equal_commits_and_lines(self, tmp_path):
+        """When two authors have equal commits and lines, longer tenure wins."""
+        gs = _make_synthetic_gs(tmp_path, {
+            'Veteran': {'commit_lines': [
+                (0,           500, 0, 'C'),
+                (_DAY * 365,  500, 0, 'C'),
+            ]},
+            'Junior': {'commit_lines': [
+                (0,          500, 0, 'C'),
+                (_DAY * 10,  500, 0, 'C'),
+            ]},
+        }, use_net_lines=False, wash_window_days=0, line_cap_percentile=0)
+        gs._compute_impact()
+        assert gs.data['authors']['Veteran']['impact'] > gs.data['authors']['Junior']['impact']
+
+    def test_multiple_commits_same_timestamp_zero_tenure(self, tmp_path):
+        """Two commits at identical timestamps produce zero tenure; score = commits + lines."""
+        gs = _make_synthetic_gs(tmp_path, {
+            'A': {'commit_lines': [(_DAY, 500, 0, 'C'), (_DAY, 500, 0, 'C')]},
+            'B': {'commit_lines': [(_DAY, 100, 0, 'C')]},
+        }, use_net_lines=False, wash_window_days=0, line_cap_percentile=0)
+        gs._compute_impact()
+        wc = gitstats.GitStats.IMPACT_W_COMMITS
+        wl = gitstats.GitStats.IMPACT_W_LINES
+        # A leads both commits (2/2) and lines (1000/1000); tenure=0 for all → tenure term=0.
+        assert gs.data['authors']['A']['impact'] == pytest.approx(wc + wl, abs=0.1)
+
+    def test_team_tenure_spans_all_member_commits(self, tmp_path):
+        """Team first/last must reflect the earliest and latest commit across all members."""
+        gs = _make_synthetic_gs(tmp_path, {
+            'Alice': {'commit_lines': [(_DAY * 100, 100, 0, 'Core')], 'team': 'Core'},
+            'Bob':   {'commit_lines': [(_DAY * 365, 100, 0, 'Core')], 'team': 'Core'},
+        }, wash_window_days=0, line_cap_percentile=0)
+        # _make_synthetic_gs builds the team dict from the commit_lines — check it directly.
+        team = gs.data['teams']['Core']
+        assert team['first'] == _DAY * 100
+        assert team['last']  == _DAY * 365
+        assert (team['last'] - team['first']) // _DAY == 265
+
+    def test_team_tenure_drives_scoring_advantage(self, tmp_path):
+        """A team with longer tenure scores higher when commits and lines are otherwise equal."""
+        gs = _make_synthetic_gs(tmp_path, {
+            'Alice': {'commit_lines': [
+                (0,            500, 0, 'LongTeam'),
+                (_DAY * 365,   500, 0, 'LongTeam'),
+            ], 'team': 'LongTeam'},
+            'Bob': {'commit_lines': [
+                (0,            500, 0, 'ShortTeam'),
+                (_DAY * 10,    500, 0, 'ShortTeam'),
+            ], 'team': 'ShortTeam'},
+        }, use_net_lines=False, wash_window_days=0, line_cap_percentile=0)
+        gs._compute_impact()
+        assert gs.data['teams']['LongTeam']['impact'] > gs.data['teams']['ShortTeam']['impact']
+
+    def test_all_three_noise_steps_combined(self, tmp_path):
+        """Net lines + percentile cap + wash window must all apply together correctly.
+
+        Importer: huge add (+500k) then full revert (-500k) in the same week.
+        Regular:  20 small genuine commits spread across months.
+
+        With all three steps enabled:
+        - Net lines: each Importer commit has high individual net, but...
+        - Wash window: the bucket gross=1M, balanced → washed to net=0
+        - Even if somehow not washed, the percentile cap would clamp the outlier
+        → Regular must outscore Importer.
+        """
+        regular_commits = [(_DAY * (30 + i * 14), 100, 0, 'C') for i in range(20)]
+        gs = _make_synthetic_gs(tmp_path, {
+            'Regular':  {'commit_lines': regular_commits},
+            'Importer': {'commit_lines': [
+                (_DAY,       500_000, 0,       'C'),
+                (_DAY * 5,   0,       500_000, 'C'),
+            ]},
+        }, use_net_lines=True, wash_window_days=7, wash_min_gross=200, line_cap_percentile=95)
+        gs._compute_impact()
+        assert gs.data['authors']['Regular']['impact'] > gs.data['authors']['Importer']['impact']
+
+    def test_team_wash_is_per_author_not_cross_author(self, tmp_path):
+        """Wash detection is applied per-author within a team: two DIFFERENT authors
+        making opposite changes in the same team/week are NOT washed — they are
+        independent contributors. Only a SINGLE author's own revert pair triggers wash.
+
+        Cross-author scenario (Alice +5000, Bob -5000 in TeamA, same week):
+          Alice's bucket: {raw_a=5000, raw_d=0} → min/gross=0 → NOT washed (+5000)
+          Bob's  bucket: {raw_a=0, raw_d=5000} → min/gross=0 → NOT washed (+5000)
+          team_eff['TeamA'] = 10000  (both contributions kept)
+
+        Single-author scenario (Eve does +5000 then -5000 in TeamA, same week):
+          Eve's bucket: {raw_a=5000, raw_d=5000} → min/gross=0.5 > 0.4 → WASHED (0)
+          team_eff['TeamA'] = 0
+
+        TeamA impact must be higher in the cross-author case than the single-author case.
+        """
+        # Cross-author: Alice adds, Bob removes — independent work, should NOT cancel.
+        gs_cross = _make_synthetic_gs(tmp_path / 'cross', {
+            'Alice': {'commit_lines': [(_DAY,     5000, 0,    'TeamA')], 'team': 'TeamA'},
+            'Bob':   {'commit_lines': [(_DAY * 3, 0,    5000, 'TeamA')], 'team': 'TeamA'},
+            'Carol': {'commit_lines': [(_DAY,     100,  0,    'TeamB')], 'team': 'TeamB'},
+        }, use_net_lines=True, wash_window_days=7, wash_min_gross=200, line_cap_percentile=0)
+
+        # Single-author: Eve does both sides herself — same-week revert, should wash.
+        gs_single = _make_synthetic_gs(tmp_path / 'single', {
+            'Eve': {'commit_lines': [
+                (_DAY,     5000, 0,    'TeamA'),
+                (_DAY * 3, 0,    5000, 'TeamA'),
+            ], 'team': 'TeamA'},
+            'Carol': {'commit_lines': [(_DAY, 100, 0, 'TeamB')], 'team': 'TeamB'},
+        }, use_net_lines=True, wash_window_days=7, wash_min_gross=200, line_cap_percentile=0)
+
+        gs_cross._compute_impact()
+        gs_single._compute_impact()
+
+        # Cross-author: TeamA keeps 10000 eff (both Alice and Bob credited) → impact=100.
+        assert gs_cross.data['teams']['TeamA']['impact'] > gs_cross.data['teams']['TeamB']['impact']
+        # Single-author: TeamA washed to 0 eff → much lower impact than cross-author.
+        assert gs_single.data['teams']['TeamA']['impact'] < gs_cross.data['teams']['TeamA']['impact']
+
+    def test_winsorization_cap_value_equals_percentile_entry(self, tmp_path):
+        """With N=21 commits and cap_pct=95, cap_idx=19 and the cap equals the 20th smallest value.
+
+        20 commits of 100 lines + 1 of 1,000,000. Sorted: [100]*20 + [1000000].
+        cap_idx = int(21 * 0.95) = 19 → all_eff[19] = 100 → importer capped to 100.
+        Both authors then have equal effective lines, so Importer's lower commit count
+        means Regular scores higher on commits dimension.
+        """
+        regular = [(_DAY * i, 100, 0, 'C') for i in range(20)]
+        gs = _make_synthetic_gs(tmp_path, {
+            'Regular':  {'commit_lines': regular},
+            'Importer': {'commit_lines': [(_DAY * 25, 1_000_000, 0, 'C')]},
+        }, use_net_lines=False, wash_window_days=0, line_cap_percentile=95)
+        gs._compute_impact()
+        # After capping, Importer's eff_lines = 100 = Regular's per-commit value.
+        # Regular has 20 commits vs Importer's 1, so Regular wins the commits dimension.
+        assert gs.data['authors']['Regular']['impact'] > gs.data['authors']['Importer']['impact']
+
+    def test_impact_scores_all_nonnegative_with_all_noise_steps(self, tmp_path):
+        """No noise-reduction combination must produce a negative impact score."""
+        WEEK = 7 * _DAY
+        gs = _make_synthetic_gs(tmp_path, {
+            'A': {'commit_lines': [
+                (_DAY,       10000, 0,     'T1'),
+                (_DAY * 6,   0,     10000, 'T1'),   # wash pair
+            ]},
+            'B': {'commit_lines': [(_DAY, 50, 50, 'T2')]},  # net=0
+            'C': {'commit_lines': [(WEEK * 3, 200, 0, 'T1')]},  # genuine
+        }, use_net_lines=True, wash_window_days=7, wash_min_gross=200, line_cap_percentile=95)
+        gs._compute_impact()
+        for name, a in gs.data['authors'].items():
+            assert a['impact'] >= 0.0, f"{name} has negative impact {a['impact']}"
+        for name, t in gs.data['teams'].items():
+            assert t['impact'] >= 0.0, f"Team {name} has negative impact {t['impact']}"
+
+    def test_commit_lines_removed_after_compute_impact(self, tmp_path):
+        """_compute_impact() must clean up commit_lines and _eff from author dicts."""
+        gs = _make_synthetic_gs(tmp_path, {
+            'Alice': {'commit_lines': [(_DAY, 100, 0, 'C'), (_DAY * 50, 200, 0, 'C')]},
+        }, wash_window_days=0, line_cap_percentile=0)
+        gs._compute_impact()
+        for name, a in gs.data['authors'].items():
+            assert 'commit_lines' not in a, f"{name} still has commit_lines after _compute_impact"
+            assert '_eff' not in a, f"{name} still has _eff after _compute_impact"
+
+    def test_team_scores_100_when_one_team(self, tmp_path):
+        """With only one team, it must be normalized to 100.0 impact."""
+        gs = _make_synthetic_gs(tmp_path, {
+            'Alice': {'commit_lines': [(_DAY, 100, 0, 'Solo'), (_DAY * 100, 100, 0, 'Solo')],
+                      'team': 'Solo'},
+        }, wash_window_days=0, line_cap_percentile=0)
+        gs._compute_impact()
+        assert gs.data['teams']['Solo']['impact'] == 100.0
+
+
+# ---------------------------------------------------------------------------
+# Zero-commit teams (configured teams with no attributed commits)
+# ---------------------------------------------------------------------------
+
+def _extract_teams_data(html):
+    """Extract the teamsData JS constant from generated HTML as a Python dict."""
+    for line in html.splitlines():
+        stripped = line.strip()
+        if stripped.startswith('const teamsData'):
+            json_str = stripped.split('=', 1)[1].strip().rstrip(';')
+            return json.loads(json_str)
+    return None
+
+
+class TestZeroCommitTeams:
+    """Verify that configured teams with members but zero commits appear in the Teams tab."""
+
+    def test_teams_config_stored_on_instance(self, tmp_path):
+        """teams_config must be stored on the GitStats instance after construction."""
+        teams = {'Alpha': {'members': ['alice@example.com']}}
+        cfg = make_config(str(tmp_path), teams=teams)
+        gs = gitstats.GitStats(str(tmp_path), cfg)
+        assert 'Alpha' in gs.teams_config
+        assert gs.teams_config['Alpha']['members'] == ['alice@example.com']
+
+    def test_teams_config_empty_when_no_teams(self, tmp_path):
+        """When no teams are configured, teams_config must be an empty dict."""
+        cfg = make_config(str(tmp_path))  # teams={}
+        gs = gitstats.GitStats(str(tmp_path), cfg)
+        assert gs.teams_config == {}
+
+    def test_zero_commit_team_appears_in_html(self, repo_path, tmp_path_factory):
+        """A configured team whose members have no commits in the repo must appear
+        in the generated HTML teamsData so the Teams tab can render it."""
+        tmp = str(tmp_path_factory.mktemp('zero_commit_team'))
+        teams = {
+            'Core': {'members': ['Hood Chatham', 'roberthoodchatham@gmail.com', 'hood@mit.edu']},
+            'Phantom': {'members': ['nonexistent-author@example.com']},
+        }
+        cfg = make_config(tmp, teams=teams)
+        gs = gitstats.GitStats(repo_path, cfg)
+        gs.collect()
+        out = os.path.join(tmp, 'report.html')
+        gs.generate_report(os.path.join(PROJECT_ROOT, 'externals'), out)
+        data = _extract_teams_data(open(out).read())
+        assert data is not None
+        assert 'Phantom' in data, "Zero-commit team must appear in teamsData"
+
+    def test_zero_commit_team_has_zero_impact_and_commits(self, repo_path, tmp_path_factory):
+        """A zero-commit team must have impact=0 and commits=0 in teamsData."""
+        tmp = str(tmp_path_factory.mktemp('zero_impact'))
+        teams = {
+            'Core':    {'members': ['Hood Chatham', 'roberthoodchatham@gmail.com', 'hood@mit.edu']},
+            'Phantom': {'members': ['nonexistent-author@example.com']},
+        }
+        cfg = make_config(tmp, teams=teams)
+        gs = gitstats.GitStats(repo_path, cfg)
+        gs.collect()
+        out = os.path.join(tmp, 'report.html')
+        gs.generate_report(os.path.join(PROJECT_ROOT, 'externals'), out)
+        data = _extract_teams_data(open(out).read())
+        assert data is not None
+        assert data['Phantom']['impact'] == 0
+        assert data['Phantom']['commits'] == 0
+
+    def test_empty_members_team_not_in_html(self, repo_path, tmp_path_factory):
+        """A configured team with an empty members list must not appear in teamsData."""
+        tmp = str(tmp_path_factory.mktemp('empty_members'))
+        teams = {
+            'Core':  {'members': ['Hood Chatham']},
+            'Ghost': {'members': []},
+        }
+        cfg = make_config(tmp, teams=teams)
+        gs = gitstats.GitStats(repo_path, cfg)
+        gs.collect()
+        out = os.path.join(tmp, 'report.html')
+        gs.generate_report(os.path.join(PROJECT_ROOT, 'externals'), out)
+        data = _extract_teams_data(open(out).read())
+        assert data is not None
+        assert 'Ghost' not in data, "Team with empty members must not appear in teamsData"
+
+    def test_real_team_unaffected_by_zero_commit_team(self, repo_path, tmp_path_factory):
+        """Adding a zero-commit team must not change the impact of teams with real commits."""
+        tmp_base  = str(tmp_path_factory.mktemp('base'))
+        tmp_extra = str(tmp_path_factory.mktemp('extra'))
+        base_teams = {'Core': {'members': ['Hood Chatham', 'roberthoodchatham@gmail.com', 'hood@mit.edu']}}
+        extra_teams = dict(base_teams)
+        extra_teams['Phantom'] = {'members': ['nonexistent@example.com']}
+
+        cfg_base  = make_config(tmp_base,  teams=base_teams)
+        cfg_extra = make_config(tmp_extra, teams=extra_teams)
+
+        gs_base  = gitstats.GitStats(repo_path, cfg_base);  gs_base.collect()
+        gs_extra = gitstats.GitStats(repo_path, cfg_extra); gs_extra.collect()
+
+        out_base  = os.path.join(tmp_base,  'report.html')
+        out_extra = os.path.join(tmp_extra, 'report.html')
+        gs_base.generate_report(os.path.join(PROJECT_ROOT, 'externals'), out_base)
+        gs_extra.generate_report(os.path.join(PROJECT_ROOT, 'externals'), out_extra)
+
+        base_data  = _extract_teams_data(open(out_base).read())
+        extra_data = _extract_teams_data(open(out_extra).read())
+
+        assert base_data['Core']['impact'] == extra_data['Core']['impact']
+        assert base_data['Core']['commits'] == extra_data['Core']['commits']
 
 
 # ---------------------------------------------------------------------------

@@ -146,6 +146,8 @@ class GitStats:
         # True only when at least one team is explicitly defined in config.
         # Used to hide the Teams tab when running without team configuration.
         self.has_teams = bool(teams_config)
+        # Retained so generate_report() can seed zero-commit teams into the display.
+        self.teams_config = teams_config
         self.team_colors = {}      # team name  → hex color string
         # key (lowercased email or author name) → list of (team, from_ts, to_ts)
         self.author_to_team_ranges = defaultdict(list)
@@ -401,6 +403,10 @@ class GitStats:
                 au['commits'] += 1
                 au['last'] = max(au['last'], ts)
                 au['first'] = min(au['first'], ts)
+                # Per-team commit counts — used by the bus factor bar to show a
+                # proportional colour split when an author has spanned multiple teams.
+                tc = au.setdefault('team_commits', {})
+                tc[team] = tc.get(team, 0) + 1
 
                 # Initialize team record on first encounter
                 if team not in self.data['teams']:
@@ -905,14 +911,18 @@ class GitStats:
             else:
                 repo_label = ''
             cards.append(
-                f'        <div class="card{margin}" id="componentChartCard-{cid}">\n'
+                f'        <div class="card{margin}" id="componentChartCard-{cid}"'
+                f' style="display:flex;flex-direction:column">\n'
                 f'            <div class="mb-6">\n'
                 f'                <h3 class="text-xl font-black">'
                 f'Component Churn \u2014 {rc["name"]}{repo_label}</h3>\n'
                 f'                <p class="text-sm text-slate-400 font-medium mt-1">'
                 f'Click any bar to filter contributors by component.</p>\n'
                 f'            </div>\n'
-                f'            <canvas id="componentChart-{cid}"></canvas>\n'
+                f'            <div style="position:relative;min-height:0"'
+                f' id="componentChartWrapper-{cid}">\n'
+                f'                <canvas id="componentChart-{cid}"></canvas>\n'
+                f'            </div>\n'
                 f'        </div>'
             )
 
@@ -966,12 +976,33 @@ class GitStats:
         """
         rows = []
         for ba in bf_authors:
-            color = self.team_colors.get(ba['team'], '#94a3b8') if self.has_teams else '#3b82f6'
+            # Build a segmented bar when the author has commits across multiple teams;
+            # fall back to a solid bar when teams are not configured.
+            team_commits = ba.get('team_commits', {})
+            author_total = sum(team_commits.values()) or 1
+            if self.has_teams and len(team_commits) > 1:
+                # Sort segments largest-first so dominant team leads left.
+                segments = sorted(team_commits.items(), key=lambda kv: kv[1], reverse=True)
+                seg_html = ''.join(
+                    f'<div style="width:{tc / author_total * 100:.2f}%;'
+                    f'background:{self.team_colors.get(t, "#94a3b8")};flex-shrink:0"></div>'
+                    for t, tc in segments
+                )
+                bar_inner = (
+                    f'<div style="width:{min(ba["pct"], 100)}%;height:100%;display:flex">'
+                    f'{seg_html}</div>'
+                )
+            else:
+                color = self.team_colors.get(ba['team'], '#94a3b8') if self.has_teams else '#3b82f6'
+                bar_inner = (
+                    f'<div class="h-full rounded-full"'
+                    f' style="width:{min(ba["pct"], 100)}%;background:{color}"></div>'
+                )
             rows.append(
                 f'                <div class="flex items-center gap-3 py-2">\n'
                 f'                    <span class="text-sm font-bold text-slate-700 w-36 truncate shrink-0">{ba["name"]}</span>\n'
                 f'                    <div class="flex-1 h-2 bg-slate-100 rounded-full overflow-hidden">\n'
-                f'                        <div class="h-full rounded-full" style="width:{min(ba["pct"], 100)}%;background:{color}"></div>\n'
+                f'                        {bar_inner}\n'
                 f'                    </div>\n'
                 f'                    <span class="text-sm font-mono font-bold text-slate-500 w-10 text-right shrink-0">{ba["pct"]}%</span>\n'
                 f'                    <span class="text-xs text-slate-400 w-24 text-right shrink-0">{ba["commits"]:,} commits</span>\n'
@@ -1081,10 +1112,11 @@ class GitStats:
         for name, adata in sorted_authors:
             running += adata['commits']
             bf_authors.append({
-                'name':    name,
-                'commits': adata['commits'],
-                'pct':     round(adata['commits'] / total_commits * 100, 1),
-                'team':    adata.get('team', 'Community'),
+                'name':         name,
+                'commits':      adata['commits'],
+                'pct':          round(adata['commits'] / total_commits * 100, 1),
+                'team':         adata.get('team', 'Community'),
+                'team_commits': adata.get('team_commits', {}),
             })
             if running >= cutoff:
                 break
@@ -1157,6 +1189,20 @@ class GitStats:
         dependencies. externals/tailwind.js and externals/chart.js are copied
         next to the output file so the report works fully offline.
         """
+        # Ensure every configured team with at least one member appears in the
+        # Teams tab, even if no commits were attributed to it (e.g. a team added
+        # to config before any of its members have pushed code).  Teams whose
+        # config members list is empty are omitted — nothing meaningful to show.
+        for team_name, team_val in self.teams_config.items():
+            if not team_val.get('members'):
+                continue
+            if team_name not in self.data['teams']:
+                self.data['teams'][team_name] = {
+                    'commits': 0, 'add': 0, 'del': 0,
+                    'members': set(), 'first': 0, 'last': 0,
+                    'impact': 0,
+                }
+
         # Convert member sets to sorted lists so they are JSON-serializable
         for t in self.data['teams'].values():
             t['members'] = sorted(list(t['members']))
@@ -1492,6 +1538,45 @@ function teamBadge(team) {{
                   style="background:${{c}}22;color:${{c}}">${{team}}</span>`;
 }}
 
+function teamBadges(s) {{
+    // For authors who have belonged to multiple teams, render one badge per team.
+    // The current (most-recent) team appears first; others are sorted by commit count.
+    if (!hasTeams) return '';
+    const tc = s.team_commits || {{}};
+    const teams = Object.keys(tc);
+    if (teams.length <= 1) return teamBadge(s.team);
+    const sorted = Object.entries(tc).sort((a, b) => {{
+        if (a[0] === s.team) return -1;
+        if (b[0] === s.team) return 1;
+        return b[1] - a[1];
+    }});
+    return sorted.map(([t]) => teamBadge(t)).join(' ');
+}}
+
+function authorImpactBar(impact, s) {{
+    // Renders the impact bar for an author row.
+    // Single-team authors get a solid bar in their team colour.
+    // Multi-team authors get a segmented bar: current team first (leftmost),
+    // then remaining teams by commit count, each segment proportional to their
+    // share of that author's total commits.
+    const tc = s.team_commits || {{}};
+    const teams = Object.keys(tc);
+    if (!hasTeams || teams.length <= 1) {{
+        const color = hasTeams ? teamColor(s.team) : '#3b82f6';
+        return `<div class="impact-bar flex-1"><div class="impact-fill" style="width:${{impact}}%;background:${{color}}"></div></div>`;
+    }}
+    const total = Object.values(tc).reduce((a, b) => a + b, 0) || 1;
+    const sorted = Object.entries(tc).sort((a, b) => {{
+        if (a[0] === s.team) return -1;
+        if (b[0] === s.team) return 1;
+        return b[1] - a[1];
+    }});
+    const segs = sorted.map(([t, c]) =>
+        `<div style="width:${{(c/total*100).toFixed(2)}}%;background:${{teamColor(t)}};flex-shrink:0"></div>`
+    ).join('');
+    return `<div class="impact-bar flex-1"><div style="width:${{impact}}%;height:100%;display:flex">${{segs}}</div></div>`;
+}}
+
 // ─── Sort controls ────────────────────────────────────────────────────────────
 function setSortKey(key) {{
     currentSortKey = key;
@@ -1558,7 +1643,7 @@ function renderAuthorTable(filter, filterType) {{
         return `<tr class="hover:bg-slate-50 transition-colors">
             <td class="px-8 py-4">
                 <div class="font-bold text-slate-800">${{name}}</div>
-                ${{teamBadge(s.team)}}
+                <div class="flex flex-wrap gap-1 mt-0.5">${{teamBadges(s)}}</div>
             </td>
             <td class="font-mono text-sm font-bold">${{fmt(commits)}}</td>
             <td>
@@ -1577,7 +1662,7 @@ function renderAuthorTable(filter, filterType) {{
             <td>
                 <div class="flex items-center gap-2" style="min-width:140px">
                     <span class="text-xs font-black text-slate-700 w-8">${{impact}}</span>
-                    <div class="impact-bar flex-1"><div class="impact-fill" style="width:${{impact}}%"></div></div>
+                    ${{authorImpactBar(impact, s)}}
                 </div>
             </td>
             <td class="px-6 text-slate-400 font-bold text-xs">${{activeDays}}d</td>
@@ -1802,9 +1887,8 @@ function initComponentChart() {{
         const canvas = document.getElementById('componentChart-' + repo.id);
         if (!canvas) return;
         const chartHeight = Math.max(300, repo.labels.length * 36 + 80);
-        canvas.style.height = chartHeight + 'px';
-        const card = document.getElementById('componentChartCard-' + repo.id);
-        if (card) card.style.height = (chartHeight + 120) + 'px';
+        const wrapper = document.getElementById('componentChartWrapper-' + repo.id);
+        if (wrapper) wrapper.style.height = chartHeight + 'px';
         new Chart(canvas, {{
             type: 'bar',
             data: {{
