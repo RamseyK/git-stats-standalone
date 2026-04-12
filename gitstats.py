@@ -116,6 +116,11 @@ class GitStats:
     # want counted.  Extensions must include the leading dot (e.g. ".py").
     LOC_EXTENSIONS = {'.py', '.cc', '.c', '.cpp', '.h', '.hpp', '.rs', '.cs'}
 
+    # ── Shared constants ─────────────────────────────────────────────────────────
+    _SECS_PER_DAY       = 86400          # seconds in one day
+    _DEFAULT_TEAM       = 'Community'    # fallback team for unassigned authors
+    _DEFAULT_TEAM_COLOR = '#94a3b8'      # slate — always shown for the fallback team
+
     def __init__(self, repo_path, config_file=None, support_paths=None):
         self.repo_path = repo_path
         # Additional git repositories whose commit histories contribute to the
@@ -185,7 +190,7 @@ class GitStats:
                     to_raw = _date_to_ts(m.get('to'))
                     to_ts  = (to_raw + 86399) if to_raw is not None else float('inf')
                     self.author_to_team_ranges[key].append((team, from_ts, to_ts))
-        self.team_colors['Community'] = '#94a3b8'  # slate — always last / fallback
+        self.team_colors[self._DEFAULT_TEAM] = self._DEFAULT_TEAM_COLOR  # slate — always last / fallback
 
         # Only git tags whose name begins with this prefix are shown in the
         # Releases tab. An empty string (the default) means all tags are included.
@@ -354,7 +359,7 @@ class GitStats:
 
         Checks the email (lowercased) first, then the author display name. For each
         key, iterates through its (team, from_ts, to_ts) ranges and returns the
-        first team whose range contains ts. Falls back to 'Community' when no range
+        first team whose range contains ts. Falls back to _DEFAULT_TEAM when no range
         matches — including when an author has left all configured teams.
 
         ts defaults to 0 so callers that don't have a timestamp (e.g. tests) get a
@@ -364,7 +369,7 @@ class GitStats:
             for team, from_ts, to_ts in self.author_to_team_ranges.get(key, []):
                 if from_ts <= ts <= to_ts:
                     return team
-        return 'Community'
+        return self._DEFAULT_TEAM
 
     def _run_git(self, args, repo=None):
         """Run a git subcommand and return its stdout as a string.
@@ -551,7 +556,7 @@ class GitStats:
 
         result = subprocess.run(
             ['git', '-C', repo_path, 'log', primary, '--first-parent',
-             '--format=MERGE|%P|%ce|%cn|%ct|%s'],
+             '--format=MERGE|%P|%ce|%cn|%ct|%ae|%s'],
             capture_output=True, text=True, errors='replace',
         )
 
@@ -559,10 +564,10 @@ class GitStats:
         for line in result.stdout.splitlines():
             if not line.startswith('MERGE|'):
                 continue
-            parts = line.split('|', 5)
-            if len(parts) < 6:
+            parts = line.split('|', 6)
+            if len(parts) < 7:
                 continue
-            _, parents_str, c_email, c_name, ts_str, subject = parts
+            _, parents_str, c_email, c_name, ts_str, a_email, subject = parts
             parents = parents_str.split()
 
             is_true_merge = len(parents) >= 2
@@ -570,7 +575,7 @@ class GitStats:
             s = subject.lower().strip()
             if self.merge_heuristics is None:
                 # Built-in defaults with primary-branch exclusion for "merge branch".
-                is_heuristic = (
+                is_subject_heuristic = (
                     'pull request #' in s
                     or s.startswith('merge remote-tracking branch')
                     or (
@@ -581,6 +586,15 @@ class GitStats:
                         and s != f'merge branch {pb_lower}'
                     )
                 )
+                # A non-merge commit where committer ≠ author typically indicates
+                # someone edited the commit message before merging (squash/rebase
+                # with a custom message).  Subject heuristics miss these since
+                # the edited message may not contain a PR pattern.
+                is_committer_merge = (
+                    not is_true_merge
+                    and c_email.lower() != a_email.strip().lower()
+                )
+                is_heuristic = is_subject_heuristic or is_committer_merge
             else:
                 # User-supplied patterns: each is a case-insensitive substring match.
                 is_heuristic = any(h in s for h in self.merge_heuristics)
@@ -663,7 +677,7 @@ class GitStats:
 
         # Age and total LOC derive from the main repo only.
         if main_all_ts:
-            self.data['general']['age_days']         = (max(main_all_ts) - min(main_all_ts)) // 86400
+            self.data['general']['age_days']         = (max(main_all_ts) - min(main_all_ts)) // self._SECS_PER_DAY
             self.data['general']['first_commit_ts']  = min(main_all_ts)
             self.data['general']['last_commit_ts']   = max(main_all_ts)
         self.data['general']['total_lines'] = main_running_loc
@@ -768,6 +782,25 @@ class GitStats:
 
     # ------------------------------------------------------------------ impact
 
+    @staticmethod
+    def _wash_bucket_score(bucket: dict, wash_min: float, cap_val: float) -> float:
+        """Return the effective line score for one wash-window bucket.
+
+        If the bucket is large and adds/dels are roughly balanced (wash condition),
+        the bucket contributes only its net |adds - dels| capped at cap_val.
+        Otherwise the pre-computed effective sum (already capped per commit) is used.
+
+        Args:
+            bucket:   Dict with keys 'eff' (float), 'raw_a' (int), 'raw_d' (int).
+            wash_min: Minimum gross lines in the bucket to trigger wash detection.
+            cap_val:  Per-commit line cap applied to the net on the wash path.
+        """
+        gross = bucket['raw_a'] + bucket['raw_d']
+        net   = abs(bucket['raw_a'] - bucket['raw_d'])
+        if gross > wash_min and gross > 0 and min(bucket['raw_a'], bucket['raw_d']) / gross > 0.4:
+            return min(net, cap_val)
+        return bucket['eff']
+
     def _compute_impact(self):
         """Compute and store impact scores for every author and team.
 
@@ -870,7 +903,7 @@ class GitStats:
             if not wash_days:
                 return sum(eff)
 
-            window_secs = wash_days * 86400
+            window_secs = wash_days * self._SECS_PER_DAY
             # Each bucket accumulates per-commit effective lines AND the raw
             # adds/dels needed to detect the wash condition.
             buckets = defaultdict(lambda: {'eff': 0, 'raw_a': 0, 'raw_d': 0})
@@ -880,21 +913,7 @@ class GitStats:
                 buckets[b]['raw_a'] += raw_a
                 buckets[b]['raw_d'] += raw_d
 
-            total = 0
-            for b in buckets.values():
-                gross = b['raw_a'] + b['raw_d']
-                net   = abs(b['raw_a'] - b['raw_d'])
-                # Wash condition: bucket is large AND adds/dels are roughly balanced.
-                # min/gross > 0.4 → min/(min+max) > 0.4 → min/max > 2/3 ≈ 67%,
-                # meaning the smaller side is at least 67% of the larger side,
-                # indicating substantial cancellation (e.g. delete 1000 + add 900).
-                # Apply cap_val to the net for consistency with the non-wash path,
-                # which uses per-commit effective values already capped at cap_val.
-                if gross > wash_min and gross > 0 and min(b['raw_a'], b['raw_d']) / gross > 0.4:
-                    total += min(net, cap_val)    # discard the cancelled-out churn
-                else:
-                    total += b['eff']
-            return total
+            return sum(self._wash_bucket_score(b, wash_min, cap_val) for b in buckets.values())
 
         # ── Score authors ─────────────────────────────────────────────────────
         eff_map = {}   # author name → effective lines (used for team rollup too)
@@ -905,11 +924,11 @@ class GitStats:
             # situation when a dimension is intentionally disabled.
             max_c = (max(a['commits'] for a in authors.values()) or 1) if wc > 0 else 1
             max_k = (max(eff_map.values()) or 1)                         if wl > 0 else 1
-            max_d = (max((a['last'] - a['first']) // 86400
+            max_d = (max((a['last'] - a['first']) // self._SECS_PER_DAY
                          for a in authors.values()) or 1)                if wt > 0 else 1
             max_m = (max(a.get('merges', 0) for a in authors.values()) or 1) if wm > 0 else 1
             for name, a in authors.items():
-                days = (a['last'] - a['first']) // 86400
+                days = (a['last'] - a['first']) // self._SECS_PER_DAY
                 raw = (
                     ((a['commits']       / max_c) * wc if wc > 0 else 0.0) +
                     ((eff_map[name]      / max_k) * wl if wl > 0 else 0.0) +
@@ -937,7 +956,7 @@ class GitStats:
                     for (_, _ra, _rd, team), e in zip(commits, eff):
                         team_eff[team] += e
                 else:
-                    window_secs = wash_days * 86400
+                    window_secs = wash_days * self._SECS_PER_DAY
                     # Bucket by (time-window, team) — applies wash detection per team
                     # the same way effective_lines() does per author.
                     t_buckets = defaultdict(lambda: {'eff': 0.0, 'raw_a': 0, 'raw_d': 0})
@@ -947,12 +966,7 @@ class GitStats:
                         t_buckets[key]['raw_a'] += raw_a
                         t_buckets[key]['raw_d'] += raw_d
                     for (_, team), b in t_buckets.items():
-                        gross = b['raw_a'] + b['raw_d']
-                        net   = abs(b['raw_a'] - b['raw_d'])
-                        if gross > wash_min and gross > 0 and min(b['raw_a'], b['raw_d']) / gross > 0.4:
-                            team_eff[team] += min(net, cap_val)
-                        else:
-                            team_eff[team] += b['eff']
+                        team_eff[team] += self._wash_bucket_score(b, wash_min, cap_val)
 
             # Accumulate merges per team from member authors
             team_merges = defaultdict(int)
@@ -963,11 +977,11 @@ class GitStats:
 
             max_c = (max(t['commits'] for t in teams.values()) or 1) if wc > 0 else 1
             max_k = (max(team_eff.values()) or 1)                      if wl > 0 else 1
-            max_d = (max((t['last'] - t['first']) // 86400
+            max_d = (max((t['last'] - t['first']) // self._SECS_PER_DAY
                          for t in teams.values()) or 1)                if wt > 0 else 1
             max_m = ((max(team_merges.values()) if team_merges else 1)) if wm > 0 else 1
             for tname, t in teams.items():
-                days = (t['last'] - t['first']) // 86400
+                days = (t['last'] - t['first']) // self._SECS_PER_DAY
                 raw = (
                     ((t['commits']           / max_c) * wc if wc > 0 else 0.0) +
                     ((team_eff[tname]        / max_k) * wl if wl > 0 else 0.0) +
@@ -1011,8 +1025,8 @@ class GitStats:
             # With no teams, every commit maps to "Community", which adds no signal.
             team_badges = ''.join([
                 f'<span class="inline-flex items-center gap-1.5 text-[10px] px-2.5 py-1 rounded-lg font-black uppercase" '
-                f'style="background:{self.team_colors.get(team, "#94a3b8")}18;'
-                f'color:{self.team_colors.get(team, "#94a3b8")}">'
+                f'style="background:{self.team_colors.get(team, self._DEFAULT_TEAM_COLOR)}18;'
+                f'color:{self.team_colors.get(team, self._DEFAULT_TEAM_COLOR)}">'
                 f'{team}'
                 f'<span class="opacity-60">·</span>'
                 f'<span>{count} commits</span>'
@@ -1142,6 +1156,87 @@ class GitStats:
             f'        </div>'
         )
 
+    def _compute_bus_factor_entries(self, metric_key: str) -> tuple:
+        """Return (entries, total) for the bus factor section identified by metric_key.
+
+        Iterates through authors sorted by the given metric in descending order,
+        accumulating entries until the combined metric reaches bus_factor_threshold
+        of the total.
+
+        Args:
+            metric_key: 'commits' or 'merges'.
+
+        Returns:
+            entries: List of dicts with keys name, count, pct, team, and
+                     (for commits) team_commits.
+            total:   Total metric value across all authors; 0 when there is
+                     no history for that metric.
+        """
+        authors = self.data['authors']
+        getter  = (lambda a: a['commits']) if metric_key == 'commits' else (lambda a: a.get('merges', 0))
+        sorted_authors = sorted(authors.items(), key=lambda x: getter(x[1]), reverse=True)
+        total = sum(getter(a) for _, a in sorted_authors)
+        if total == 0:
+            return [], 0
+        cutoff  = total * self.bus_factor_threshold
+        running = 0
+        entries = []
+        for name, adata in sorted_authors:
+            val = getter(adata)
+            if metric_key == 'merges' and val == 0:
+                break
+            running += val
+            entry = {
+                'name':  name,
+                'count': val,
+                'pct':   round(val / total * 100, 1),
+                'team':  adata.get('team', self._DEFAULT_TEAM),
+            }
+            if metric_key == 'commits':
+                entry['team_commits'] = adata.get('team_commits', {})
+            entries.append(entry)
+            if running >= cutoff:
+                break
+        return entries, total
+
+    def _render_bf_section(self, label: str, metric_key: str, entries: list, bus_pct: int) -> str:
+        """Render one labeled bus-factor section (Commits or PR Merges).
+
+        Produces the inner <div> that appears inside the two-column bus factor
+        card layout.  Both sections share the same structure; only the label,
+        the metric name in the description sentence, and the row data differ.
+
+        Args:
+            label:      Section heading shown above the content (e.g. 'Commits').
+            metric_key: 'commits' or 'merges' — passed to _render_bf_rows and
+                        used to build the description sentence.
+            entries:    Output of _compute_bus_factor_entries for this metric.
+            bus_pct:    Threshold as an integer percentage (e.g. 50 for 50%).
+        """
+        count       = len(entries)
+        plural_s    = 's' if count != 1 else ''
+        plural_verb = 'account' if count != 1 else 'accounts'
+        dim_label   = 'commits' if metric_key == 'commits' else 'PR merges'
+        rows        = self._render_bf_rows(entries, metric_key)
+        return (
+            f'            <div>\n'
+            f'                <div class="text-[10px] uppercase font-bold text-slate-400 tracking-widest mb-4">{label}</div>\n'
+            f'                <div class="flex items-start gap-6 flex-wrap">\n'
+            f'                    <div class="shrink-0 text-center min-w-[4rem]">\n'
+            f'                        <div class="text-5xl font-black text-slate-900">{count}</div>\n'
+            f'                        <div class="text-[10px] uppercase font-bold text-slate-400 mt-1 tracking-widest">Bus Factor</div>\n'
+            f'                    </div>\n'
+            f'                    <div class="flex-1 min-w-0">\n'
+            f'                        <p class="text-sm text-slate-600 font-medium mb-4">\n'
+            f'                            <strong>{count} contributor{plural_s}</strong> {plural_verb} for\n'
+            f'                            {bus_pct}% of all {dim_label}.\n'
+            f'                        </p>\n'
+            f'{rows}\n'
+            f'                    </div>\n'
+            f'                </div>\n'
+            f'            </div>'
+        )
+
     def _render_bf_rows(self, bf_entries: list, metric_key: str) -> str:
         """Render contributor rows for one bus-factor section.
 
@@ -1162,7 +1257,7 @@ class GitStats:
                     segments = sorted(team_commits.items(), key=lambda kv: kv[1], reverse=True)
                     seg_html = ''.join(
                         f'<div style="width:{tc / author_total * 100:.2f}%;'
-                        f'background:{self.team_colors.get(t, "#94a3b8")};flex-shrink:0"></div>'
+                        f'background:{self.team_colors.get(t, self._DEFAULT_TEAM_COLOR)};flex-shrink:0"></div>'
                         for t, tc in segments
                     )
                     bar_inner = (
@@ -1170,14 +1265,14 @@ class GitStats:
                         f'{seg_html}</div>'
                     )
                 else:
-                    color = self.team_colors.get(ba['team'], '#94a3b8') if self.has_teams else '#3b82f6'
+                    color = self.team_colors.get(ba['team'], self._DEFAULT_TEAM_COLOR) if self.has_teams else '#3b82f6'
                     bar_inner = (
                         f'<div class="h-full rounded-full"'
                         f' style="width:{min(ba["pct"], 100)}%;background:{color}"></div>'
                     )
             else:
                 # Merges: simple solid bar using the author's team color.
-                color = self.team_colors.get(ba['team'], '#94a3b8') if self.has_teams else '#3b82f6'
+                color = self.team_colors.get(ba['team'], self._DEFAULT_TEAM_COLOR) if self.has_teams else '#3b82f6'
                 bar_inner = (
                     f'<div class="h-full rounded-full"'
                     f' style="width:{min(ba["pct"], 100)}%;background:{color}"></div>'
@@ -1196,9 +1291,7 @@ class GitStats:
         return '\n'.join(rows)
 
     def _render_bus_factor_card(self,
-                                commit_bus_count: int,
                                 commit_bf_authors: list,
-                                merge_bus_count: int,
                                 merge_bf_authors: list,
                                 total_merges: int,
                                 bus_pct: int,
@@ -1210,42 +1303,19 @@ class GitStats:
         rendered and it occupies the full width of the card.
 
         Args:
-            commit_bus_count:    Bus factor based on commit counts.
-            commit_bf_authors:   Entries for the commits section (see _render_bf_rows).
-            merge_bus_count:     Bus factor based on PR merge counts.
+            commit_bf_authors:   Entries for the commits section (see _compute_bus_factor_entries).
             merge_bf_authors:    Entries for the merges section.
             total_merges:        Total PR merges across all authors; 0 → no merge history.
             bus_pct:             Threshold as an integer percentage (e.g. 50 for 50%).
             show_merges_section: Show the PR Merges section.  Pass False when
                                  impact_w_merges == 0.
         """
-        # ── Commits section ──────────────────────────────────────────────────
-        cplural_s    = 's' if commit_bus_count != 1 else ''
-        cplural_verb = 'account' if commit_bus_count != 1 else 'accounts'
-        commit_rows  = self._render_bf_rows(commit_bf_authors, 'commits')
-
-        if show_merges_section:
-            # Two-column layout: add a section label above the commits content.
-            commits_section = (
-                f'            <div>\n'
-                f'                <div class="text-[10px] uppercase font-bold text-slate-400 tracking-widest mb-4">Commits</div>\n'
-                f'                <div class="flex items-start gap-6 flex-wrap">\n'
-                f'                    <div class="shrink-0 text-center min-w-[4rem]">\n'
-                f'                        <div class="text-5xl font-black text-slate-900">{commit_bus_count}</div>\n'
-                f'                        <div class="text-[10px] uppercase font-bold text-slate-400 mt-1 tracking-widest">Bus Factor</div>\n'
-                f'                    </div>\n'
-                f'                    <div class="flex-1 min-w-0">\n'
-                f'                        <p class="text-sm text-slate-600 font-medium mb-4">\n'
-                f'                            <strong>{commit_bus_count} contributor{cplural_s}</strong> {cplural_verb} for\n'
-                f'                            {bus_pct}% of all commits.\n'
-                f'                        </p>\n'
-                f'{commit_rows}\n'
-                f'                    </div>\n'
-                f'                </div>\n'
-                f'            </div>'
-            )
-        else:
-            # Full-width layout: original single-section style without a label.
+        if not show_merges_section:
+            # Single-section card — commits only, full width (no section label).
+            commit_bus_count = len(commit_bf_authors)
+            plural_s    = 's' if commit_bus_count != 1 else ''
+            plural_verb = 'account' if commit_bus_count != 1 else 'accounts'
+            commit_rows = self._render_bf_rows(commit_bf_authors, 'commits')
             commits_section = (
                 f'            <div class="flex items-start gap-8 flex-wrap">\n'
                 f'                <div class="shrink-0 text-center min-w-[5rem]">\n'
@@ -1254,16 +1324,13 @@ class GitStats:
                 f'                </div>\n'
                 f'                <div class="flex-1 min-w-0">\n'
                 f'                    <p class="text-sm text-slate-600 font-medium mb-4">\n'
-                f'                        <strong>{commit_bus_count} contributor{cplural_s}</strong> {cplural_verb} for\n'
+                f'                        <strong>{commit_bus_count} contributor{plural_s}</strong> {plural_verb} for\n'
                 f'                        {bus_pct}% of all commits.\n'
                 f'                    </p>\n'
                 f'{commit_rows}\n'
                 f'                </div>\n'
                 f'            </div>'
             )
-
-        if not show_merges_section:
-            # Single-section card — commits only, full width.
             return (
                 f'    <div class="card">\n'
                 f'{commits_section}\n'
@@ -1274,7 +1341,9 @@ class GitStats:
                 f'    </div>'
             )
 
-        # ── PR Merges section ────────────────────────────────────────────────
+        # ── Two-section card — Commits | PR Merges ───────────────────────────
+        commits_section = self._render_bf_section('Commits', 'commits', commit_bf_authors, bus_pct)
+
         if total_merges == 0:
             merges_section = (
                 f'            <div>\n'
@@ -1283,29 +1352,8 @@ class GitStats:
                 f'            </div>'
             )
         else:
-            mplural_s    = 's' if merge_bus_count != 1 else ''
-            mplural_verb = 'account' if merge_bus_count != 1 else 'accounts'
-            merge_rows   = self._render_bf_rows(merge_bf_authors, 'merges')
-            merges_section = (
-                f'            <div>\n'
-                f'                <div class="text-[10px] uppercase font-bold text-slate-400 tracking-widest mb-4">PR Merges</div>\n'
-                f'                <div class="flex items-start gap-6 flex-wrap">\n'
-                f'                    <div class="shrink-0 text-center min-w-[4rem]">\n'
-                f'                        <div class="text-5xl font-black text-slate-900">{merge_bus_count}</div>\n'
-                f'                        <div class="text-[10px] uppercase font-bold text-slate-400 mt-1 tracking-widest">Bus Factor</div>\n'
-                f'                    </div>\n'
-                f'                    <div class="flex-1 min-w-0">\n'
-                f'                        <p class="text-sm text-slate-600 font-medium mb-4">\n'
-                f'                            <strong>{merge_bus_count} contributor{mplural_s}</strong> {mplural_verb} for\n'
-                f'                            {bus_pct}% of all PR merges.\n'
-                f'                        </p>\n'
-                f'{merge_rows}\n'
-                f'                    </div>\n'
-                f'                </div>\n'
-                f'            </div>'
-            )
+            merges_section = self._render_bf_section('PR Merges', 'merges', merge_bf_authors, bus_pct)
 
-        # Two-section card — commits | PR merges side by side.
         return (
             f'    <div class="card">\n'
             f'        <div class="grid grid-cols-1 md:grid-cols-2 gap-8">\n'
@@ -1390,53 +1438,12 @@ class GitStats:
 
         bus_pct = int(self.bus_factor_threshold * 100)
 
-        # Commits bus factor — fewest contributors whose combined commits reach the threshold
-        sorted_by_commits = sorted(
-            self.data['authors'].items(), key=lambda x: x[1]['commits'], reverse=True
-        )
-        total_commits  = sum(a['commits'] for _, a in sorted_by_commits) or 1
-        commit_cutoff  = total_commits * self.bus_factor_threshold
-        running        = 0
-        commit_bf      = []
-        for name, adata in sorted_by_commits:
-            running += adata['commits']
-            commit_bf.append({
-                'name':         name,
-                'count':        adata['commits'],
-                'pct':          round(adata['commits'] / total_commits * 100, 1),
-                'team':         adata.get('team', 'Community'),
-                'team_commits': adata.get('team_commits', {}),
-            })
-            if running >= commit_cutoff:
-                break
-
-        # PR merges bus factor — fewest contributors whose combined merges reach the threshold
-        sorted_by_merges = sorted(
-            self.data['authors'].items(), key=lambda x: x[1].get('merges', 0), reverse=True
-        )
-        total_merges = sum(a.get('merges', 0) for _, a in sorted_by_merges)
-        merge_bf     = []
-        if total_merges > 0:
-            merge_cutoff = total_merges * self.bus_factor_threshold
-            running      = 0
-            for name, adata in sorted_by_merges:
-                m = adata.get('merges', 0)
-                if m == 0:
-                    break
-                running += m
-                merge_bf.append({
-                    'name':  name,
-                    'count': m,
-                    'pct':   round(m / total_merges * 100, 1),
-                    'team':  adata.get('team', 'Community'),
-                })
-                if running >= merge_cutoff:
-                    break
+        commit_bf, _            = self._compute_bus_factor_entries('commits')
+        merge_bf,  total_merges = self._compute_bus_factor_entries('merges')
 
         bus_factor_html = self._render_bus_factor_card(
-            len(commit_bf), commit_bf,
-            len(merge_bf),  merge_bf,
-            total_merges,   bus_pct,
+            commit_bf, merge_bf,
+            total_merges, bus_pct,
             show_merges_section=(self.IMPACT_W_MERGES > 0),
         )
 

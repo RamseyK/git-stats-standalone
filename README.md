@@ -142,8 +142,9 @@ In addition to true merge commits (two or more parents), GitStats detects squash
 - Subject contains `Pull request #`
 - Subject starts with `Merge remote-tracking branch`
 - Subject starts with `Merge branch` but does **not** merge the primary branch back into itself
+- Committer e-mail differs from author e-mail — catches squash merges where the message was edited before landing, which subjects heuristics miss
 
-When `merge_heuristics` is present in config it **replaces** the built-in patterns entirely. Each string is matched as a case-insensitive substring of the commit subject. The primary-branch self-merge exclusion is not applied to custom patterns — only the built-in defaults include that logic.
+When `merge_heuristics` is present in config it **replaces** the built-in patterns entirely (including the committer-differs check). Each string is matched as a case-insensitive substring of the commit subject. The primary-branch self-merge exclusion is not applied to custom patterns — only the built-in defaults include that logic.
 
 ```json
 "merge_heuristics": ["Pull request #", "Merge remote-tracking branch"]
