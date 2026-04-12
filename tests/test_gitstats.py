@@ -1630,11 +1630,11 @@ class TestReleaseTags:
             team_sum = sum(count for _, count in tag['top_teams'])
             assert team_sum == tag['count']
 
-    def test_max_commit_authors_per_tag_default(self, repo_path, tmp_path):
-        """Default max_commit_authors_per_tag must be 20."""
+    def test_max_authors_per_tag_default(self, repo_path, tmp_path):
+        """Default max_authors_per_tag must be 20."""
         cfg = make_config(tmp_path)
         gs = gitstats.GitStats(repo_path, cfg)
-        assert gs.max_commit_authors_per_tag == 20
+        assert gs.max_authors_per_tag == 20
 
     def test_max_teams_per_tag_default(self, repo_path, tmp_path):
         """Default max_teams_per_tag must be 10."""
@@ -1642,11 +1642,11 @@ class TestReleaseTags:
         gs = gitstats.GitStats(repo_path, cfg)
         assert gs.max_teams_per_tag == 10
 
-    def test_max_commit_authors_per_tag_config_override(self, repo_path, tmp_path):
-        """max_commit_authors_per_tag from config must be stored on the instance."""
-        cfg = make_config(tmp_path, max_commit_authors_per_tag=5)
+    def test_max_authors_per_tag_config_override(self, repo_path, tmp_path):
+        """max_authors_per_tag from config must be stored on the instance."""
+        cfg = make_config(tmp_path, max_authors_per_tag=5)
         gs = gitstats.GitStats(repo_path, cfg)
-        assert gs.max_commit_authors_per_tag == 5
+        assert gs.max_authors_per_tag == 5
 
     def test_max_teams_per_tag_config_override(self, repo_path, tmp_path):
         """max_teams_per_tag from config must be stored on the instance."""
@@ -1654,13 +1654,13 @@ class TestReleaseTags:
         gs = gitstats.GitStats(repo_path, cfg)
         assert gs.max_teams_per_tag == 3
 
-    def test_max_commit_authors_per_tag_limits_top_authors(self, repo_path, tmp_path):
-        """Each tag's top_authors list must not exceed max_commit_authors_per_tag entries."""
-        cfg = make_config(tmp_path, max_commit_authors_per_tag=3, max_release_tags=0)
+    def test_max_authors_per_tag_limits_authors(self, repo_path, tmp_path):
+        """Each tag's authors list must not exceed max_authors_per_tag entries."""
+        cfg = make_config(tmp_path, max_authors_per_tag=3, max_release_tags=0)
         gs = gitstats.GitStats(repo_path, cfg)
         gs.collect()
         for tag in gs.data['tags']:
-            assert len(tag['top_authors']) <= 3
+            assert len(tag['authors']) <= 3
 
     def test_max_teams_per_tag_limits_top_teams(self, repo_path, tmp_path):
         """Each tag's top_teams list must not exceed max_teams_per_tag entries."""
@@ -1671,6 +1671,198 @@ class TestReleaseTags:
         gs.collect()
         for tag in gs.data['tags']:
             assert len(tag['top_teams']) <= 2
+
+
+# ---------------------------------------------------------------------------
+# Per-release impact scoring (_score_tag_entities / _compute_tag_impacts)
+# ---------------------------------------------------------------------------
+
+class TestTagImpacts:
+    """Verify per-release impact scoring for authors and teams."""
+
+    @pytest.fixture(scope='class')
+    def gs(self, repo_path, tmp_path_factory):
+        """Minimal GitStats instance (no collect) used to call scoring helpers."""
+        tmp = str(tmp_path_factory.mktemp('tag_impact_cfg'))
+        cfg = make_config(tmp)
+        return gitstats.GitStats(repo_path, cfg)
+
+    _TS = 1_000_000   # arbitrary base timestamp used in author fixtures
+
+    # ── _compute_tag_impacts: return type and structure ──────────────────
+
+    def test_empty_input_returns_empty_list(self, gs):
+        assert gs._compute_tag_impacts({}) == []
+
+    def test_result_is_list_of_dicts_with_required_keys(self, gs):
+        a = {'commits': 1, 'add': 10, 'del': 0, 'first_ts': self._TS, 'last_ts': self._TS}
+        result = gs._compute_tag_impacts({'Alice': a})
+        assert isinstance(result, list)
+        assert len(result) == 1
+        for key in ('name', 'commits', 'eff_lines', 'tenure_days', 'impact'):
+            assert key in result[0], f"Missing key: {key!r}"
+
+    # ── _score_tag_entities: scoring accuracy ────────────────────────────
+
+    def test_single_entity_scores_100(self, gs):
+        """A lone contributor with non-zero values in all active dimensions scores 100."""
+        ts = self._TS
+        a = {'commits': 5, 'add': 100, 'del': 20,
+             'first_ts': ts, 'last_ts': ts + 86400}  # 1 day tenure
+        result = gs._compute_tag_impacts({'Alice': a})
+        assert result[0]['impact'] == 100.0
+
+    def test_top_author_by_all_dimensions_scores_100(self, gs):
+        """Author dominating all three dimensions must score 100."""
+        ts = self._TS
+        authors = {
+            'Alice': {'commits': 10, 'add': 500, 'del': 50,
+                      'first_ts': ts, 'last_ts': ts + 86400 * 10},
+            'Bob':   {'commits': 1,  'add': 5,   'del': 0,
+                      'first_ts': ts, 'last_ts': ts},
+        }
+        result = gs._compute_tag_impacts(authors)
+        assert result[0]['name'] == 'Alice'
+        assert result[0]['impact'] == 100.0
+
+    def test_lower_contributor_scores_below_top(self, gs):
+        ts = self._TS
+        authors = {
+            'Alice': {'commits': 10, 'add': 500, 'del': 0,
+                      'first_ts': ts, 'last_ts': ts + 86400},
+            'Bob':   {'commits': 2,  'add': 50,  'del': 0,
+                      'first_ts': ts, 'last_ts': ts},
+        }
+        result = gs._compute_tag_impacts(authors)
+        assert result[1]['impact'] < result[0]['impact']
+
+    def test_sorted_descending_by_impact(self, gs):
+        ts = self._TS
+        authors = {
+            'Alice':   {'commits': 10, 'add': 500, 'del': 0, 'first_ts': ts, 'last_ts': ts + 86400},
+            'Bob':     {'commits': 5,  'add': 100, 'del': 0, 'first_ts': ts, 'last_ts': ts},
+            'Charlie': {'commits': 1,  'add': 10,  'del': 0, 'first_ts': ts, 'last_ts': ts},
+        }
+        result = gs._compute_tag_impacts(authors)
+        impacts = [r['impact'] for r in result]
+        assert impacts == sorted(impacts, reverse=True)
+
+    def test_eff_lines_uses_net_lines(self, gs):
+        """eff_lines must equal |add - del| when use_net_lines=True (the default)."""
+        assert gs.use_net_lines is True
+        a = {'commits': 1, 'add': 100, 'del': 80, 'first_ts': self._TS, 'last_ts': self._TS}
+        result = gs._compute_tag_impacts({'Alice': a})
+        assert result[0]['eff_lines'] == 20  # |100 - 80|
+
+    def test_commits_field_preserved(self, gs):
+        a = {'commits': 7, 'add': 50, 'del': 10, 'first_ts': self._TS, 'last_ts': self._TS}
+        result = gs._compute_tag_impacts({'Alice': a})
+        assert result[0]['commits'] == 7
+
+    def test_tenure_days_computed_from_first_last_ts(self, gs):
+        ts = self._TS
+        a = {'commits': 5, 'add': 100, 'del': 0, 'first_ts': ts, 'last_ts': ts + 3 * 86400}
+        result = gs._compute_tag_impacts({'Alice': a})
+        assert result[0]['tenure_days'] == 3
+
+    def test_zero_lines_still_scores_on_commits_and_tenure(self, gs):
+        """Author with no lines changed must still receive a non-zero score
+        when wc > 0 and/or wt > 0."""
+        ts = self._TS
+        a = {'commits': 5, 'add': 0, 'del': 0,
+             'first_ts': ts, 'last_ts': ts + 5 * 86400}
+        result = gs._compute_tag_impacts({'Alice': a})
+        assert result[0]['impact'] > 0
+
+    def test_impact_formula_manual_verification(self, gs):
+        """Manually verify the per-release impact formula for two authors.
+
+        With default weights wc=30, wl=30, wt=15 and wm excluded, the active
+        weight sum is 75. scale = 100/75.
+
+        Alice: commits=10, eff_lines=100, tenure=10d → raw = 30 + 30 + 15 = 75
+               impact = 75 * (100/75) = 100.0
+        Bob:   commits=5,  eff_lines=50,  tenure=0d  → raw = 15 + 15 + 0   = 30
+               impact = 30 * (100/75) = 40.0
+        """
+        ts = self._TS
+        authors = {
+            'Alice': {'commits': 10, 'add': 100, 'del': 0,
+                      'first_ts': ts, 'last_ts': ts + 10 * 86400},
+            'Bob':   {'commits': 5,  'add': 50,  'del': 0,
+                      'first_ts': ts, 'last_ts': ts},
+        }
+        result = {r['name']: r for r in gs._compute_tag_impacts(authors)}
+        assert result['Alice']['impact'] == 100.0
+        assert round(result['Bob']['impact'], 1) == 40.0
+
+    # ── _compute_tag_team_impacts ────────────────────────────────────────
+
+    def test_team_impacts_empty_input_returns_empty_dict(self, gs):
+        assert gs._compute_tag_team_impacts({}) == {}
+
+    def test_team_impacts_returns_dict_with_impact_key(self, gs):
+        from collections import defaultdict
+        ts = self._TS
+        tag_teams = defaultdict(lambda: {'commits': 0, 'add': 0, 'del': 0,
+                                         'first_ts': float('inf'), 'last_ts': 0})
+        tag_teams['Core'].update({'commits': 5, 'add': 100, 'del': 0,
+                                   'first_ts': ts, 'last_ts': ts + 86400})
+        result = gs._compute_tag_team_impacts(tag_teams)
+        assert 'Core' in result
+        assert result['Core']['impact'] == 100.0
+
+    # ── Integration: tag data structure ──────────────────────────────────
+
+    def test_tag_authors_have_impact_key(self, std_gs):
+        for tag in std_gs.data['tags']:
+            for a in tag['authors']:
+                assert 'impact' in a, f"Tag {tag['name']!r}: author missing 'impact'"
+
+    def test_tag_authors_sorted_by_impact(self, std_gs):
+        for tag in std_gs.data['tags']:
+            impacts = [a['impact'] for a in tag['authors']]
+            assert impacts == sorted(impacts, reverse=True), \
+                f"Tag {tag['name']!r}: authors not sorted by impact"
+
+    def test_tag_authors_impact_in_0_to_100(self, std_gs):
+        for tag in std_gs.data['tags']:
+            for a in tag['authors']:
+                assert 0.0 <= a['impact'] <= 100.0, \
+                    f"Tag {tag['name']!r}: {a['name']!r} impact {a['impact']} out of range"
+
+    def test_tag_team_impacts_present(self, std_gs):
+        for tag in std_gs.data['tags']:
+            assert 'team_impacts' in tag, f"Tag {tag['name']!r} missing 'team_impacts'"
+
+    def test_tag_team_impacts_keys_match_top_teams(self, std_gs):
+        for tag in std_gs.data['tags']:
+            for team, _ in tag['top_teams']:
+                assert team in tag['team_impacts'], \
+                    f"Tag {tag['name']!r}: {team!r} in top_teams but not in team_impacts"
+
+    def test_tag_top_team_impact_in_0_to_100(self, std_gs):
+        for tag in std_gs.data['tags']:
+            for team in tag['team_impacts'].values():
+                assert 0.0 <= team['impact'] <= 100.0
+
+    # ── HTML output ───────────────────────────────────────────────────────
+
+    def test_html_release_cards_show_impact_badge(self, std_gs, tmp_path_factory):
+        html = generate_html(std_gs, tmp_path_factory, 'tag_impact_html')
+        # Each author entry must have the ⚡ impact badge
+        assert '⚡' in html
+
+    def test_html_release_author_tooltip_contains_commits(self, std_gs, tmp_path_factory):
+        html = generate_html(std_gs, tmp_path_factory, 'tag_tooltip_html')
+        # Author tooltips encode 'Commits:' in the title attribute
+        assert 'Commits:' in html
+
+    def test_html_release_team_chip_tooltip_present(self, std_gs, tmp_path_factory):
+        html = generate_html(std_gs, tmp_path_factory, 'tag_team_tip_html')
+        # Team chip tooltips also encode 'Commits:' in their title attributes
+        # (only when has_teams is True, which it is for std_gs)
+        assert 'Commits:' in html
 
 
 # ---------------------------------------------------------------------------

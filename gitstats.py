@@ -4,6 +4,7 @@
 # ]
 # ///
 
+import html
 import os
 import shutil
 import subprocess
@@ -295,8 +296,8 @@ class GitStats:
             )
 
         # Maximum number of authors/teams shown per release tag on the Releases tab.
-        self.max_commit_authors_per_tag = int(config.get('max_commit_authors_per_tag', 20))
-        self.max_teams_per_tag          = int(config.get('max_teams_per_tag', 10))
+        self.max_authors_per_tag = int(config.get('max_authors_per_tag', 20))
+        self.max_teams_per_tag   = int(config.get('max_teams_per_tag', 10))
 
         # Central data store populated by collect() and consumed by generate_report().
         self.data = {
@@ -753,26 +754,72 @@ class GitStats:
             # For the oldest tag in the list, include all its commits.
             tag_range = tag if i == len(tags) - 1 else f"{tags[i + 1]}..{tag}"
             try:
-                # Include %at (Unix timestamp) so time-ranged team membership is
-                # resolved correctly for each commit within this release range.
-                tag_log = self._run_git(['log', tag_range, '--pretty=format:%at|%an|%ae'])
+                # Include --numstat so per-author line stats are available for
+                # per-release impact scoring alongside commit counts and tenure.
+                tag_log = self._run_git(['log', tag_range, '--numstat',
+                                         '--pretty=format:COMMIT|%at|%an|%ae'])
             except subprocess.CalledProcessError:
                 continue
-            author_counts = Counter()
-            team_counts = Counter()
-            for tag_log_line in tag_log.splitlines():
-                if '|' in tag_log_line:
-                    ts_str, n, e = tag_log_line.split('|', 2)
-                    commit_ts = int(ts_str) if ts_str.isdigit() else 0
-                    canon = self._get_author(n, e)
-                    author_counts[canon] += 1
-                    team_counts[self._get_team(canon, e, commit_ts)] += 1
-            if author_counts:
+
+            # Accumulate per-author and per-team data: commits, line stats,
+            # first/last commit timestamp.
+            tag_authors  = {}    # name → {commits, add, del, first_ts, last_ts}
+            tag_teams    = defaultdict(lambda: {
+                'commits': 0, 'add': 0, 'del': 0,
+                'first_ts': float('inf'), 'last_ts': 0,
+            })
+            current_author = None
+            current_team   = None
+
+            for line in tag_log.splitlines():
+                if line.startswith('COMMIT|'):
+                    parts = line.split('|', 3)
+                    if len(parts) < 4:
+                        continue
+                    _, ts_str, name, email = parts
+                    ts    = int(ts_str) if ts_str.isdigit() else 0
+                    canon = self._get_author(name, email)
+                    team  = self._get_team(canon, email, ts)
+                    current_author = canon
+                    current_team   = team
+                    if canon not in tag_authors:
+                        tag_authors[canon] = {
+                            'commits': 0, 'add': 0, 'del': 0,
+                            'first_ts': ts, 'last_ts': ts,
+                        }
+                    a = tag_authors[canon]
+                    a['commits']  += 1
+                    a['first_ts']  = min(a['first_ts'], ts)
+                    a['last_ts']   = max(a['last_ts'],  ts)
+                    tt = tag_teams[team]
+                    tt['commits']  += 1
+                    tt['first_ts']  = min(tt['first_ts'], ts)
+                    tt['last_ts']   = max(tt['last_ts'],  ts)
+                elif current_author and '\t' in line:
+                    parts = line.split('\t', 2)
+                    if len(parts) >= 2:
+                        try:
+                            add = int(parts[0]) if parts[0] != '-' else 0
+                            dl  = int(parts[1]) if parts[1] != '-' else 0
+                            tag_authors[current_author]['add'] += add
+                            tag_authors[current_author]['del'] += dl
+                            tag_teams[current_team]['add'] += add
+                            tag_teams[current_team]['del'] += dl
+                        except ValueError:
+                            pass
+
+            if tag_authors:
+                ranked       = self._compute_tag_impacts(tag_authors)
+                team_impacts = self._compute_tag_team_impacts(tag_teams)
+                top_teams    = sorted(tag_teams.keys(),
+                                      key=lambda t: tag_teams[t]['commits'],
+                                      reverse=True)[:self.max_teams_per_tag]
                 self.data['tags'].append({
-                    'name': tag,
-                    'count': sum(author_counts.values()),
-                    'top_authors': author_counts.most_common(self.max_commit_authors_per_tag),
-                    'top_teams': team_counts.most_common(self.max_teams_per_tag),
+                    'name':         tag,
+                    'count':        sum(a['commits'] for a in tag_authors.values()),
+                    'authors':      ranked[:self.max_authors_per_tag],
+                    'top_teams':    [(t, tag_teams[t]['commits']) for t in top_teams],
+                    'team_impacts': team_impacts,
                 })
 
         self._compute_impact()
@@ -997,6 +1044,73 @@ class GitStats:
 
     # ------------------------------------------------------------------ HTML helpers
 
+    def _score_tag_entities(self, entities: dict) -> dict:
+        """Compute per-release impact scores for a dict of authors or teams.
+
+        Both callers (_compute_tag_impacts and _compute_tag_team_impacts) share
+        the same schema: {name: {'commits', 'add', 'del', 'first_ts', 'last_ts'}}.
+        Uses the configured commits, lines, and tenure weights normalized within
+        the release.  The merges dimension is excluded — it is not tracked per
+        release range.
+
+        Returns:
+            {name: {'commits', 'eff_lines', 'tenure_days', 'impact'}}
+        """
+        wc = self.IMPACT_W_COMMITS
+        wl = self.IMPACT_W_LINES
+        wt = self.IMPACT_W_TENURE
+        active_w = (wc if wc > 0 else 0) + (wl if wl > 0 else 0) + (wt if wt > 0 else 0)
+        scale = (100.0 / active_w) if active_w > 0 else 0.0
+
+        eff_map = {
+            name: abs(e['add'] - e['del']) if self.use_net_lines else (e['add'] + e['del'])
+            for name, e in entities.items()
+        }
+
+        max_c = (max(e['commits'] for e in entities.values()) or 1) if wc > 0 else 1
+        max_k = (max(eff_map.values()) or 1)                        if wl > 0 else 1
+        max_d = (max((e['last_ts'] - e['first_ts']) // self._SECS_PER_DAY
+                     for e in entities.values()) or 1)              if wt > 0 else 1
+
+        results = {}
+        for name, e in entities.items():
+            tenure = (e['last_ts'] - e['first_ts']) // self._SECS_PER_DAY
+            raw = (
+                ((e['commits']  / max_c) * wc if wc > 0 else 0.0) +
+                ((eff_map[name] / max_k) * wl if wl > 0 else 0.0) +
+                ((tenure        / max_d) * wt if wt > 0 else 0.0)
+            )
+            results[name] = {
+                'commits':     e['commits'],
+                'eff_lines':   int(eff_map[name]),
+                'tenure_days': tenure,
+                'impact':      round(raw * scale, 1),
+            }
+        return results
+
+    def _compute_tag_impacts(self, tag_authors: dict) -> list:
+        """Score per-release authors by impact and return a list sorted descending.
+
+        Each entry has keys: 'name', 'commits', 'eff_lines', 'tenure_days', 'impact'.
+        Returns an empty list when tag_authors is empty.
+        """
+        if not tag_authors:
+            return []
+        scored = self._score_tag_entities(tag_authors)
+        results = [{'name': name, **data} for name, data in scored.items()]
+        results.sort(key=lambda x: x['impact'], reverse=True)
+        return results
+
+    def _compute_tag_team_impacts(self, tag_teams: dict) -> dict:
+        """Score per-release teams by impact and return a {team: data} dict.
+
+        Each value has keys: 'commits', 'eff_lines', 'tenure_days', 'impact'.
+        Returns an empty dict when tag_teams is empty.
+        """
+        if not tag_teams:
+            return {}
+        return self._score_tag_entities(tag_teams)
+
     def _render_tags_html(self):
         """Return an HTML string of release cards for the Releases tab.
 
@@ -1009,32 +1123,54 @@ class GitStats:
                     'No tags found in this repository.</div>')
         parts = []
         _release_medals = ['🥇', '🥈', '🥉']
+        _merges_excluded = self.IMPACT_W_MERGES > 0
+
+        def _author_prefix(i):
+            if i < 3:
+                return f'<span class="mr-1">{_release_medals[i]}</span>{i + 1}. '
+            return f'{i + 1}. '
+
+        def _impact_tooltip(label, data):
+            """Build an HTML-escaped title attribute for an author or team entry."""
+            days   = data['tenure_days']
+            plural = 's' if days != 1 else ''
+            note   = '&#10;(merges not tracked per release)' if _merges_excluded else ''
+            return (
+                f'{html.escape(label)}&#10;'
+                f'Commits: {data["commits"]:,}&#10;'
+                f'Lines: {data["eff_lines"]:,}&#10;'
+                f'Tenure: {days} day{plural}'
+                f'{note}'
+            )
+
         for t in self.data['tags']:
-            def _author_prefix(i):
-                if i < 3:
-                    return f'<span class="mr-1">{_release_medals[i]}</span>{i + 1}. '
-                return f'{i + 1}. '
             author_items = ''.join([
                 f'<div class="flex justify-between items-center text-sm bg-slate-50 p-2 rounded-xl '
                 f'border border-transparent hover:border-slate-200 transition-all">'
-                f'<span class="truncate font-bold text-slate-600">{_author_prefix(i)}{auth}</span>'
-                f'<b class="text-blue-600 ml-2 shrink-0">{count}</b></div>'
-                for i, (auth, count) in enumerate(t['top_authors'])
+                f'<span class="truncate font-bold text-slate-600 cursor-default"'
+                f' title="{_impact_tooltip(a["name"], a)}">{_author_prefix(i)}{html.escape(a["name"])}</span>'
+                f'<b class="text-blue-600 ml-2 shrink-0">⚡{a["impact"]}</b></div>'
+                for i, a in enumerate(t['authors'])
             ])
             # Only render team badges when teams are explicitly configured.
             # With no teams, every commit maps to "Community", which adds no signal.
-            team_badges = ''.join([
-                f'<span class="inline-flex items-center gap-1.5 text-[10px] px-2.5 py-1 rounded-lg font-black uppercase" '
-                f'style="background:{self.team_colors.get(team, self._DEFAULT_TEAM_COLOR)}18;'
-                f'color:{self.team_colors.get(team, self._DEFAULT_TEAM_COLOR)}">'
-                f'{team}'
-                f'<span class="opacity-60">·</span>'
-                f'<span>{count} commits</span>'
-                f'<span class="opacity-60">·</span>'
-                f'<span class="bg-white/60 rounded px-1 py-px">⚡ {self.data["teams"].get(team, {}).get("impact", 0)}</span>'
-                f'</span>'
-                for team, count in t['top_teams']
-            ]) if self.has_teams else ''
+            if self.has_teams:
+                team_impacts = t.get('team_impacts', {})
+                team_badges = ''.join([
+                    f'<span class="inline-flex items-center gap-1.5 text-[10px] px-2.5 py-1 rounded-lg font-black uppercase cursor-default"'
+                    f' title="{_impact_tooltip(team, team_impacts[team]) if team in team_impacts else html.escape(team)}"'
+                    f' style="background:{self.team_colors.get(team, self._DEFAULT_TEAM_COLOR)}18;'
+                    f'color:{self.team_colors.get(team, self._DEFAULT_TEAM_COLOR)}">'
+                    f'{team}'
+                    f'<span class="opacity-60">·</span>'
+                    f'<span>{count} commits</span>'
+                    f'<span class="opacity-60">·</span>'
+                    f'<span class="bg-white/60 rounded px-1 py-px">⚡ {team_impacts.get(team, {}).get("impact", 0)}</span>'
+                    f'</span>'
+                    for team, count in t['top_teams']
+                ])
+            else:
+                team_badges = ''
             parts.append(f'''
             <div class="card group">
                 <div class="flex flex-col md:flex-row justify-between items-start md:items-center gap-4 mb-6 border-b border-slate-100 pb-6">

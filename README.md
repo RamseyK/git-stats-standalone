@@ -125,7 +125,7 @@ All configuration lives in a single JSON file. Every key is optional.
 |-----|---------|-------------|
 | `release_tag_prefix` | `""` | Only tags whose name starts with this prefix appear in the Releases tab. `"v"` includes `v1.0` but excludes `nightly-20240101`. An empty string includes all tags. |
 | `max_release_tags` | `20` | Maximum number of release tags to display, taken from the most recent. `0` shows all tags. |
-| `max_commit_authors_per_tag` | `20` | Maximum number of authors shown in the per-release breakdown on the Releases tab. |
+| `max_authors_per_tag` | `20` | Maximum number of authors shown in the per-release breakdown on the Releases tab. |
 | `max_teams_per_tag` | `10` | Maximum number of teams shown in the per-release breakdown on the Releases tab. |
 | `primary_branch` | `"develop"` | Name of the primary branch. Pull requests merged into this branch are counted toward each committer's PR Merges impact dimension. |
 | `summary_velocity_days` | `[30, 90]` | Day windows shown as velocity cards on the Summary tab. Each entry produces one card comparing commits in the last N days against the prior N days. |
