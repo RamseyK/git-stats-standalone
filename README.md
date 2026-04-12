@@ -1,6 +1,6 @@
-# GitStats
+# Git Stats Standalone
 
-A Python script that analyzes a Git repository and generates a self-contained HTML statistics report viewable offline in any browser.
+A Python script that analyzes a Git repository and generates a self-contained HTML statistics report viewable offline in any browser. The most important design principal of this project: All computed statistics and scoring **must** serve a purpose to help highlight the actual impact of contributors (and optionally their teams) make on a codebase. All metrics added must assist in measuring true impact, effort, and expertise of contributors to a codebase (based on git history).
 
 ## Primary Metrics
 
@@ -38,32 +38,6 @@ python gitstats.py -s ~/projects/myrepo -c config.json -o report.html \
 On success, `tailwind.js` and `chart.js` are copied from the externals directory into the same directory as the output HTML so the report works fully offline or from a self-hosted webserver.
 
 Running without `-c` is fully supported. All settings use built-in defaults: every author is shown under a single **Community** label, no aliases are resolved, and all impact weights and noise-reduction settings use the values documented in [Impact Score](#impact-score).
-
-## Support Repositories
-
-Some projects spread their work across multiple Git repositories — a main repo and separate repos for recipes, tools, tests, or packaging. The `-support` flag folds those additional histories into a single unified report. It may be repeated for any number of additional repositories.
-
-### What merges across all repositories
-
-| Data | Behavior |
-|------|----------|
-| Author commit counts | Combined — each commit in any repo is credited to the resolved canonical author |
-| Author line stats | Combined — additions and deletions accumulate across all repos |
-| Team attribution | Combined — the same config teams and aliases apply to all repos |
-| Hourly punchcard | Combined |
-| Monthly commit activity | Combined |
-| Impact scoring | Computed over the combined author and team data |
-
-### What stays main-repository-only
-
-| Data | Reason |
-|------|--------|
-| Components tab | Each repo gets its own component chart card (main repo first, support repos below) |
-| Release tags | Tag names and release ranges are specific to the main repo's version history |
-| File count | Reflects the current tracked files in the main repo |
-| Repo age | Derived from the oldest and newest commit in the main repo |
-
-The Components tab shows a separate churn chart for each repository. The main repo card appears first; each support repo card is labeled **Support Repository**. Clicking any bar on any card filters the Authors table to contributors who touched that component.
 
 ## Configuration
 
@@ -151,6 +125,8 @@ When `merge_heuristics` is present in config it **replaces** the built-in patter
 ```
 
 Set to an empty array `[]` to count only true merge commits (two-parent merges) and ignore all subject-based detection.
+
+**Line count exclusion:** any commit identified as a merge — true or heuristic — has its line additions and deletions excluded from all author and team metrics. Component churn is still tracked. See [Noise filtering — Step 0](#noise-filtering) for the full rationale.
 
 #### Component markers
 
@@ -257,7 +233,21 @@ Each metric is normalized against the top performer in that dimension. The final
 
 ### Noise filtering
 
-Raw line counts from `git log --numstat` overcount meaningless work. The effective lines metric applies a three-step pipeline before scoring.
+Raw line counts from `git log --numstat` overcount meaningless work. The effective lines metric applies a four-step pipeline before scoring.
+
+**Step 0 — Merge commit exclusion** (always on): Any commit identified as a merge — true (two or more parents) or heuristic (matched by `merge_heuristics`) — has its line additions and deletions excluded entirely from all author and team metrics before any other filtering takes place. This applies to add/del totals, the lines dimension of the impact score, and the LOC history chart.
+
+A merge commit's diff is not original work. It is one of three things:
+
+- **Conflict resolution** — lines produced mechanically by reconciling two diverging histories, not written by the author. A large conflict can add thousands of lines that belong to the commits being merged, not to the person resolving the conflict.
+- **A duplicate of already-counted work** — in a `--no-ff` merge the parent commits already contain the changes; counting the merge commit's diff would double-count every line that came through a feature branch.
+- **A sync commit** — when a developer pulls the primary branch into their feature branch (`Merge branch 'main' into feature/x`), the diff represents other people's commits being incorporated. Attributing those lines to the feature branch author misrepresents who did the work.
+
+All three cases would inflate the lines dimension for authors who merge frequently, rewarding integration activity instead of original contribution. Excluding merge lines ensures the metric reflects code that the author actually wrote.
+
+Component churn is still tracked for merge commits — file activity is real regardless of authorship credit, and the Components tab is meant to show where the codebase is changing, not to rank individual contributions.
+
+See [Merge heuristics](#merge-heuristics) for details on how merges are detected and how to customize the patterns.
 
 **Step 1 — Net lines** (`impact_use_net_lines`, default `true`): Each commit contributes `|adds − dels|` rather than `adds + dels`. A reformatting pass that deletes and re-adds 10,000 lines scores near zero.
 
@@ -298,6 +288,32 @@ The same weights can also be changed permanently by editing the class constants 
 - **Set `impact_use_net_lines: false`** if gross volume is genuinely meaningful (e.g., large automated test generation).
 - **Lower `impact_line_cap_percentile`** (e.g., `80`) for tighter outlier control; `0` to disable.
 - **Lower `impact_wash_window_days`** (e.g., `3`) for high-frequency repos where revert pairs happen within days.
+
+## Support Repositories
+
+Some projects spread their work across multiple Git repositories — a main repo and separate repos for recipes, tools, tests, or packaging. The `-support` flag folds those additional histories into a single unified report. It may be repeated for any number of additional repositories.
+
+### Metrics computed across all repositories (main and support git repositories)
+
+| Data | Behavior |
+|------|----------|
+| Author commit counts | Combined — each commit in any repo is credited to the resolved canonical author |
+| Author line stats | Combined — additions and deletions accumulate across all repos |
+| Team attribution | Combined — the same config teams and aliases apply to all repos |
+| Hourly punchcard | Combined |
+| Monthly commit activity | Combined |
+| Impact scoring | Computed over the combined author and team data |
+
+### Metrics computed for main repository only
+
+| Data | Reason |
+|------|--------|
+| Components tab | Each repo gets its own component chart card (main repo first, support repos below) |
+| Release tags | Tag names and release ranges are specific to the main repo's version history |
+| File count | Reflects the current tracked files in the main repo |
+| Repo age | Derived from the oldest and newest commit in the main repo |
+
+The Components tab shows a separate churn chart for each repository. The main repo card appears first; each support repo card is labeled **Support Repository**. Clicking any bar on any card filters the Authors table to contributors who touched that component.
 
 ## Potential Shortfalls
 

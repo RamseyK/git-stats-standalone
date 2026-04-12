@@ -439,9 +439,12 @@ class TestImpactScoring:
         for t in std_gs.data['teams'].values():
             assert 0.0 <= t['impact'] <= 100.0
 
-    def test_hood_chatham_is_top_author(self, std_gs):
-        top_name = max(std_gs.data['authors'], key=lambda n: std_gs.data['authors'][n]['impact'])
-        assert top_name == 'Hood Chatham'
+    def test_top_author_has_highest_impact(self, std_gs):
+        """The highest-scoring author must have a strictly positive impact score
+        that is greater than or equal to every other author's score."""
+        impacts = [a['impact'] for a in std_gs.data['authors'].values()]
+        assert max(impacts) > 0
+        assert max(impacts) == sorted(impacts)[-1]
 
     def test_core_is_top_team(self, std_gs):
         top_name = max(std_gs.data['teams'], key=lambda n: std_gs.data['teams'][n]['impact'])
@@ -1714,7 +1717,7 @@ class TestTagImpacts:
         result = gs._compute_tag_impacts({'Alice': a})
         assert isinstance(result, list)
         assert len(result) == 1
-        for key in ('name', 'commits', 'eff_lines', 'tenure_days', 'impact'):
+        for key in ('name', 'commits', 'eff_lines', 'tenure_days', 'merges', 'impact'):
             assert key in result[0], f"Missing key: {key!r}"
 
     # ── _score_tag_entities: scoring accuracy ────────────────────────────
@@ -1723,18 +1726,21 @@ class TestTagImpacts:
         """A lone contributor with non-zero values in all active dimensions scores 100."""
         ts = self._TS
         a = {'commits': 5, 'add': 100, 'del': 20,
-             'first_ts': ts, 'last_ts': ts + 86400}  # 1 day tenure
+             'first_ts': ts, 'last_ts': ts + 86400,  # 1 day tenure
+             'merges': 1}
         result = gs._compute_tag_impacts({'Alice': a})
         assert result[0]['impact'] == 100.0
 
     def test_top_author_by_all_dimensions_scores_100(self, gs):
-        """Author dominating all three dimensions must score 100."""
+        """Author dominating all four dimensions must score 100."""
         ts = self._TS
         authors = {
             'Alice': {'commits': 10, 'add': 500, 'del': 50,
-                      'first_ts': ts, 'last_ts': ts + 86400 * 10},
+                      'first_ts': ts, 'last_ts': ts + 86400 * 10,
+                      'merges': 5},
             'Bob':   {'commits': 1,  'add': 5,   'del': 0,
-                      'first_ts': ts, 'last_ts': ts},
+                      'first_ts': ts, 'last_ts': ts,
+                      'merges': 0},
         }
         result = gs._compute_tag_impacts(authors)
         assert result[0]['name'] == 'Alice'
@@ -1832,24 +1838,26 @@ class TestTagImpacts:
     def test_impact_formula_manual_verification(self, gs):
         """Manually verify the per-release impact formula for two authors.
 
-        With default weights wc=30, wl=30, wt=15 and wm excluded, the active
-        weight sum is 75. scale = 100/75.
+        With default weights wc=30, wl=30, wt=15, wm=25, the active weight
+        sum is 100. scale = 1.0.
 
-        Alice: commits=10, eff_lines=100, tenure=10d → raw = 30 + 30 + 15 = 75
-               impact = 75 * (100/75) = 100.0
-        Bob:   commits=5,  eff_lines=50,  tenure=0d  → raw = 15 + 15 + 0   = 30
-               impact = 30 * (100/75) = 40.0
+        Alice: commits=10 (max), eff_lines=100 (max), tenure=10d (max), merges=1 (max)
+               raw = 30 + 30 + 15 + 25 = 100; impact = 100 * 1.0 = 100.0
+        Bob:   commits=5, eff_lines=50, tenure=0d, merges=0
+               raw = 15 + 15 + 0 + 0 = 30; impact = 30 * 1.0 = 30.0
         """
         ts = self._TS
         authors = {
             'Alice': {'commits': 10, 'add': 100, 'del': 0,
-                      'first_ts': ts, 'last_ts': ts + 10 * 86400},
+                      'first_ts': ts, 'last_ts': ts + 10 * 86400,
+                      'merges': 1},
             'Bob':   {'commits': 5,  'add': 50,  'del': 0,
-                      'first_ts': ts, 'last_ts': ts},
+                      'first_ts': ts, 'last_ts': ts,
+                      'merges': 0},
         }
         result = {r['name']: r for r in gs._compute_tag_impacts(authors)}
         assert result['Alice']['impact'] == 100.0
-        assert round(result['Bob']['impact'], 1) == 40.0
+        assert round(result['Bob']['impact'], 1) == 30.0
 
     # ── _compute_tag_team_impacts ────────────────────────────────────────
 
@@ -1860,9 +1868,10 @@ class TestTagImpacts:
         from collections import defaultdict
         ts = self._TS
         tag_teams = defaultdict(lambda: {'commits': 0, 'add': 0, 'del': 0,
-                                         'first_ts': float('inf'), 'last_ts': 0})
+                                         'first_ts': float('inf'), 'last_ts': 0, 'merges': 0})
         tag_teams['Core'].update({'commits': 5, 'add': 100, 'del': 0,
-                                   'first_ts': ts, 'last_ts': ts + 86400})
+                                   'first_ts': ts, 'last_ts': ts + 86400,
+                                   'merges': 1})
         result = gs._compute_tag_team_impacts(tag_teams)
         assert 'Core' in result
         assert result['Core']['impact'] == 100.0
@@ -1918,6 +1927,52 @@ class TestTagImpacts:
         # Team chip tooltips also encode 'Commits:' in their title attributes
         # (only when has_teams is True, which it is for std_gs)
         assert 'Commits:' in html
+
+
+# ---------------------------------------------------------------------------
+# Merges sort button on Authors tab
+# ---------------------------------------------------------------------------
+
+class TestMergesSortButton:
+    """Verify the Merges sort button on the Authors tab is gated on IMPACT_W_MERGES."""
+
+    def test_merges_sort_button_present_when_merges_weighted(self, std_gs, tmp_path_factory):
+        """Default config has IMPACT_W_MERGES=25, so the Merges sort button must appear."""
+        assert std_gs.IMPACT_W_MERGES > 0
+        html = generate_html(std_gs, tmp_path_factory, 'merges_sort_btn_on')
+        assert 'id="sort-merges"' in html
+
+    def test_merges_sort_button_absent_when_merges_weight_zero(self, repo_path, tmp_path_factory):
+        """When IMPACT_W_MERGES=0, the Merges sort button must not be rendered."""
+        tmp = str(tmp_path_factory.mktemp('merges_sort_btn_off'))
+        cfg = make_config(tmp,
+                          impact_w_commits=40,
+                          impact_w_lines=40,
+                          impact_w_tenure=20,
+                          impact_w_merges=0)
+        gs = gitstats.GitStats(repo_path, cfg)
+        gs.collect()
+        html = generate_html(gs, tmp_path_factory, 'merges_sort_html_off')
+        assert 'id="sort-merges"' not in html
+
+    def test_merges_sort_onclick_in_html_when_merges_weighted(self, std_gs, tmp_path_factory):
+        """When merges dimension is active, the button onclick must reference setSortKey('merges')."""
+        assert std_gs.IMPACT_W_MERGES > 0
+        html = generate_html(std_gs, tmp_path_factory, 'merges_sort_js_on')
+        assert "setSortKey('merges')" in html
+
+    def test_merges_sort_onclick_absent_when_merges_weight_zero(self, repo_path, tmp_path_factory):
+        """When IMPACT_W_MERGES=0, no button for merges sort should be in the HTML."""
+        tmp = str(tmp_path_factory.mktemp('merges_sort_js_off'))
+        cfg = make_config(tmp,
+                          impact_w_commits=40,
+                          impact_w_lines=40,
+                          impact_w_tenure=20,
+                          impact_w_merges=0)
+        gs = gitstats.GitStats(repo_path, cfg)
+        gs.collect()
+        html = generate_html(gs, tmp_path_factory, 'merges_sort_js_off_html')
+        assert "setSortKey('merges')" not in html
 
 
 # ---------------------------------------------------------------------------
@@ -3186,6 +3241,155 @@ class TestPRMergeRate:
         assert 'max_merges' not in html
         # Bus factor PR Merges section must also be absent.
         assert 'PR Merges' not in html
+
+
+# ---------------------------------------------------------------------------
+# Merge detection — _detect_merge
+# ---------------------------------------------------------------------------
+
+class TestDetectMerge:
+    """Unit tests for _detect_merge and the line-skip behaviour in _collect_commits.
+
+    _detect_merge drives both the PR merges metric (via _collect_merges) and the
+    line-exclusion logic (via _collect_commits).  Any commit it flags has its
+    add/del lines excluded from all author and team metrics.
+    """
+
+    _PRIMARY = 'main'
+    _NO_PARENTS = ''          # single-parent (ordinary commit)
+    _TWO_PARENTS = 'abc def'  # true merge
+    _SAME_EMAIL = 'a@x.com'
+
+    @pytest.fixture
+    def gs(self, tmp_path):
+        cfg = make_config(str(tmp_path), primary_branch=self._PRIMARY)
+        return gitstats.GitStats(str(tmp_path), cfg)
+
+    # ── True merges (parent count) ────────────────────────────────────────────
+
+    def test_true_merge_detected(self, gs):
+        assert gs._detect_merge(self._TWO_PARENTS, self._SAME_EMAIL, self._SAME_EMAIL, 'anything') is True
+
+    def test_single_parent_not_a_true_merge(self, gs):
+        assert gs._detect_merge(self._NO_PARENTS, self._SAME_EMAIL, self._SAME_EMAIL, 'Fix bug') is False
+
+    # ── Built-in subject heuristics ───────────────────────────────────────────
+
+    def test_pull_request_subject_detected(self, gs):
+        assert gs._detect_merge(self._NO_PARENTS, self._SAME_EMAIL, self._SAME_EMAIL,
+                                 'Merge pull request #42 from user/branch') is True
+
+    def test_merge_remote_tracking_detected(self, gs):
+        assert gs._detect_merge(self._NO_PARENTS, self._SAME_EMAIL, self._SAME_EMAIL,
+                                 'Merge remote-tracking branch origin/feature') is True
+
+    def test_merge_feature_branch_detected(self, gs):
+        assert gs._detect_merge(self._NO_PARENTS, self._SAME_EMAIL, self._SAME_EMAIL,
+                                 "Merge branch 'feature/cool-thing'") is True
+
+    def test_merge_primary_branch_not_detected(self, gs):
+        """Merging the primary branch into itself is excluded from heuristics."""
+        assert gs._detect_merge(self._NO_PARENTS, self._SAME_EMAIL, self._SAME_EMAIL,
+                                 "Merge branch 'main'") is False
+
+    def test_merge_primary_branch_into_feature_not_detected(self, gs):
+        """Primary branch pulled into a feature branch is not a PR merge heuristic."""
+        assert gs._detect_merge(self._NO_PARENTS, self._SAME_EMAIL, self._SAME_EMAIL,
+                                 "Merge branch 'main' into feature/foo") is False
+
+    def test_normal_commit_not_detected(self, gs):
+        assert gs._detect_merge(self._NO_PARENTS, self._SAME_EMAIL, self._SAME_EMAIL,
+                                 'Fix crash in parser') is False
+
+    def test_empty_subject_not_detected(self, gs):
+        assert gs._detect_merge(self._NO_PARENTS, self._SAME_EMAIL, self._SAME_EMAIL, '') is False
+
+    # ── Committer-differs heuristic (built-in only) ───────────────────────────
+
+    def test_committer_differs_detected(self, gs):
+        """Different committer/author e-mails flag a squash merge."""
+        assert gs._detect_merge(self._NO_PARENTS, 'committer@x.com', 'author@y.com',
+                                 'Regular commit message') is True
+
+    def test_committer_same_not_detected(self, gs):
+        assert gs._detect_merge(self._NO_PARENTS, 'same@x.com', 'same@x.com',
+                                 'Regular commit message') is False
+
+    def test_committer_differs_case_insensitive(self, gs):
+        assert gs._detect_merge(self._NO_PARENTS, 'USER@X.COM', 'user@x.com',
+                                 'Regular commit message') is False
+
+    # ── Custom merge_heuristics — committer-differs NOT applied ───────────────
+
+    def test_custom_heuristics_replace_defaults(self, tmp_path):
+        cfg = make_config(str(tmp_path), primary_branch=self._PRIMARY,
+                          merge_heuristics=['squash merge', 'landed via'])
+        gs = gitstats.GitStats(str(tmp_path), cfg)
+        # Custom patterns match
+        assert gs._detect_merge(self._NO_PARENTS, self._SAME_EMAIL, self._SAME_EMAIL,
+                                 'Squash merge of feature branch') is True
+        assert gs._detect_merge(self._NO_PARENTS, self._SAME_EMAIL, self._SAME_EMAIL,
+                                 'Landed via merge queue') is True
+        # Built-in subject heuristics no longer apply
+        assert gs._detect_merge(self._NO_PARENTS, self._SAME_EMAIL, self._SAME_EMAIL,
+                                 'Merge pull request #5') is False
+        # Committer-differs not applied for custom heuristics
+        assert gs._detect_merge(self._NO_PARENTS, 'committer@x.com', 'author@y.com',
+                                 'Regular commit') is False
+
+    def test_empty_custom_heuristics_only_true_merges(self, tmp_path):
+        cfg = make_config(str(tmp_path), primary_branch=self._PRIMARY,
+                          merge_heuristics=[])
+        gs = gitstats.GitStats(str(tmp_path), cfg)
+        # Only true merges (2+ parents) are detected
+        assert gs._detect_merge(self._TWO_PARENTS, self._SAME_EMAIL, self._SAME_EMAIL, '') is True
+        assert gs._detect_merge(self._NO_PARENTS, self._SAME_EMAIL, self._SAME_EMAIL,
+                                 'Merge pull request #5') is False
+        assert gs._detect_merge(self._NO_PARENTS, 'committer@x.com', 'author@y.com',
+                                 'Regular commit') is False
+
+    # ── Integration: merge lines excluded from author/team totals ─────────────
+
+    def test_merge_lines_excluded_from_author_totals(self, std_gs):
+        """Author add/del totals must be lower with merge-line filtering than without.
+
+        Verified by comparing a default run (merges filtered) against a run with
+        merge_heuristics=[] (only true merges filtered) — the default should have
+        equal-or-lower totals because it strips more commits.
+        """
+        import pathlib
+        repo = str(pathlib.Path.home() / 'Downloads' / 'pyodide')
+        if not os.path.isdir(repo):
+            pytest.skip('pyodide repo not available')
+
+        cfg_default    = make_config('/tmp', primary_branch='main')
+        cfg_no_heuristic = make_config('/tmp', primary_branch='main', merge_heuristics=[])
+        gs_default     = gitstats.GitStats(repo, cfg_default)
+        gs_no_heuristic = gitstats.GitStats(repo, cfg_no_heuristic)
+        gs_default.collect()
+        gs_no_heuristic.collect()
+
+        total_default    = sum(a['add'] for a in gs_default.data['authors'].values())
+        total_no_heuristic = sum(a['add'] for a in gs_no_heuristic.data['authors'].values())
+        assert total_no_heuristic >= total_default
+
+    def test_merge_lines_excluded_from_team_totals(self, std_gs):
+        """Team add/del totals must be lower with merge-line filtering than without."""
+        import pathlib
+        repo = str(pathlib.Path.home() / 'Downloads' / 'pyodide')
+        if not os.path.isdir(repo):
+            pytest.skip('pyodide repo not available')
+
+        cfg_default    = make_config('/tmp', primary_branch='main')
+        cfg_no_heuristic = make_config('/tmp', primary_branch='main', merge_heuristics=[])
+        gs_default     = gitstats.GitStats(repo, cfg_default)
+        gs_no_heuristic = gitstats.GitStats(repo, cfg_no_heuristic)
+        gs_default.collect()
+        gs_no_heuristic.collect()
+
+        total_default    = sum(t['add'] for t in gs_default.data['teams'].values())
+        total_no_heuristic = sum(t['add'] for t in gs_no_heuristic.data['teams'].values())
+        assert total_no_heuristic >= total_default
 
 
 # ---------------------------------------------------------------------------

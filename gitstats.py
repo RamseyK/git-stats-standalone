@@ -35,53 +35,7 @@ class GitStats:
       - Release/tag breakdown by author and team
       - Component churn chart (click to filter by component)
 
-    Config file format:
-    {
-      "release_tag_prefix": "v",
-      "max_release_tags": 50,
-      "teams": {
-        "Team Name": {
-          "color": "#3b82f6",
-          "members": [
-            "always member name",        // plain string → no time bounds
-            "always@email.com",
-            {"name": "Jane Smith", "from": "2021-01-01", "to": "2022-12-31"},
-            {"name": "bob@example.com", "from": "2023-06-01"}  // no end date
-          ]
-        }
-      },
-      "aliases": {
-        "Canonical Name": ["alias", "old@email.com", ...]
-      },
-
-      // Impact score noise-reduction options (all optional, defaults shown):
-      "impact_use_net_lines": true,
-        // true  → each commit contributes abs(adds - dels) to the lines metric.
-        //         A reformatting commit that deletes and re-adds 10,000 lines
-        //         scores near zero instead of 20,000 gross lines.
-        // false → use raw adds + dels (original behavior).
-
-      "impact_wash_window_days": 7,
-        // Group each author's commits into non-overlapping N-day buckets.
-        // If a bucket's raw gross lines exceed impact_wash_min_gross AND
-        // at least 40% of the changes cancel out (e.g., mass delete on Monday,
-        // mass re-add on Friday), the bucket scores only its net |adds - dels|.
-        // Set to 0 to disable this check entirely.
-
-      "impact_wash_min_gross": 200,
-        // Minimum gross lines in a time bucket to trigger wash detection.
-        // Prevents small day-to-day edits from being mistakenly zeroed out.
-
-      "impact_line_cap_percentile": 95
-        // Cap each commit's effective line contribution at this percentile
-        // of all commits in the repo. A one-time 500,000-line import won't
-        // drown out years of regular work. Set to 0 to disable.
-    }
-
-    Members in "teams" are matched against git author names and emails.
-    "color" is optional; teams without one are assigned a color from the palette.
-    "aliases" merges multiple identities into a single canonical name.
-    Authors not assigned to any team appear under "Community".
+    See README.md for full configuration reference.
     """
 
     # ── Impact score weights ─────────────────────────────────────────────────────
@@ -265,25 +219,12 @@ class GitStats:
         # Each string is matched as a case-insensitive substring of the subject.
         # None means use the built-in defaults (pull request #, merge remote-tracking
         # branch, merge branch) which include primary-branch exclusion logic.
+        # Any commit identified as a merge — true or heuristic — also has its line
+        # counts excluded from all author/team metrics.
         raw_h = config.get('merge_heuristics', None)
         self.merge_heuristics = (
             None if raw_h is None
             else [s.lower() for s in raw_h]
-        )
-
-        # Patterns identifying commits whose line counts should be excluded from
-        # all metrics (add/del totals, commit_lines for impact scoring, LOC history).
-        # Matched case-insensitively as substrings of the commit subject.
-        # None means use the built-in defaults, which discard line counts for:
-        #   • commits containing "merge conflict"
-        #   • commits merging the primary branch back into another branch
-        #     (e.g. "Merge branch 'main'" / "Merge remote-tracking branch 'origin/main'")
-        # These are sync/conflict-resolution commits whose diffs do not represent
-        # original work by the author.  Set to [] to disable all filtering.
-        raw_um = config.get('useless_merge_heuristics', None)
-        self.useless_merge_heuristics = (
-            None if raw_um is None
-            else [s.lower() for s in raw_um]
         )
 
         # ── Impact score weights (config-overridable) ─────────────────────────
@@ -419,37 +360,52 @@ class GitStats:
 
     # ------------------------------------------------------------------ collect
 
-    def _is_useless_merge(self, subject: str) -> bool:
-        """Return True when a commit's line counts should be excluded from all metrics.
+    def _detect_merge(self, parents_str: str, c_email: str, a_email: str, subject: str) -> bool:
+        """Return True when a commit should be treated as a merge.
 
-        Matches case-insensitively against the lowercased subject.  When
-        useless_merge_heuristics is None the built-in defaults are used:
-          • Subject contains 'merge conflict'
-          • Subject matches 'merge branch '<primary_branch>'' — the primary branch
-            being pulled into another branch to resolve conflicts
-          • Subject matches 'merge remote-tracking branch 'origin/<primary_branch>''
-        When useless_merge_heuristics is a list (including empty) it replaces the
-        built-in defaults entirely.
+        Used both to credit the merges dimension (via _collect_merges) and to
+        suppress line counting in _collect_commits.  Any commit identified here
+        has its add/del lines excluded from all author and team metrics.
+
+        Args:
+            parents_str: Space-separated parent hashes from %P.
+            c_email:     Committer email (%ce).
+            a_email:     Author email (%ae).
+            subject:     Commit subject line (%s).
+
+        A commit is a merge when any of the following hold:
+          True merge       — two or more parents.
+          Subject heuristic — matches built-in or user-supplied patterns.
+          Committer differs — committer e-mail ≠ author e-mail (built-in only);
+                              catches squash merges whose edited messages bypass
+                              subject heuristics.
+        When merge_heuristics is a user-supplied list the committer-differs check
+        is not applied, matching the behaviour documented in the README.
         """
+        is_true_merge = len(parents_str.split()) >= 2
         s = subject.lower().strip()
         pb = self.primary_branch.lower()
 
-        if self.useless_merge_heuristics is not None:
-            return any(h in s for h in self.useless_merge_heuristics)
+        if self.merge_heuristics is not None:
+            return is_true_merge or any(h in s for h in self.merge_heuristics)
 
         # Built-in defaults
-        if 'merge conflict' in s:
-            return True
-        # "Merge branch 'main'" or "Merge branch 'main' into ..."
-        if s.startswith(f"merge branch '{pb}'") or s.startswith(f'merge branch "{pb}"') \
-                or s.startswith(f'merge branch {pb} ') or s == f'merge branch {pb}':
-            return True
-        # "Merge remote-tracking branch 'origin/main'" (any variant)
-        if s.startswith(f"merge remote-tracking branch 'origin/{pb}'") \
-                or s.startswith(f'merge remote-tracking branch "origin/{pb}"') \
-                or s.startswith(f'merge remote-tracking branch origin/{pb}'):
-            return True
-        return False
+        is_subject_heuristic = (
+            'pull request #' in s
+            or s.startswith('merge remote-tracking branch')
+            or (
+                s.startswith('merge branch')
+                and not s.startswith(f"merge branch '{pb}'")
+                and not s.startswith(f'merge branch "{pb}"')
+                and not s.startswith(f'merge branch {pb} ')
+                and s != f'merge branch {pb}'
+            )
+        )
+        is_committer_merge = (
+            not is_true_merge
+            and c_email.lower() != a_email.strip().lower()
+        )
+        return is_true_merge or is_subject_heuristic or is_committer_merge
 
     def _collect_commits(self, repo_path, component_dirs, components,
                          component_contributions, team_components, record_loc=False):
@@ -477,7 +433,7 @@ class GitStats:
             main repo.
         """
         log_data = self._run_git(
-            ['log', '--numstat', '--pretty=format:COMMIT|%at|%an|%ae|%s'], repo_path
+            ['log', '--numstat', '--pretty=format:COMMIT|%P|%at|%an|%ae|%ce|%s'], repo_path
         )
 
         # State carried across lines within the same commit
@@ -505,7 +461,7 @@ class GitStats:
                 current_commit_adds = 0
                 current_commit_dels = 0
 
-                _, ts_str, name, email, subject = line.split('|', 4)
+                _, parents_str, ts_str, name, email, c_email, subject = line.split('|', 6)
                 ts = int(ts_str)
                 current_commit_ts = ts
                 dt = datetime.datetime.fromtimestamp(ts)
@@ -514,7 +470,7 @@ class GitStats:
                 all_ts.append(ts)
                 current_author = author
                 current_team = team
-                current_skip_lines = self._is_useless_merge(subject)
+                current_skip_lines = self._detect_merge(parents_str, c_email, email, subject)
                 # Track the most-recently-seen email for each canonical author so
                 # we can resolve email-keyed team membership entries later.
 
@@ -635,7 +591,6 @@ class GitStats:
             capture_output=True, text=True, errors='replace',
         )
 
-        pb_lower = primary.lower()
         for line in result.stdout.splitlines():
             if not line.startswith('MERGE|'):
                 continue
@@ -643,38 +598,8 @@ class GitStats:
             if len(parts) < 7:
                 continue
             _, parents_str, c_email, c_name, ts_str, a_email, subject = parts
-            parents = parents_str.split()
 
-            is_true_merge = len(parents) >= 2
-
-            s = subject.lower().strip()
-            if self.merge_heuristics is None:
-                # Built-in defaults with primary-branch exclusion for "merge branch".
-                is_subject_heuristic = (
-                    'pull request #' in s
-                    or s.startswith('merge remote-tracking branch')
-                    or (
-                        s.startswith('merge branch')
-                        and not s.startswith(f"merge branch '{pb_lower}'")
-                        and not s.startswith(f'merge branch "{pb_lower}"')
-                        and not s.startswith(f'merge branch {pb_lower} ')
-                        and s != f'merge branch {pb_lower}'
-                    )
-                )
-                # A non-merge commit where committer ≠ author typically indicates
-                # someone edited the commit message before merging (squash/rebase
-                # with a custom message).  Subject heuristics miss these since
-                # the edited message may not contain a PR pattern.
-                is_committer_merge = (
-                    not is_true_merge
-                    and c_email.lower() != a_email.strip().lower()
-                )
-                is_heuristic = is_subject_heuristic or is_committer_merge
-            else:
-                # User-supplied patterns: each is a case-insensitive substring match.
-                is_heuristic = any(h in s for h in self.merge_heuristics)
-
-            if not (is_true_merge or is_heuristic):
+            if not self._detect_merge(parents_str, c_email, a_email, subject):
                 continue
 
             ts = int(ts_str) if ts_str.strip().isdigit() else 0
@@ -831,38 +756,43 @@ class GitStats:
             # For the oldest tag in the list, include all its commits.
             tag_range = tag if i == len(tags) - 1 else f"{tags[i + 1]}..{tag}"
             try:
-                # Include --numstat so per-author line stats are available for
-                # per-release impact scoring alongside commit counts and tenure.
+                # Include --numstat so per-author line stats are available.
+                # Include parent hashes (%P), committer email (%ce), committer
+                # name (%cn), and subject (%s) so merge commits can be detected
+                # and credited to the committer for the PR Merges dimension.
                 tag_log = self._run_git(['log', tag_range, '--numstat',
-                                         '--pretty=format:COMMIT|%at|%an|%ae'])
+                                         '--pretty=format:COMMIT|%P|%at|%an|%ae|%ce|%cn|%s'])
             except subprocess.CalledProcessError:
                 continue
 
             # Accumulate per-author and per-team data: commits, line stats,
-            # first/last commit timestamp.
-            tag_authors  = {}    # name → {commits, add, del, first_ts, last_ts}
+            # first/last commit timestamp, and PR merges.
+            tag_authors  = {}    # name → {commits, add, del, first_ts, last_ts, merges}
             tag_teams    = defaultdict(lambda: {
                 'commits': 0, 'add': 0, 'del': 0,
-                'first_ts': float('inf'), 'last_ts': 0,
+                'first_ts': float('inf'), 'last_ts': 0, 'merges': 0,
             })
             current_author = None
             current_team   = None
+            current_skip_lines = False  # True for merge commits
 
             for line in tag_log.splitlines():
                 if line.startswith('COMMIT|'):
-                    parts = line.split('|', 3)
-                    if len(parts) < 4:
+                    parts = line.split('|', 7)
+                    if len(parts) < 8:
                         continue
-                    _, ts_str, name, email = parts
+                    _, parents_str, ts_str, a_name, a_email, c_email, c_name, subject = parts
                     ts    = int(ts_str) if ts_str.isdigit() else 0
-                    canon = self._get_author(name, email)
-                    team  = self._get_team(canon, email, ts)
+                    canon = self._get_author(a_name, a_email)
+                    team  = self._get_team(canon, a_email, ts)
                     current_author = canon
                     current_team   = team
+                    current_skip_lines = self._detect_merge(parents_str, c_email, a_email, subject)
+
                     if canon not in tag_authors:
                         tag_authors[canon] = {
                             'commits': 0, 'add': 0, 'del': 0,
-                            'first_ts': ts, 'last_ts': ts,
+                            'first_ts': ts, 'last_ts': ts, 'merges': 0,
                         }
                     a = tag_authors[canon]
                     a['commits']  += 1
@@ -872,7 +802,23 @@ class GitStats:
                     tt['commits']  += 1
                     tt['first_ts']  = min(tt['first_ts'], ts)
                     tt['last_ts']   = max(tt['last_ts'],  ts)
+
+                    # Credit the committer with the merge (consistent with
+                    # _collect_merges which also uses committer, not author).
+                    if current_skip_lines:
+                        committer = self._get_author(c_name, c_email)
+                        c_team    = self._get_team(committer, c_email, ts)
+                        if committer not in tag_authors:
+                            tag_authors[committer] = {
+                                'commits': 0, 'add': 0, 'del': 0,
+                                'first_ts': ts, 'last_ts': ts, 'merges': 0,
+                            }
+                        tag_authors[committer]['merges'] += 1
+                        tag_teams[c_team]['merges'] += 1
+
                 elif current_author and '\t' in line:
+                    if current_skip_lines:
+                        continue  # never count merge commit lines
                     parts = line.split('\t', 2)
                     if len(parts) >= 2:
                         try:
@@ -1128,25 +1074,25 @@ class GitStats:
         """Compute per-release impact scores for a dict of authors or teams.
 
         Both callers (_compute_tag_impacts and _compute_tag_team_impacts) share
-        the same schema: {name: {'commits', 'add', 'del', 'first_ts', 'last_ts'}}.
-        Uses the configured commits, lines, and tenure weights normalized within
-        the release.  The merges dimension is excluded — it is not tracked per
-        release range.
+        the same schema: {name: {commits, add, del, first_ts, last_ts, merges}}.
+        Uses all four configured impact weights normalized within the release.
 
         Args:
-            entities:    {name: {commits, add, del, first_ts, last_ts}}
+            entities:    {name: {commits, add, del, first_ts, last_ts, merges}}
             tenure_map:  Optional {name: tenure_days} supplying global tenure values.
                          When provided, a name's global tenure is used instead of the
                          release-range tenure derived from first_ts/last_ts.  Names
                          absent from tenure_map fall back to release-range tenure.
 
         Returns:
-            {name: {'commits', 'eff_lines', 'tenure_days', 'impact'}}
+            {name: {'commits', 'eff_lines', 'tenure_days', 'merges', 'impact'}}
         """
         wc = self.IMPACT_W_COMMITS
         wl = self.IMPACT_W_LINES
         wt = self.IMPACT_W_TENURE
-        active_w = (wc if wc > 0 else 0) + (wl if wl > 0 else 0) + (wt if wt > 0 else 0)
+        wm = self.IMPACT_W_MERGES
+        active_w = ((wc if wc > 0 else 0) + (wl if wl > 0 else 0) +
+                    (wt if wt > 0 else 0) + (wm if wm > 0 else 0))
         scale = (100.0 / active_w) if active_w > 0 else 0.0
 
         eff_map = {
@@ -1161,22 +1107,26 @@ class GitStats:
 
         tenure_values = {name: _tenure(name, e) for name, e in entities.items()}
 
-        max_c = (max(e['commits'] for e in entities.values()) or 1) if wc > 0 else 1
-        max_k = (max(eff_map.values()) or 1)                        if wl > 0 else 1
-        max_d = (max(tenure_values.values()) or 1)                  if wt > 0 else 1
+        max_c = (max(e['commits'] for e in entities.values()) or 1)          if wc > 0 else 1
+        max_k = (max(eff_map.values()) or 1)                                  if wl > 0 else 1
+        max_d = (max(tenure_values.values()) or 1)                            if wt > 0 else 1
+        max_m = (max(e.get('merges', 0) for e in entities.values()) or 1)    if wm > 0 else 1
 
         results = {}
         for name, e in entities.items():
-            tenure = tenure_values[name]
+            tenure  = tenure_values[name]
+            merges  = e.get('merges', 0)
             raw = (
                 ((e['commits']  / max_c) * wc if wc > 0 else 0.0) +
                 ((eff_map[name] / max_k) * wl if wl > 0 else 0.0) +
-                ((tenure        / max_d) * wt if wt > 0 else 0.0)
+                ((tenure        / max_d) * wt if wt > 0 else 0.0) +
+                ((merges        / max_m) * wm if wm > 0 else 0.0)
             )
             results[name] = {
                 'commits':     e['commits'],
                 'eff_lines':   int(eff_map[name]),
                 'tenure_days': tenure,
+                'merges':      merges,
                 'impact':      round(raw * scale, 1),
             }
         return results
@@ -1228,7 +1178,7 @@ class GitStats:
                     'No tags found in this repository.</div>')
         parts = []
         _release_medals = ['🥇', '🥈', '🥉']
-        _merges_excluded = self.IMPACT_W_MERGES > 0
+        _show_merges = self.IMPACT_W_MERGES > 0
 
         def _author_prefix(i):
             if i < 3:
@@ -1239,14 +1189,15 @@ class GitStats:
             """Build an HTML-escaped title attribute for an author or team entry."""
             days   = data['tenure_days']
             plural = 's' if days != 1 else ''
-            note   = '&#10;(merges not tracked per release)' if _merges_excluded else ''
-            return (
-                f'{html.escape(label)}&#10;'
-                f'Commits: {data["commits"]:,}&#10;'
-                f'Lines: {data["eff_lines"]:,}&#10;'
-                f'Tenure: {days} day{plural}'
-                f'{note}'
-            )
+            parts  = [
+                html.escape(label),
+                f'Commits: {data["commits"]:,}',
+                f'Lines: {data["eff_lines"]:,}',
+                f'Tenure: {days} day{plural}',
+            ]
+            if _show_merges:
+                parts.append(f'Merges: {data.get("merges", 0):,}')
+            return '&#10;'.join(parts)
 
         for t in self.data['tags']:
             author_items = ''.join([
@@ -1897,6 +1848,12 @@ class GitStats:
         iw_tenure_js     = json.dumps(self.IMPACT_W_TENURE)
         iw_merges_js     = json.dumps(self.IMPACT_W_MERGES)
         tags_tab_html    = self._render_tags_html()
+        # Merges sort button — only shown when merges dimension is active
+        merges_sort_btn  = (
+            '<button onclick="setSortKey(\'merges\')" id="sort-merges"'
+            ' class="px-3 py-1.5 rounded-lg text-slate-500 hover:bg-slate-100 transition-all">Merges</button>'
+            if self.IMPACT_W_MERGES > 0 else ''
+        )
 
         # Noise-reduction settings — displayed in the impact explanation section
         # so viewers know exactly what filtering was applied to this report.
@@ -2042,6 +1999,7 @@ class GitStats:
                     <button onclick="setSortKey('impact')"  id="sort-impact"  class="px-3 py-1.5 rounded-lg bg-slate-900 text-white">Impact</button>
                     <button onclick="setSortKey('commits')" id="sort-commits" class="px-3 py-1.5 rounded-lg text-slate-500 hover:bg-slate-100 transition-all">Commits</button>
                     <button onclick="setSortKey('lines')"   id="sort-lines"   class="px-3 py-1.5 rounded-lg text-slate-500 hover:bg-slate-100 transition-all">Lines</button>
+                    {merges_sort_btn}
                 </div>
             </div>
         </div>
@@ -2213,8 +2171,11 @@ function authorImpactBar(impact, s) {{
 // ─── Sort controls ────────────────────────────────────────────────────────────
 function setSortKey(key) {{
     currentSortKey = key;
-    ['impact','commits','lines'].forEach(k => {{
+    const keys = ['impact','commits','lines'];
+    if (impactWMerges > 0) keys.push('merges');
+    keys.forEach(k => {{
         const b = document.getElementById('sort-' + k);
+        if (!b) return;
         b.className = k === key
             ? 'px-3 py-1.5 rounded-lg bg-slate-900 text-white text-xs font-bold'
             : 'px-3 py-1.5 rounded-lg text-slate-500 hover:bg-slate-100 transition-all text-xs font-bold';
@@ -2262,6 +2223,7 @@ function renderAuthorTable(filter, filterType) {{
         if (currentSortKey === 'impact')  return b[1].impact  - a[1].impact;
         if (currentSortKey === 'commits') return b[1].commits - a[1].commits;
         if (currentSortKey === 'lines')   return (b[1].add + b[1].del) - (a[1].add + a[1].del);
+        if (currentSortKey === 'merges')  return (b[1].merges || 0) - (a[1].merges || 0);
         return 0;
     }});
 
