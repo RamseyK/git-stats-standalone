@@ -33,7 +33,7 @@ class GitStats:
       - Release/tag breakdown by author and team
       - Component churn chart (click to filter by component)
 
-    Config file (./config.json or custom path) format:
+    Config file format:
     {
       "release_tag_prefix": "v",
       "max_release_tags": 50,
@@ -82,12 +82,18 @@ class GitStats:
     Authors not assigned to any team appear under "Community".
     """
 
-    # ── Impact score weights (must sum to 100) ──────────────────────────────────
+    # ── Impact score weights ─────────────────────────────────────────────────────
     # Each metric is normalized to the max value across all authors/teams (0–1),
-    # then multiplied by its weight, yielding a final score in the range 0–100.
-    IMPACT_W_COMMITS = 40   # commit count
-    IMPACT_W_LINES   = 40   # total lines changed (additions + deletions)
-    IMPACT_W_TENURE  = 20   # active tenure in days (first commit → last commit)
+    # then multiplied by its weight.  The raw sum is then rescaled by
+    # 100 / (sum of non-zero weights) so the final score always lies in 0–100
+    # regardless of how many dimensions are active.
+    #
+    # Set any weight to 0 to remove that dimension from scoring entirely.
+    # The remaining active weights are automatically renormalized to fill 0–100.
+    IMPACT_W_COMMITS = 30   # commit count          — set to 0 to disable
+    IMPACT_W_LINES   = 30   # effective lines changed — set to 0 to disable
+    IMPACT_W_TENURE  = 15   # active tenure in days  — set to 0 to disable
+    IMPACT_W_MERGES  = 25   # PR merges into primary branch — set to 0 to disable
 
     # ── Component marker filenames ───────────────────────────────────────────────
     # A directory that directly contains one of these files is treated as a
@@ -101,7 +107,7 @@ class GitStats:
     #     'BUILD', 'BUCK', 'Cargo.toml') to pick up more component boundaries.
     #   - Remove entries that are too common in your repo (e.g. 'Makefile' in a
     #     repo where every subdirectory has one) to avoid over-fragmenting the chart.
-    COMPONENT_MARKERS = {'make.py', 'pyproject.toml', 'setup.py', 'Makefile', 'meta.yaml'}
+    COMPONENT_MARKERS = {'make.py', 'pyproject.toml', 'setup.py', 'Makefile', 'meta.yaml', 'Cargo.toml', 'CMakeLists.txt'}
 
     # ── Source file extensions counted toward "Lines of Code" ───────────────────
     # Only files whose extension (lowercased) is in this set contribute to the
@@ -241,6 +247,39 @@ class GitStats:
         # percentile of all commits, preventing one-time bulk imports from
         # dominating the lines metric. 0 disables the cap.
         self.line_cap_percentile = int(config.get('impact_line_cap_percentile', 95))
+
+        # Primary branch name used to detect PR merges.  Only merge commits
+        # (or heuristic squash/rebase merges) whose target is this branch are
+        # counted in the merges dimension of the impact score.
+        self.primary_branch = config.get('primary_branch', 'develop')
+
+        # ── Impact score weights (config-overridable) ─────────────────────────
+        # Each key maps to the corresponding class-level default.  Set a weight
+        # to 0 to remove that dimension from scoring entirely; the remaining
+        # active weights are renormalized so scores still span 0–100.
+        # Negative values are clamped to 0.
+        def _w(key, default):
+            """Read a weight from config, clamping negative values to 0."""
+            return max(0, int(config.get(key, default)))
+
+        self.IMPACT_W_COMMITS = _w('impact_w_commits', self.IMPACT_W_COMMITS)
+        self.IMPACT_W_LINES   = _w('impact_w_lines',   self.IMPACT_W_LINES)
+        self.IMPACT_W_TENURE  = _w('impact_w_tenure',  self.IMPACT_W_TENURE)
+        self.IMPACT_W_MERGES  = _w('impact_w_merges',  self.IMPACT_W_MERGES)
+
+        # Validate that all impact weights sum to exactly 100.
+        _total_w = self.IMPACT_W_COMMITS + self.IMPACT_W_LINES + self.IMPACT_W_TENURE + self.IMPACT_W_MERGES
+        if _total_w != 100:
+            raise ValueError(
+                f"Impact score weights must sum to 100, but got {_total_w} "
+                f"(commits={self.IMPACT_W_COMMITS}, lines={self.IMPACT_W_LINES}, "
+                f"tenure={self.IMPACT_W_TENURE}, merges={self.IMPACT_W_MERGES}). "
+                f"Adjust the impact_w_* values in config.json so they sum to 100."
+            )
+
+        # Maximum number of authors/teams shown per release tag on the Releases tab.
+        self.max_commit_authors_per_tag = int(config.get('max_commit_authors_per_tag', 20))
+        self.max_teams_per_tag          = int(config.get('max_teams_per_tag', 10))
 
         # Central data store populated by collect() and consumed by generate_report().
         self.data = {
@@ -397,7 +436,7 @@ class GitStats:
                     self.data['authors'][author] = {
                         'commits': 0, 'add': 0, 'del': 0,
                         'first': ts, 'last': ts, 'team': team,
-                        'commit_lines': [],
+                        'commit_lines': [], 'merges': 0,
                     }
                 au = self.data['authors'][author]
                 au['commits'] += 1
@@ -467,6 +506,83 @@ class GitStats:
                 (current_commit_ts, current_commit_adds, current_commit_dels, current_team))
 
         return all_ts, running_loc
+
+    def _collect_merges(self, repo_path):
+        """Credit committers for PR merges detected in repo_path.
+
+        Walks the first-parent history of self.primary_branch and identifies
+        merge commits by two criteria:
+
+          True merge  — the commit has two or more parents (git merge).
+          Heuristic   — squash/rebase merges detected by commit subject:
+            • "Pull request #..."
+            • Starts with "Merge remote-tracking branch"
+            • Starts with "Merge branch" but does NOT merge the primary
+              branch itself back in (i.e., not "Merge branch 'develop'").
+
+        The committer (not the author) is credited because they are the
+        person who pressed the merge button.  If the committer is not
+        already in self.data['authors'] (e.g. a bot that never authored
+        a code commit), a stub entry is created so the merge count survives
+        into the impact score.
+
+        Silently returns when the primary branch does not exist in repo_path.
+        """
+        primary = self.primary_branch
+        # Bail out silently if the branch doesn't exist in this repo.
+        check = subprocess.run(
+            ['git', '-C', repo_path, 'rev-parse', '--verify', primary],
+            capture_output=True,
+        )
+        if check.returncode != 0:
+            return
+
+        result = subprocess.run(
+            ['git', '-C', repo_path, 'log', primary, '--first-parent',
+             '--format=MERGE|%P|%ce|%cn|%ct|%s'],
+            capture_output=True, text=True, errors='replace',
+        )
+
+        pb_lower = primary.lower()
+        for line in result.stdout.splitlines():
+            if not line.startswith('MERGE|'):
+                continue
+            parts = line.split('|', 5)
+            if len(parts) < 6:
+                continue
+            _, parents_str, c_email, c_name, ts_str, subject = parts
+            parents = parents_str.split()
+
+            is_true_merge = len(parents) >= 2
+
+            s = subject.lower().strip()
+            is_heuristic = (
+                'pull request #' in s
+                or s.startswith('merge remote-tracking branch')
+                or (
+                    s.startswith('merge branch')
+                    and not s.startswith(f"merge branch '{pb_lower}'")
+                    and not s.startswith(f'merge branch "{pb_lower}"')
+                    and not s.startswith(f'merge branch {pb_lower} ')
+                    and s != f'merge branch {pb_lower}'
+                )
+            )
+
+            if not (is_true_merge or is_heuristic):
+                continue
+
+            ts = int(ts_str) if ts_str.strip().isdigit() else 0
+            author = self._get_author(c_name, c_email)
+            if author not in self.data['authors']:
+                team = self._get_team(author, c_email, ts)
+                self.data['authors'][author] = {
+                    'commits': 0, 'add': 0, 'del': 0,
+                    'first': ts, 'last': ts, 'team': team,
+                    'commit_lines': [], 'merges': 0,
+                    'team_commits': {},
+                }
+            au = self.data['authors'][author]
+            au['merges'] = au.get('merges', 0) + 1
 
     def collect(self):
         """Populate self.data by running git commands against all repositories.
@@ -574,6 +690,13 @@ class GitStats:
                 'team_components': sup_team_comps,
             })
 
+        # ── Phase 2c: PR merge counts (main repo + all support repos) ────────
+        # Committers on merge commits into the primary branch are credited with
+        # a merge count used in the impact score merges dimension.
+        self._collect_merges(self.repo_path)
+        for support_path in self.support_paths:
+            self._collect_merges(support_path)
+
         # ── Phase 3: release tag breakdown (main repo only) ──────────────────
         # Tags are sorted newest-first. For each tag we attribute the commits
         # between it and the previous tag (tag_range) to authors and teams.
@@ -617,8 +740,8 @@ class GitStats:
                 self.data['tags'].append({
                     'name': tag,
                     'count': sum(author_counts.values()),
-                    'top_authors': author_counts.most_common(20),
-                    'top_teams': team_counts.most_common(10),
+                    'top_authors': author_counts.most_common(self.max_commit_authors_per_tag),
+                    'top_teams': team_counts.most_common(self.max_teams_per_tag),
                 })
 
         self._compute_impact()
@@ -632,9 +755,16 @@ class GitStats:
         """Compute and store impact scores for every author and team.
 
         Score formula (produces a value in the range 0–100):
-            score = (commits / max_commits)         * IMPACT_W_COMMITS
-                  + (effective_lines / max_eff)     * IMPACT_W_LINES
-                  + (tenure_days / max_tenure)      * IMPACT_W_TENURE
+            raw   = (commits / max_commits)      * IMPACT_W_COMMITS   (if wc > 0)
+                  + (effective_lines / max_eff)  * IMPACT_W_LINES     (if wl > 0)
+                  + (tenure_days / max_tenure)   * IMPACT_W_TENURE    (if wt > 0)
+                  + (merges / max_merges)         * IMPACT_W_MERGES   (if wm > 0)
+            score = raw * (100 / sum_of_active_weights)
+
+        Setting any weight to 0 removes that dimension from scoring entirely.
+        The remaining active weights are automatically renormalized so that the
+        top performer still reaches 100.  Setting all weights to 0 yields 0 for
+        every author and team.
 
         "effective_lines" is derived from the per-commit line stats collected
         during collect() via a three-step noise-reduction pipeline:
@@ -667,6 +797,14 @@ class GitStats:
         wc = self.IMPACT_W_COMMITS
         wl = self.IMPACT_W_LINES
         wt = self.IMPACT_W_TENURE
+        wm = self.IMPACT_W_MERGES
+
+        # Scale factor that renormalizes scores to 0–100 when one or more
+        # dimensions are disabled (weight = 0).  When all four weights are
+        # active (the default), total_w = 100 and scale = 1.0 exactly.
+        total_w = (wc if wc > 0 else 0) + (wl if wl > 0 else 0) + \
+                  (wt if wt > 0 else 0) + (wm if wm > 0 else 0)
+        scale = (100.0 / total_w) if total_w > 0 else 0.0
 
         use_net   = self.use_net_lines
         wash_days = self.wash_window_days
@@ -745,16 +883,23 @@ class GitStats:
         eff_map = {}   # author name → effective lines (used for team rollup too)
         if authors:
             eff_map = {name: effective_lines(a) for name, a in authors.items()}
-            max_c = max(a['commits'] for a in authors.values()) or 1
-            max_k = max(eff_map.values()) or 1
-            max_d = max((a['last'] - a['first']) // 86400 for a in authors.values()) or 1
+            # Only compute the max for each dimension when that weight is active.
+            # Skipping the computation avoids a misleading or divide-by-zero
+            # situation when a dimension is intentionally disabled.
+            max_c = (max(a['commits'] for a in authors.values()) or 1) if wc > 0 else 1
+            max_k = (max(eff_map.values()) or 1)                         if wl > 0 else 1
+            max_d = (max((a['last'] - a['first']) // 86400
+                         for a in authors.values()) or 1)                if wt > 0 else 1
+            max_m = (max(a.get('merges', 0) for a in authors.values()) or 1) if wm > 0 else 1
             for name, a in authors.items():
                 days = (a['last'] - a['first']) // 86400
-                a['impact'] = round(
-                    (a['commits'] / max_c) * wc +
-                    (eff_map[name]  / max_k) * wl +
-                    (days / max_d)           * wt, 1
+                raw = (
+                    ((a['commits']       / max_c) * wc if wc > 0 else 0.0) +
+                    ((eff_map[name]      / max_k) * wl if wl > 0 else 0.0) +
+                    ((days               / max_d) * wt if wt > 0 else 0.0) +
+                    ((a.get('merges', 0) / max_m) * wm if wm > 0 else 0.0)
                 )
+                a['impact'] = round(raw * scale, 1)
 
         # ── Score teams ───────────────────────────────────────────────────────
         # Team effective lines apply the same three-step noise-reduction pipeline
@@ -792,16 +937,27 @@ class GitStats:
                         else:
                             team_eff[team] += b['eff']
 
-            max_c = max(t['commits'] for t in teams.values()) or 1
-            max_k = max(team_eff.values()) or 1
-            max_d = max((t['last'] - t['first']) // 86400 for t in teams.values()) or 1
+            # Accumulate merges per team from member authors
+            team_merges = defaultdict(int)
+            for name, a in authors.items():
+                m = a.get('merges', 0)
+                if m:
+                    team_merges[a['team']] += m
+
+            max_c = (max(t['commits'] for t in teams.values()) or 1) if wc > 0 else 1
+            max_k = (max(team_eff.values()) or 1)                      if wl > 0 else 1
+            max_d = (max((t['last'] - t['first']) // 86400
+                         for t in teams.values()) or 1)                if wt > 0 else 1
+            max_m = ((max(team_merges.values()) if team_merges else 1)) if wm > 0 else 1
             for tname, t in teams.items():
                 days = (t['last'] - t['first']) // 86400
-                t['impact'] = round(
-                    (t['commits']        / max_c) * wc +
-                    (team_eff[tname]     / max_k) * wl +
-                    (days                / max_d) * wt, 1
+                raw = (
+                    ((t['commits']           / max_c) * wc if wc > 0 else 0.0) +
+                    ((team_eff[tname]        / max_k) * wl if wl > 0 else 0.0) +
+                    ((days                   / max_d) * wt if wt > 0 else 0.0) +
+                    ((team_merges[tname]     / max_m) * wm if wm > 0 else 0.0)
                 )
+                t['impact'] = round(raw * scale, 1)
 
         # Clean up internal scratch fields — they must not appear in JSON output.
         for a in authors.values():
@@ -1252,6 +1408,57 @@ class GitStats:
         iw_commits = self.IMPACT_W_COMMITS
         iw_lines   = self.IMPACT_W_LINES
         iw_tenure  = self.IMPACT_W_TENURE
+        iw_merges  = self.IMPACT_W_MERGES
+        primary_branch = self.primary_branch
+
+        # Build the weight cards and formula for the Impact explanation section.
+        # Cards and formula terms are omitted when a weight is 0.
+        _active_dims = []
+        if iw_commits > 0:
+            _active_dims.append(('Commit Volume', iw_commits,
+                'Total number of commits authored. Rewards consistent contribution frequency over time.',
+                f'score += (commits / max_commits) × {iw_commits}'))
+        if iw_lines > 0:
+            _active_dims.append(('Lines Changed', iw_lines,
+                'Effective lines changed, filtered to remove noise. Reformats, mass moves, and revert pairs are discounted before scoring.',
+                f'score += (effective_lines / max_lines) × {iw_lines}'))
+        if iw_tenure > 0:
+            _active_dims.append(('Active Tenure', iw_tenure,
+                "Days between a contributor's first and last commit. Rewards long-term, sustained engagement.",
+                f'score += (tenure_days / max_tenure) × {iw_tenure}'))
+        if iw_merges > 0:
+            _active_dims.append(('PR Merges', iw_merges,
+                f'Number of pull requests merged into <span class="font-mono">{primary_branch}</span>. Credits the committer — the person who pressed the merge button. Includes true merges and squash/rebase merges detected by commit message.',
+                f'score += (merges / max_merges) × {iw_merges}'))
+
+        _ncards = len(_active_dims)
+        _grid_cols = {1: 'grid-cols-1', 2: 'grid-cols-1 md:grid-cols-2',
+                      3: 'grid-cols-1 md:grid-cols-3', 4: 'grid-cols-1 md:grid-cols-2 lg:grid-cols-4'}.get(_ncards, 'grid-cols-1 md:grid-cols-2')
+        _weight_cards_html = '\n'.join(
+            f'''                <div class="bg-slate-50 rounded-2xl p-5">
+                    <div class="flex items-center justify-between mb-2">
+                        <span class="text-sm font-black text-slate-700">{label}</span>
+                        <span class="text-2xl font-black text-blue-600">{w}%</span>
+                    </div>
+                    <div class="impact-bar mb-3"><div class="impact-fill" style="width:{w}%"></div></div>
+                    <p class="text-xs text-slate-500">{desc}</p>
+                    <p class="text-[11px] text-slate-400 mt-2 font-mono">{formula}</p>
+                </div>'''
+            for label, w, desc, formula in _active_dims
+        )
+        _formula_terms = ' &nbsp;+&nbsp; '.join(
+            {'Commit Volume': f'(commits / max_commits) × {iw_commits}',
+             'Lines Changed': f'(effective_lines / max_lines) × {iw_lines}',
+             'Active Tenure': f'(tenure_days / max_tenure) × {iw_tenure}',
+             'PR Merges':     f'(merges / max_merges) × {iw_merges}'}[label]
+            for label, w, desc, formula in _active_dims
+        )
+        _impact_subtitle_parts = []
+        if iw_commits > 0: _impact_subtitle_parts.append(f'commits&nbsp;{iw_commits}%')
+        if iw_lines   > 0: _impact_subtitle_parts.append(f'lines&nbsp;{iw_lines}%')
+        if iw_tenure  > 0: _impact_subtitle_parts.append(f'tenure&nbsp;{iw_tenure}%')
+        if iw_merges  > 0: _impact_subtitle_parts.append(f'merges&nbsp;{iw_merges}%')
+        impact_subtitle = 'Impact = ' + '&nbsp;·&nbsp;'.join(_impact_subtitle_parts)
 
         # Teams tab visibility
         teams_tab_hidden = ' hidden' if not self.has_teams else ''
@@ -1353,7 +1560,7 @@ class GitStats:
                         Clear Filter
                     </button>
                 </div>
-                <p class="text-xs text-slate-400 font-medium mb-6">Impact = commits&nbsp;{iw_commits}%&nbsp;·&nbsp;lines&nbsp;{iw_lines}%&nbsp;·&nbsp;tenure&nbsp;{iw_tenure}%</p>
+                <p class="text-xs text-slate-400 font-medium mb-6">{impact_subtitle}</p>
                 <div id="impact-authors" class="space-y-1"></div>
             </div>
             <div class="card" id="impact-teams-card">
@@ -1371,38 +1578,12 @@ class GitStats:
         <div class="card">
             <h3 class="text-xl font-black text-slate-900 mb-1">How the Impact Score Is Computed</h3>
             <p class="text-xs text-slate-400 font-medium mb-6">Scores range from 0 to 100. Each metric is normalized relative to the top performer, so the highest scorer in each dimension always contributes the full weight for that dimension.</p>
-            <div class="grid grid-cols-1 md:grid-cols-3 gap-6 mb-6">
-                <div class="bg-slate-50 rounded-2xl p-5">
-                    <div class="flex items-center justify-between mb-2">
-                        <span class="text-sm font-black text-slate-700">Commit Volume</span>
-                        <span class="text-2xl font-black text-blue-600">{iw_commits}%</span>
-                    </div>
-                    <div class="impact-bar mb-3"><div class="impact-fill" style="width:{iw_commits}%"></div></div>
-                    <p class="text-xs text-slate-500">Total number of commits authored. Rewards consistent contribution frequency over time.</p>
-                    <p class="text-[11px] text-slate-400 mt-2 font-mono">score += (commits / max_commits) × {iw_commits}</p>
-                </div>
-                <div class="bg-slate-50 rounded-2xl p-5">
-                    <div class="flex items-center justify-between mb-2">
-                        <span class="text-sm font-black text-slate-700">Lines Changed</span>
-                        <span class="text-2xl font-black text-blue-600">{iw_lines}%</span>
-                    </div>
-                    <div class="impact-bar mb-3"><div class="impact-fill" style="width:{iw_lines}%"></div></div>
-                    <p class="text-xs text-slate-500">Effective lines changed, filtered to remove noise. Reformats, mass moves, and revert pairs are discounted before scoring.</p>
-                    <p class="text-[11px] text-slate-400 mt-2 font-mono">score += (effective_lines / max_lines) × {iw_lines}</p>
-                </div>
-                <div class="bg-slate-50 rounded-2xl p-5">
-                    <div class="flex items-center justify-between mb-2">
-                        <span class="text-sm font-black text-slate-700">Active Tenure</span>
-                        <span class="text-2xl font-black text-blue-600">{iw_tenure}%</span>
-                    </div>
-                    <div class="impact-bar mb-3"><div class="impact-fill" style="width:{iw_tenure}%"></div></div>
-                    <p class="text-xs text-slate-500">Days between a contributor's first and last commit. Rewards long-term, sustained engagement.</p>
-                    <p class="text-[11px] text-slate-400 mt-2 font-mono">score += (tenure_days / max_tenure) × {iw_tenure}</p>
-                </div>
+            <div class="grid {_grid_cols} gap-6 mb-6">
+{_weight_cards_html}
             </div>
             <div class="bg-blue-50 border border-blue-100 rounded-xl p-4 text-xs text-blue-800 mb-4">
                 <span class="font-black">Formula: </span>
-                Impact = (commits / max_commits) × {iw_commits} &nbsp;+&nbsp; (effective_lines / max_lines) × {iw_lines} &nbsp;+&nbsp; (tenure_days / max_tenure) × {iw_tenure}
+                Impact = {_formula_terms}
                 <br><span class="text-blue-500 mt-1 block">All normalizations are computed independently for authors and for teams.</span>
             </div>
             <div class="bg-slate-50 border border-slate-200 rounded-xl p-4 text-xs text-slate-700">
@@ -1640,6 +1821,7 @@ function renderAuthorTable(filter, filterType) {{
         const activeDays = Math.floor((s.last - s.first) / 86400);
         const color      = teamColor(s.team);
         const impact     = s.impact || 0;
+        const merges     = s.merges || 0;
         return `<tr class="hover:bg-slate-50 transition-colors">
             <td class="px-8 py-4">
                 <div class="font-bold text-slate-800">${{name}}</div>
@@ -1659,6 +1841,7 @@ function renderAuthorTable(filter, filterType) {{
                 <span class="text-slate-300 mx-1">/</span>
                 <span class="text-red-400">-${{fmt(s.del)}}</span>
             </td>
+            <td class="px-4 font-mono text-sm font-bold text-slate-600">${{merges > 0 ? merges : '<span class="text-slate-300">—</span>'}}</td>
             <td>
                 <div class="flex items-center gap-2" style="min-width:140px">
                     <span class="text-xs font-black text-slate-700 w-8">${{impact}}</span>
@@ -1676,6 +1859,7 @@ function renderAuthorTable(filter, filterType) {{
                 <th>Commits</th>
                 <th>Share</th>
                 <th>Lines +/−</th>
+                <th class="px-4">Merges</th>
                 <th>Impact Score</th>
                 <th class="px-6">Tenure</th>
             </tr>
@@ -2018,8 +2202,8 @@ def main() -> int:
         help="Path to the source Git repository"
     )
     parser.add_argument(
-        "-c", "--config", default=os.path.join(os.getcwd(), "config.json"),
-        help="Path to teams/aliases config JSON (default: ./config.json)"
+        "-c", "--config", default=None,
+        help="Path to a config JSON file (default: all settings use built-in defaults)"
     )
     parser.add_argument(
         "-o", "--output", required=True, default="/tmp/index.html",
@@ -2038,25 +2222,26 @@ def main() -> int:
     )
     args = parser.parse_args()
 
-    if not os.path.isdir(args.source):
-        print(f"Provided source Git repository directory does not exist at {args.source}")
-        return 1
+    for repo_path in [args.source, *args.support]:
+        if not os.path.isdir(repo_path):
+            print(f"Provided repository directory does not exist at {repo_path}")
+            return 1
+
+        if not os.path.isdir(os.path.join(repo_path, ".git")):
+            print(f"Provided repository directory does not look like it contains a git (.git) repository: {repo_path}")
+            return 1
 
     if not os.path.isdir(args.externals):
         print(f"Provided externals dependencies directory does not exist at {args.externals}")
         return 1
 
-    for sp in args.support:
-        if not os.path.isdir(sp):
-            print(f"Provided support repository directory does not exist at {sp}")
-            return 1
-
     config_path = args.config
-    if config_path and os.path.exists(config_path):
-        print(f"Using config: {config_path}")
-    else:
-        print("No config file found — all authors will appear as 'Community'.")
-        print('Create config.json with format: {"teams": {"Team": {"color": "#3b82f6", "members": ["name", "email"]}}, "aliases": {}}')
+    if config_path:
+        if os.path.exists(config_path):
+            print(f"Using config: {config_path}")
+        else:
+            print(f"Warning: config file not found at {config_path!r} — running with defaults.")
+            config_path = None
 
     stats = GitStats(args.source, config_path, support_paths=args.support)
     stats.collect()

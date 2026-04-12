@@ -37,3 +37,7 @@ coverage.xml
 *.swp
 *DS_Store*
 index.html
+
+# Local config
+config.json
+

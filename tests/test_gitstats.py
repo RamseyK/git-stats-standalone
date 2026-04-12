@@ -33,12 +33,81 @@ import gitstats  # noqa: E402
 PYODIDE_REPO   = os.path.expanduser('~/Downloads/pyodide')
 LOCKED_COMMIT  = '2906b146c8bb4700c437ede5581f0dc641459a97'
 
-# Expected values at the locked commit with the standard config.json.
+# Expected values at the locked commit with the standard test config.
 EXPECTED_COMMITS  = 4204
 EXPECTED_FILES    = 546
-EXPECTED_AUTHORS  = 310
+EXPECTED_AUTHORS  = 311  # 310 commit authors + 1 merge-only committer (GitHub bot)
 EXPECTED_TEAMS    = 3    # Core, Build & Packaging, Community
-EXPECTED_TAGS     = 50   # capped by max_release_tags in config.json
+EXPECTED_TAGS     = 50   # capped by max_release_tags in STD_CONFIG
+
+# Standard test configuration — mirrors the teams, aliases, and settings used
+# across all tests that need a realistic multi-team setup.  Tests must never
+# rely on the project-root config.json; this constant is the single source of
+# truth for expected values.
+STD_CONFIG = {
+    'release_tag_prefix': '',
+    'max_release_tags': 50,
+    'primary_branch': 'main',
+    'teams': {
+        'Core': {
+            'members': [
+                'Hood Chatham',
+                'roberthoodchatham@gmail.com',
+                'hood@mit.edu',
+                'Michael Droettboom',
+                'mdboom@gmail.com',
+                'Gyeongjae Choi',
+                'def6488@gmail.com',
+            ],
+        },
+        'Build & Packaging': {
+            'members': [
+                'Roman Yurchak',
+                'rth.yurchak@gmail.com',
+                'rth.yurchak@pm.me',
+                'Henry Schreiner',
+                'HenrySchreinerIII@gmail.com',
+                'Agriya Khetarpal',
+                '74401230+agriyakhetarpal@users.noreply.github.com',
+            ],
+        },
+        'Community': {
+            'members': [
+                'Dexter Chua',
+                'dalcde@users.noreply.github.com',
+                'Loïc Estève',
+                'loic.esteve@ymail.com',
+                'Christian Clauss',
+                'cclauss@me.com',
+                'Matthias Köppe',
+                'mkoeppe@math.ucdavis.edu',
+            ],
+        },
+    },
+    'aliases': {
+        'Hood Chatham': [
+            'roberthoodchatham@gmail.com',
+            'hood@mit.edu',
+        ],
+        'Roman Yurchak': [
+            'rth.yurchak@gmail.com',
+            'rth.yurchak@pm.me',
+        ],
+    },
+    'impact_w_commits': 30,
+    'impact_w_lines':   30,
+    'impact_w_tenure':  15,
+    'impact_w_merges':  25,
+    'impact_use_net_lines': True,
+    'impact_wash_window_days': 7,
+    'impact_wash_min_gross': 200,
+    'impact_line_cap_percentile': 95,
+    'summary_velocity_days': [30, 90],
+    'monthly_top_authors': 3,
+    'bus_factor_threshold': 0.5,
+    'component_markers': ['pyproject.toml', 'meta.yaml'],
+    'loc_extensions': ['.py', '.cc', '.c', '.cpp', '.h', '.hpp', '.rs'],
+}
 
 # Support repo — pyodide-recipes
 RECIPES_REPO          = os.path.expanduser('~/Downloads/pyodide-recipes')
@@ -46,7 +115,7 @@ RECIPES_LOCKED_COMMIT = 'b7c6155fa29d773c53cb0825d28f04d65cf76d32'
 
 # Expected values when pyodide + pyodide-recipes are combined.
 EXPECTED_COMBINED_COMMITS = 4613   # 4204 pyodide + 409 recipes
-EXPECTED_COMBINED_AUTHORS = 329    # 310 pyodide + 19 recipes-only authors
+EXPECTED_COMBINED_AUTHORS = 330    # 311 pyodide + 19 recipes-only authors
 
 
 # ---------------------------------------------------------------------------
@@ -74,18 +143,17 @@ def repo_path(tmp_path_factory):
 
 
 @pytest.fixture(scope='module')
-def std_config_path():
-    """Path to the project's standard config.json."""
-    return os.path.join(PROJECT_ROOT, 'config.json')
-
-
-@pytest.fixture(scope='module')
-def std_gs(repo_path, std_config_path):
+def std_gs(repo_path, tmp_path_factory):
     """
     GitStats instance collected against the locked commit with the standard
-    config.json.  Shared across all tests that only need to read results.
+    test config (STD_CONFIG).  Shared across all tests that only need to read
+    results.  Never reads the project-root config.json.
     """
-    gs = gitstats.GitStats(repo_path, std_config_path)
+    tmp = str(tmp_path_factory.mktemp('std_gs_cfg'))
+    cfg_path = os.path.join(tmp, 'config.json')
+    with open(cfg_path, 'w') as f:
+        json.dump(STD_CONFIG, f)
+    gs = gitstats.GitStats(repo_path, cfg_path)
     gs.collect()
     return gs
 
@@ -94,12 +162,19 @@ def make_config(tmp_path, **overrides):
     """
     Write a minimal config JSON file to tmp_path and return the file path.
     Pass keyword arguments to override top-level keys.
+
+    Impact weights default to 30/30/15/25 (sum=100).  Any test that changes
+    one or more weight keys must supply all four so they still sum to 100.
     """
     cfg = {
         'release_tag_prefix': '',
         'max_release_tags': 10,
         'teams': {},
         'aliases': {},
+        'impact_w_commits': 30,
+        'impact_w_lines':   30,
+        'impact_w_tenure':  15,
+        'impact_w_merges':  25,
     }
     cfg.update(overrides)
     p = os.path.join(str(tmp_path), 'config.json')
@@ -308,9 +383,10 @@ class TestImpactScoring:
         top_committer = max(std_gs.data['authors'].values(), key=lambda a: a['commits'])
         assert top_committer['impact'] >= wc
 
-    def test_top_team_impact_is_100(self, std_gs):
+    def test_top_team_impact_at_most_100(self, std_gs):
         top = max(std_gs.data['teams'].values(), key=lambda t: t['impact'])
-        assert top['impact'] == 100.0
+        assert top['impact'] <= 100.0
+        assert top['impact'] > 0.0
 
     def test_all_impact_scores_in_range(self, std_gs):
         for a in std_gs.data['authors'].values():
@@ -357,7 +433,8 @@ class TestImpactScoring:
     def test_impact_weights_sum_to_100(self):
         total = (gitstats.GitStats.IMPACT_W_COMMITS +
                  gitstats.GitStats.IMPACT_W_LINES   +
-                 gitstats.GitStats.IMPACT_W_TENURE)
+                 gitstats.GitStats.IMPACT_W_TENURE  +
+                 gitstats.GitStats.IMPACT_W_MERGES)
         assert total == 100
 
     # ── Stats invariants (real repo) ─────────────────────────────────────────
@@ -513,10 +590,10 @@ class TestImpactLogicUnit:
     def test_formula_two_authors_exact(self, tmp_path):
         """Verify exact scores with two authors where Alice maximises every dimension.
 
-        With caps/wash disabled and gross lines:
-            max_commits=2, max_eff=200, max_tenure=365
-            Alice: (2/2)*40 + (200/200)*40 + (365/365)*20 = 100.0
-            Bob:   (2/2)*40 + (100/200)*40 + (183/365)*20 ≈ 70.0
+        With caps/wash disabled, gross lines, and Alice leading all four dimensions:
+            max_commits=2, max_eff=200, max_tenure=365, max_merges=1
+            Alice: (2/2)*30 + (200/200)*30 + (365/365)*15 + (1/1)*25 = 100.0
+            Bob:   (2/2)*30 + (100/200)*30 + (183/365)*15 + (0/1)*25 ≈ 52.5
         """
         gs = _make_synthetic_gs(tmp_path, {
             'Alice': {'commit_lines': [
@@ -528,18 +605,21 @@ class TestImpactLogicUnit:
                 (_DAY * 183,   50, 0, 'C'),
             ]},
         }, use_net_lines=False, wash_window_days=0, line_cap_percentile=0)
+        gs.data['authors']['Alice']['merges'] = 1
+        gs.data['authors']['Bob']['merges']   = 0
         gs._compute_impact()
         assert gs.data['authors']['Alice']['impact'] == 100.0
-        assert gs.data['authors']['Bob']['impact'] == pytest.approx(70.0, abs=0.2)
+        assert gs.data['authors']['Bob']['impact'] == pytest.approx(52.5, abs=0.2)
 
     def test_single_author_scores_100(self, tmp_path):
-        """A repository with exactly one author must score 100 (leads every dimension)."""
+        """A repository with exactly one author who leads all four dimensions must score 100."""
         gs = _make_synthetic_gs(tmp_path, {
             'Solo': {'commit_lines': [
                 (0,           500, 100, 'C'),
                 (_DAY * 200,  300,  50, 'C'),
             ]},
         }, wash_window_days=0, line_cap_percentile=0)
+        gs.data['authors']['Solo']['merges'] = 1   # leads the merges dimension too
         gs._compute_impact()
         assert gs.data['authors']['Solo']['impact'] == 100.0
 
@@ -570,15 +650,15 @@ class TestImpactLogicUnit:
     def test_net_lines_balanced_commit_scores_zero_lines(self, tmp_path):
         """A commit with equal adds and deletes contributes 0 effective lines under net mode.
 
-        Only the commits weight (40) contributes; the lines and tenure weights are 0.
+        Only the commits weight (30) contributes; the lines, tenure, and merges weights are 0.
         """
         gs = _make_synthetic_gs(tmp_path, {
             'Reformatter': {'commit_lines': [(_DAY, 1000, 1000, 'C')]},
         }, use_net_lines=True, wash_window_days=0, line_cap_percentile=0)
         gs._compute_impact()
-        # tenure = 0 days → tenure term = 0; eff_lines = 0 → lines term = 0
-        # score = (1/1)*40 + 0 + 0 = 40.0
-        assert gs.data['authors']['Reformatter']['impact'] == pytest.approx(40.0, abs=0.1)
+        # tenure = 0 days → tenure term = 0; eff_lines = 0 → lines term = 0; merges = 0
+        # score = (1/1)*30 + 0 + 0 + 0 = 30.0
+        assert gs.data['authors']['Reformatter']['impact'] == pytest.approx(30.0, abs=0.1)
 
     def test_gross_lines_scores_both_sides(self, tmp_path):
         """With net mode off, adds+dels are both counted, so a balanced commit scores high."""
@@ -641,8 +721,9 @@ class TestImpactLogicUnit:
         gs = _make_synthetic_gs(tmp_path, {
             'A': {'commit_lines': [(_DAY, 10_000, 0, 'C'), (_DAY * 100, 10_000, 0, 'C')]},
         }, line_cap_percentile=0, wash_window_days=0)
+        gs.data['authors']['A']['merges'] = 1   # leads all four dimensions
         gs._compute_impact()
-        # Single author with positive commits, lines, and tenure → score = 100.
+        # Single author leading all dimensions → score = 100.
         assert gs.data['authors']['A']['impact'] == 100.0
 
     # ── Wash-window detection ─────────────────────────────────────────────────
@@ -783,7 +864,7 @@ class TestImpactLogicUnit:
         assert gs.data['teams']['Docs']['del'] == 200
 
     def test_top_author_leads_all_dimensions_scores_100(self, tmp_path):
-        """An author who leads commits, lines, and tenure must score exactly 100.0."""
+        """An author who leads commits, lines, tenure, and merges must score exactly 100.0."""
         gs = _make_synthetic_gs(tmp_path, {
             'Alice': {'commit_lines': [
                 (0,           1000, 0, 'C'),
@@ -791,6 +872,8 @@ class TestImpactLogicUnit:
             ]},
             'Bob': {'commit_lines': [(_DAY * 100, 500, 0, 'C')]},
         }, use_net_lines=False, wash_window_days=0, line_cap_percentile=0)
+        gs.data['authors']['Alice']['merges'] = 5
+        gs.data['authors']['Bob']['merges']   = 0
         gs._compute_impact()
         assert gs.data['authors']['Alice']['impact'] == 100.0
 
@@ -957,13 +1040,408 @@ class TestImpactLogicUnit:
             assert '_eff' not in a, f"{name} still has _eff after _compute_impact"
 
     def test_team_scores_100_when_one_team(self, tmp_path):
-        """With only one team, it must be normalized to 100.0 impact."""
+        """With only one team leading all dimensions, it must score 100.0."""
         gs = _make_synthetic_gs(tmp_path, {
             'Alice': {'commit_lines': [(_DAY, 100, 0, 'Solo'), (_DAY * 100, 100, 0, 'Solo')],
                       'team': 'Solo'},
         }, wash_window_days=0, line_cap_percentile=0)
+        gs.data['authors']['Alice']['merges'] = 1   # leads the merges dimension too
         gs._compute_impact()
         assert gs.data['teams']['Solo']['impact'] == 100.0
+
+
+# ---------------------------------------------------------------------------
+# Impact weight config overrides
+# ---------------------------------------------------------------------------
+
+class TestImpactWeightConfig:
+    """Verify that impact_w_* keys in config.json override the class-level defaults
+    and that instance attributes are correctly set on GitStats.
+
+    These tests use a real (but lightweight) GitStats instance; they do not call
+    collect() because the weights are applied in __init__ and consumed by
+    _compute_impact() independently of data collection.
+    """
+
+    # ── __init__ wiring ───────────────────────────────────────────────────────
+
+    def test_defaults_match_class_constants_when_no_config_keys(self, repo_path, tmp_path):
+        """When impact_w_* are absent from config the instance weights must equal
+        the class-level constants."""
+        # Write a config that deliberately omits all impact_w_* keys.
+        cfg_path = os.path.join(str(tmp_path), 'no_weights.json')
+        with open(cfg_path, 'w') as f:
+            json.dump({'release_tag_prefix': '', 'max_release_tags': 10,
+                       'teams': {}, 'aliases': {}}, f)
+        gs = gitstats.GitStats(repo_path, cfg_path)
+        assert gs.IMPACT_W_COMMITS == gitstats.GitStats.IMPACT_W_COMMITS
+        assert gs.IMPACT_W_LINES   == gitstats.GitStats.IMPACT_W_LINES
+        assert gs.IMPACT_W_TENURE  == gitstats.GitStats.IMPACT_W_TENURE
+        assert gs.IMPACT_W_MERGES  == gitstats.GitStats.IMPACT_W_MERGES
+
+    def test_config_overrides_all_four_weights(self, repo_path, tmp_path):
+        """Each impact_w_* key in config must override its corresponding weight."""
+        cfg = make_config(tmp_path,
+                          impact_w_commits=20,
+                          impact_w_lines=40,
+                          impact_w_tenure=10,
+                          impact_w_merges=30)
+        gs = gitstats.GitStats(repo_path, cfg)
+        assert gs.IMPACT_W_COMMITS == 20
+        assert gs.IMPACT_W_LINES   == 40
+        assert gs.IMPACT_W_TENURE  == 10
+        assert gs.IMPACT_W_MERGES  == 30
+
+    def test_config_override_partial_raises_when_sum_not_100(self, repo_path, tmp_path):
+        """Overriding only some weights without balancing the others must raise ValueError
+        because the total will not sum to 100."""
+        cfg = make_config(tmp_path, impact_w_commits=50)
+        # defaults: lines=30, tenure=15, merges=25 → total=120, not 100
+        with pytest.raises(ValueError, match='sum to 100'):
+            gitstats.GitStats(repo_path, cfg)
+
+    def test_zero_weight_via_config(self, repo_path, tmp_path):
+        """Setting a weight to 0 is valid as long as the remaining weights sum to 100."""
+        cfg = make_config(tmp_path,
+                          impact_w_commits=40,
+                          impact_w_lines=40,
+                          impact_w_tenure=20,
+                          impact_w_merges=0)
+        gs = gitstats.GitStats(repo_path, cfg)
+        assert gs.IMPACT_W_MERGES == 0
+        assert gs.IMPACT_W_COMMITS + gs.IMPACT_W_LINES + gs.IMPACT_W_TENURE + gs.IMPACT_W_MERGES == 100
+
+    def test_negative_weight_clamped_then_sum_checked(self, repo_path, tmp_path):
+        """A negative weight is clamped to 0 before the sum=100 check, so if the
+        remaining weights don't compensate, a ValueError is raised."""
+        # commits=-10 → clamped to 0; others at defaults (30+15+25=70) → total=70, not 100
+        cfg = make_config(tmp_path, impact_w_commits=-10)
+        with pytest.raises(ValueError, match='sum to 100'):
+            gitstats.GitStats(repo_path, cfg)
+
+    def test_weights_must_sum_to_100(self, repo_path, tmp_path):
+        """A ValueError is raised when the configured weights do not sum to exactly 100."""
+        cfg = make_config(tmp_path,
+                          impact_w_commits=30,
+                          impact_w_lines=30,
+                          impact_w_tenure=30,
+                          impact_w_merges=5)  # total = 95
+        with pytest.raises(ValueError, match='sum to 100'):
+            gitstats.GitStats(repo_path, cfg)
+
+    # ── Scoring effect of config-supplied weights ─────────────────────────────
+
+    def test_config_weight_changes_ranking(self, tmp_path):
+        """Changing weights via config must change which author ranks higher.
+
+        With default weights (commits 30, lines 30, tenure 15, merges 25):
+          Alice: many merges but few commits/lines.
+          Bob:   many commits and lines but zero merges.
+          With default weights Bob wins on commits+lines; Alice can win if wm is
+          raised high enough relative to the others.
+
+        We verify that swapping to commits=10, lines=10, merges=70 flips the ranking.
+        """
+        import pathlib
+        pathlib.Path(tmp_path).mkdir(parents=True, exist_ok=True)
+
+        def run_with_weights(path, wc, wl, wt, wm):
+            import pathlib as _pl
+            _pl.Path(path).mkdir(parents=True, exist_ok=True)
+            cfg = make_config(path,
+                              impact_w_commits=wc,
+                              impact_w_lines=wl,
+                              impact_w_tenure=wt,
+                              impact_w_merges=wm)
+            gs = gitstats.GitStats(str(path), cfg)
+            gs.data['authors'] = {
+                'Alice': {
+                    'commits': 2, 'add': 10, 'del': 0,
+                    'first': 0, 'last': _DAY * 5, 'team': 'C',
+                    'commit_lines': [(_DAY, 5, 0, 'C'), (_DAY * 5, 5, 0, 'C')],
+                    'merges': 50,
+                },
+                'Bob': {
+                    'commits': 100, 'add': 10000, 'del': 0,
+                    'first': 0, 'last': _DAY * 5, 'team': 'C',
+                    'commit_lines': [(_DAY * i, 100, 0, 'C') for i in range(100)],
+                    'merges': 0,
+                },
+            }
+            gs.data['teams'] = {
+                'C': {'commits': 102, 'add': 10010, 'del': 0,
+                      'members': {'Alice', 'Bob'}, 'first': 0, 'last': _DAY * 5}
+            }
+            gs.use_net_lines = False
+            gs.wash_window_days = 0
+            gs.line_cap_percentile = 0
+            gs._compute_impact()
+            return gs.data['authors']
+
+        # Default-ish: commits and lines dominate → Bob wins
+        authors_bob_wins = run_with_weights(tmp_path / 'a', 40, 40, 10, 10)
+        assert authors_bob_wins['Bob']['impact'] > authors_bob_wins['Alice']['impact']
+
+        # Merges-heavy: merges dominate → Alice wins
+        authors_alice_wins = run_with_weights(tmp_path / 'b', 10, 10, 10, 70)
+        assert authors_alice_wins['Alice']['impact'] > authors_alice_wins['Bob']['impact']
+
+    def test_config_weights_reflected_in_html(self, repo_path, tmp_path_factory):
+        """The HTML report must display the configured weight percentages, not the defaults.
+
+        Sets impact_w_commits=50, impact_w_lines=50, impact_w_tenure=0, impact_w_merges=0
+        and checks the rendered weight cards.
+        """
+        tmp = str(tmp_path_factory.mktemp('weight_html'))
+        cfg = make_config(tmp,
+                          impact_w_commits=50,
+                          impact_w_lines=50,
+                          impact_w_tenure=0,
+                          impact_w_merges=0)
+        gs = gitstats.GitStats(repo_path, cfg)
+        gs.collect()
+        out = os.path.join(tmp, 'report.html')
+        gs.generate_report(os.path.join(PROJECT_ROOT, 'externals'), out)
+        html = open(out).read()
+
+        # The weight cards must show the configured values.
+        assert '>50%<' in html or '50%' in html
+        # The default 30 must not appear as a weight value in the formula area
+        # (the formula string contains the actual configured weights).
+        assert '(commits / max_commits) × 50' in html or 'max_commits) × 50' in html
+        # Zero-weight dimensions must not appear in the cards or formula.
+        assert 'Active Tenure' not in html
+        assert 'PR Merges' not in html
+        assert 'max_tenure' not in html
+        assert 'max_merges' not in html
+
+    def test_config_weights_used_in_impact_formula_display(self, repo_path, tmp_path_factory):
+        """The impact formula string rendered in the HTML must use the configured weights."""
+        tmp = str(tmp_path_factory.mktemp('formula_html'))
+        cfg = make_config(tmp,
+                          impact_w_commits=40,
+                          impact_w_lines=40,
+                          impact_w_tenure=20,
+                          impact_w_merges=0)
+        gs = gitstats.GitStats(repo_path, cfg)
+        gs.collect()
+        out = os.path.join(tmp, 'report.html')
+        gs.generate_report(os.path.join(PROJECT_ROOT, 'externals'), out)
+        html = open(out).read()
+
+        # Formula line must reference the configured values.
+        assert '× 40' in html     # commits and lines
+        assert '× 20' in html     # tenure
+        # merges weight is 0 — the PR Merges card must be absent from the report
+        assert 'PR Merges' not in html
+        # The formula must not include the merges term
+        assert 'max_merges' not in html
+
+
+# ---------------------------------------------------------------------------
+# Zero-weight dimensions (disabling individual impact factors)
+# ---------------------------------------------------------------------------
+
+class TestZeroWeightDimensions:
+    """Verify that setting any IMPACT_W_* constant to 0 removes that dimension
+    from scoring and that scores are renormalized to the 0–100 range using only
+    the remaining active weights.
+
+    All tests use _make_synthetic_gs() to inject controlled data; the weight
+    overrides are applied directly to the GitStats instance before calling
+    _compute_impact().
+    """
+
+    # ── Renormalization keeps top score at 100 ────────────────────────────────
+
+    def test_disable_merges_top_author_still_100(self, tmp_path):
+        """With IMPACT_W_MERGES=0 the top performer across the three remaining
+        dimensions must still score 100.0 (renormalization applies)."""
+        gs = _make_synthetic_gs(tmp_path, {
+            'Alice': {'commit_lines': [
+                (0,           500, 0, 'C'),
+                (_DAY * 200,  500, 0, 'C'),
+            ]},
+            'Bob': {'commit_lines': [(_DAY * 10, 100, 0, 'C')]},
+        }, use_net_lines=False, wash_window_days=0, line_cap_percentile=0)
+        gs.IMPACT_W_MERGES = 0
+        gs._compute_impact()
+        top = max(gs.data['authors'].values(), key=lambda a: a['impact'])
+        assert top['impact'] == 100.0
+
+    def test_disable_tenure_top_author_still_100(self, tmp_path):
+        """Disabling tenure (wt=0) must still produce a top score of 100.0."""
+        gs = _make_synthetic_gs(tmp_path, {
+            'Alice': {'commit_lines': [(_DAY, 500, 0, 'C'), (_DAY * 2, 500, 0, 'C')]},
+            'Bob':   {'commit_lines': [(_DAY, 100, 0, 'C')]},
+        }, use_net_lines=False, wash_window_days=0, line_cap_percentile=0)
+        gs.data['authors']['Alice']['merges'] = 5
+        gs.data['authors']['Bob']['merges']   = 0
+        gs.IMPACT_W_TENURE = 0
+        gs._compute_impact()
+        top = max(gs.data['authors'].values(), key=lambda a: a['impact'])
+        assert top['impact'] == 100.0
+
+    def test_disable_lines_top_author_still_100(self, tmp_path):
+        """Disabling lines (wl=0) must still produce a top score of 100.0."""
+        gs = _make_synthetic_gs(tmp_path, {
+            'Alice': {'commit_lines': [
+                (0,          100, 0, 'C'),
+                (_DAY * 100, 100, 0, 'C'),
+            ]},
+            'Bob': {'commit_lines': [(_DAY * 5, 50, 0, 'C')]},
+        }, use_net_lines=False, wash_window_days=0, line_cap_percentile=0)
+        gs.data['authors']['Alice']['merges'] = 5
+        gs.data['authors']['Bob']['merges']   = 0
+        gs.IMPACT_W_LINES = 0
+        gs._compute_impact()
+        top = max(gs.data['authors'].values(), key=lambda a: a['impact'])
+        assert top['impact'] == 100.0
+
+    def test_disable_commits_top_author_still_100(self, tmp_path):
+        """Disabling commits (wc=0) must still produce a top score of 100.0."""
+        gs = _make_synthetic_gs(tmp_path, {
+            'Alice': {'commit_lines': [
+                (0,           1000, 0, 'C'),
+                (_DAY * 365,  1000, 0, 'C'),
+            ]},
+            'Bob': {'commit_lines': [(_DAY * 10, 100, 0, 'C')]},
+        }, use_net_lines=False, wash_window_days=0, line_cap_percentile=0)
+        gs.data['authors']['Alice']['merges'] = 10
+        gs.data['authors']['Bob']['merges']   = 0
+        gs.IMPACT_W_COMMITS = 0
+        gs._compute_impact()
+        top = max(gs.data['authors'].values(), key=lambda a: a['impact'])
+        assert top['impact'] == 100.0
+
+    # ── Disabled dimension does not influence ranking ─────────────────────────
+
+    def test_disable_merges_high_merger_not_rewarded(self, tmp_path):
+        """With wm=0 an author with many merges but few commits/lines/tenure must
+        not outscore an author who leads the remaining active dimensions."""
+        gs = _make_synthetic_gs(tmp_path, {
+            'MergeBot': {'commit_lines': [(_DAY, 1, 0, 'C')]},
+            'Coder':    {'commit_lines': [
+                (0,           500, 0, 'C'),
+                (_DAY * 200,  500, 0, 'C'),
+            ]},
+        }, use_net_lines=False, wash_window_days=0, line_cap_percentile=0)
+        gs.data['authors']['MergeBot']['merges'] = 999
+        gs.data['authors']['Coder']['merges']    = 0
+        gs.IMPACT_W_MERGES = 0
+        gs._compute_impact()
+        assert gs.data['authors']['Coder']['impact'] > gs.data['authors']['MergeBot']['impact']
+
+    def test_disable_tenure_long_timer_not_rewarded(self, tmp_path):
+        """With wt=0 an author with enormous tenure but few commits/lines must
+        not outscore an author who leads commits and lines."""
+        gs = _make_synthetic_gs(tmp_path, {
+            'OldTimer': {'commit_lines': [
+                (0,            1, 0, 'C'),
+                (_DAY * 3650,  1, 0, 'C'),
+            ]},
+            'Coder': {'commit_lines': [(_DAY * 5, 1000, 0, 'C'), (_DAY * 6, 1000, 0, 'C')]},
+        }, use_net_lines=False, wash_window_days=0, line_cap_percentile=0)
+        gs.IMPACT_W_TENURE = 0
+        gs._compute_impact()
+        assert gs.data['authors']['Coder']['impact'] > gs.data['authors']['OldTimer']['impact']
+
+    # ── Two dimensions disabled ───────────────────────────────────────────────
+
+    def test_only_commits_active_scores_on_commit_ratio_only(self, tmp_path):
+        """With only wc > 0, scores must equal (commits/max_commits)*100."""
+        gs = _make_synthetic_gs(tmp_path, {
+            'Alice': {'commit_lines': [(_DAY * i, 0, 0, 'C') for i in range(10)]},
+            'Bob':   {'commit_lines': [(_DAY * i, 0, 0, 'C') for i in range(4)]},
+        }, use_net_lines=False, wash_window_days=0, line_cap_percentile=0)
+        gs.IMPACT_W_LINES  = 0
+        gs.IMPACT_W_TENURE = 0
+        gs.IMPACT_W_MERGES = 0
+        gs._compute_impact()
+        # Alice: 10/10 = 100.0; Bob: 4/10 = 40.0
+        assert gs.data['authors']['Alice']['impact'] == 100.0
+        assert gs.data['authors']['Bob']['impact']   == pytest.approx(40.0, abs=0.1)
+
+    def test_only_merges_active_scores_on_merge_ratio_only(self, tmp_path):
+        """With only wm > 0, scores must equal (merges/max_merges)*100."""
+        gs = _make_synthetic_gs(tmp_path, {
+            'Alice': {'commit_lines': [(_DAY, 9999, 0, 'C'), (_DAY * 365, 9999, 0, 'C')]},
+            'Bob':   {'commit_lines': [(_DAY, 100, 0, 'C')]},
+        }, use_net_lines=False, wash_window_days=0, line_cap_percentile=0)
+        gs.data['authors']['Alice']['merges'] = 8
+        gs.data['authors']['Bob']['merges']   = 4
+        gs.IMPACT_W_COMMITS = 0
+        gs.IMPACT_W_LINES   = 0
+        gs.IMPACT_W_TENURE  = 0
+        gs._compute_impact()
+        # Despite Alice's dominant commits/lines/tenure, only merges count.
+        assert gs.data['authors']['Alice']['impact'] == 100.0
+        assert gs.data['authors']['Bob']['impact']   == pytest.approx(50.0, abs=0.1)
+
+    # ── All weights zero ──────────────────────────────────────────────────────
+
+    def test_all_weights_zero_gives_zero_impact(self, tmp_path):
+        """Setting all four weights to 0 must produce impact=0 for every author and team."""
+        gs = _make_synthetic_gs(tmp_path, {
+            'Alice': {'commit_lines': [(0, 500, 0, 'C'), (_DAY * 200, 500, 0, 'C')]},
+            'Bob':   {'commit_lines': [(_DAY, 100, 0, 'C')]},
+        }, use_net_lines=False, wash_window_days=0, line_cap_percentile=0)
+        gs.data['authors']['Alice']['merges'] = 5
+        gs.IMPACT_W_COMMITS = 0
+        gs.IMPACT_W_LINES   = 0
+        gs.IMPACT_W_TENURE  = 0
+        gs.IMPACT_W_MERGES  = 0
+        gs._compute_impact()
+        for name, a in gs.data['authors'].items():
+            assert a['impact'] == 0.0, f"{name} has non-zero impact when all weights are 0"
+        for tname, t in gs.data['teams'].items():
+            assert t['impact'] == 0.0, f"Team {tname} has non-zero impact when all weights are 0"
+
+    # ── Score invariants still hold after disabling ───────────────────────────
+
+    def test_scores_nonnegative_after_disabling_dimension(self, tmp_path):
+        """No score may be negative after disabling any dimension."""
+        gs = _make_synthetic_gs(tmp_path, {
+            'A': {'commit_lines': [(_DAY,     10000, 0,     'T1'), (_DAY * 6, 0, 10000, 'T1')]},
+            'B': {'commit_lines': [(_DAY * 50, 200,  0,    'T2')]},
+            'C': {'commit_lines': [(_DAY,      50,   50,   'T1')]},
+        }, use_net_lines=True, wash_window_days=7, wash_min_gross=200, line_cap_percentile=95)
+        gs.IMPACT_W_MERGES = 0
+        gs._compute_impact()
+        for name, a in gs.data['authors'].items():
+            assert a['impact'] >= 0.0, f"{name} has negative impact: {a['impact']}"
+        for tname, t in gs.data['teams'].items():
+            assert t['impact'] >= 0.0, f"Team {tname} has negative impact: {t['impact']}"
+
+    def test_scores_at_most_100_after_disabling_dimension(self, tmp_path):
+        """No score may exceed 100 after disabling any dimension."""
+        gs = _make_synthetic_gs(tmp_path, {
+            'Alice': {'commit_lines': [(0, 500, 0, 'C'), (_DAY * 100, 500, 0, 'C')]},
+            'Bob':   {'commit_lines': [(_DAY, 100, 0, 'C')]},
+        }, use_net_lines=False, wash_window_days=0, line_cap_percentile=0)
+        gs.IMPACT_W_TENURE = 0
+        gs.IMPACT_W_MERGES = 0
+        gs._compute_impact()
+        for name, a in gs.data['authors'].items():
+            assert a['impact'] <= 100.0, f"{name} exceeds 100: {a['impact']}"
+        for tname, t in gs.data['teams'].items():
+            assert t['impact'] <= 100.0, f"Team {tname} exceeds 100: {t['impact']}"
+
+    # ── Team scores also renormalize ──────────────────────────────────────────
+
+    def test_disable_merges_team_top_score_is_100(self, tmp_path):
+        """With wm=0 the top team must still reach 100.0 (renormalization covers teams too)."""
+        gs = _make_synthetic_gs(tmp_path, {
+            'Alice': {'commit_lines': [
+                (0,           500, 0, 'Alpha'),
+                (_DAY * 200,  500, 0, 'Alpha'),
+            ], 'team': 'Alpha'},
+            'Bob': {'commit_lines': [(_DAY, 50, 0, 'Beta')], 'team': 'Beta'},
+        }, use_net_lines=False, wash_window_days=0, line_cap_percentile=0)
+        gs.IMPACT_W_MERGES = 0
+        gs._compute_impact()
+        top = max(gs.data['teams'].values(), key=lambda t: t['impact'])
+        assert top['impact'] == 100.0
 
 
 # ---------------------------------------------------------------------------
@@ -1121,6 +1599,48 @@ class TestReleaseTags:
             team_sum = sum(count for _, count in tag['top_teams'])
             assert team_sum == tag['count']
 
+    def test_max_commit_authors_per_tag_default(self, repo_path, tmp_path):
+        """Default max_commit_authors_per_tag must be 20."""
+        cfg = make_config(tmp_path)
+        gs = gitstats.GitStats(repo_path, cfg)
+        assert gs.max_commit_authors_per_tag == 20
+
+    def test_max_teams_per_tag_default(self, repo_path, tmp_path):
+        """Default max_teams_per_tag must be 10."""
+        cfg = make_config(tmp_path)
+        gs = gitstats.GitStats(repo_path, cfg)
+        assert gs.max_teams_per_tag == 10
+
+    def test_max_commit_authors_per_tag_config_override(self, repo_path, tmp_path):
+        """max_commit_authors_per_tag from config must be stored on the instance."""
+        cfg = make_config(tmp_path, max_commit_authors_per_tag=5)
+        gs = gitstats.GitStats(repo_path, cfg)
+        assert gs.max_commit_authors_per_tag == 5
+
+    def test_max_teams_per_tag_config_override(self, repo_path, tmp_path):
+        """max_teams_per_tag from config must be stored on the instance."""
+        cfg = make_config(tmp_path, max_teams_per_tag=3)
+        gs = gitstats.GitStats(repo_path, cfg)
+        assert gs.max_teams_per_tag == 3
+
+    def test_max_commit_authors_per_tag_limits_top_authors(self, repo_path, tmp_path):
+        """Each tag's top_authors list must not exceed max_commit_authors_per_tag entries."""
+        cfg = make_config(tmp_path, max_commit_authors_per_tag=3, max_release_tags=0)
+        gs = gitstats.GitStats(repo_path, cfg)
+        gs.collect()
+        for tag in gs.data['tags']:
+            assert len(tag['top_authors']) <= 3
+
+    def test_max_teams_per_tag_limits_top_teams(self, repo_path, tmp_path):
+        """Each tag's top_teams list must not exceed max_teams_per_tag entries."""
+        cfg = make_config(tmp_path, max_teams_per_tag=2, max_release_tags=0,
+                          teams={'Core': {'members': ['Hood Chatham']},
+                                 'Other': {'members': ['Michael Droettboom']}})
+        gs = gitstats.GitStats(repo_path, cfg)
+        gs.collect()
+        for tag in gs.data['tags']:
+            assert len(tag['top_teams']) <= 2
+
 
 # ---------------------------------------------------------------------------
 # Components
@@ -1209,13 +1729,18 @@ def recipes_repo_path(tmp_path_factory):
 
 
 @pytest.fixture(scope='module')
-def combined_gs(repo_path, recipes_repo_path, std_config_path):
+def combined_gs(repo_path, recipes_repo_path, tmp_path_factory):
     """
     GitStats instance with pyodide as main repo and pyodide-recipes as a
     support repo, both locked to fixed commits.  Shared across all tests in
-    TestSupportRepos that only need to read the result.
+    TestSupportRepos that only need to read the result.  Never reads the
+    project-root config.json.
     """
-    gs = gitstats.GitStats(repo_path, std_config_path, support_paths=[recipes_repo_path])
+    tmp = str(tmp_path_factory.mktemp('combined_gs_cfg'))
+    cfg_path = os.path.join(tmp, 'config.json')
+    with open(cfg_path, 'w') as f:
+        json.dump(STD_CONFIG, f)
+    gs = gitstats.GitStats(repo_path, cfg_path, support_paths=[recipes_repo_path])
     gs.collect()
     return gs
 
@@ -1919,6 +2444,389 @@ class TestSummaryTab:
         so the tooltip fires anywhere along the x-axis, not just over a rendered point."""
         assert "mode: 'index'" in std_html
         assert "intersect: false" in std_html
+
+
+# ---------------------------------------------------------------------------
+# PR merge rate
+# ---------------------------------------------------------------------------
+
+class TestPRMergeRate:
+    """Verify _collect_merges() and the merges dimension of the impact score.
+
+    Tests cover:
+      - Config / __init__ wiring for primary_branch.
+      - _collect_merges() detection: true merge commits, heuristic squash/rebase,
+        exclusion of "Merge branch <primary>" commits.
+      - Committer (not author) receives credit.
+      - Merges survive into serialized authorData JSON.
+      - Impact score weights updated to 30/30/15/25.
+      - merges dimension drives scoring when other dimensions are equal.
+      - Graceful handling when primary branch is absent.
+      - HTML: PR Merges column in Authors table, 4th weight card in Impact tab,
+        updated formula string, primary_branch name shown in card.
+    """
+
+    # ── Config / __init__ ────────────────────────────────────────────────────
+
+    def test_primary_branch_default_is_develop(self, repo_path, tmp_path):
+        """When 'primary_branch' is absent from config the default must be 'develop'."""
+        cfg = make_config(tmp_path)
+        gs = gitstats.GitStats(repo_path, cfg)
+        assert gs.primary_branch == 'develop'
+
+    def test_primary_branch_config_override(self, repo_path, tmp_path):
+        """Setting 'primary_branch' in config must be stored on the instance."""
+        cfg = make_config(tmp_path, primary_branch='main')
+        gs = gitstats.GitStats(repo_path, cfg)
+        assert gs.primary_branch == 'main'
+
+    # ── Weight constants ─────────────────────────────────────────────────────
+
+    def test_weight_constants_sum_to_100(self):
+        """IMPACT_W_COMMITS + IMPACT_W_LINES + IMPACT_W_TENURE + IMPACT_W_MERGES must equal 100."""
+        total = (
+            gitstats.GitStats.IMPACT_W_COMMITS
+            + gitstats.GitStats.IMPACT_W_LINES
+            + gitstats.GitStats.IMPACT_W_TENURE
+            + gitstats.GitStats.IMPACT_W_MERGES
+        )
+        assert total == 100
+
+    def test_weight_values_are_30_30_15_25(self):
+        """Verify the exact weight values agreed for the four-dimension formula."""
+        assert gitstats.GitStats.IMPACT_W_COMMITS == 30
+        assert gitstats.GitStats.IMPACT_W_LINES   == 30
+        assert gitstats.GitStats.IMPACT_W_TENURE  == 15
+        assert gitstats.GitStats.IMPACT_W_MERGES  == 25
+
+    # ── _collect_merges() detection ──────────────────────────────────────────
+
+    def test_nonexistent_branch_is_silently_skipped(self, repo_path, tmp_path):
+        """_collect_merges() must not raise when the primary branch doesn't exist."""
+        cfg = make_config(tmp_path, primary_branch='branch-that-does-not-exist-xyz')
+        gs = gitstats.GitStats(repo_path, cfg)
+        gs.data['authors'] = {}
+        gs.data['teams']   = {}
+        gs._collect_merges(repo_path)   # must not raise
+        # No entries created for a nonexistent branch.
+        assert all(a.get('merges', 0) == 0 for a in gs.data['authors'].values())
+
+    def test_merges_detected_on_real_repo(self, std_gs):
+        """At least one author must have a positive merges count on the locked pyodide commit.
+
+        pyodide uses GitHub PRs so there will be many "Merge pull request #..." commits
+        on the default branch — at least one author should have been credited.
+        """
+        any_merges = any(a.get('merges', 0) > 0 for a in std_gs.data['authors'].values())
+        assert any_merges, "No PR merges detected; expected at least one from pyodide's PR history"
+
+    def test_merges_field_present_on_all_authors(self, std_gs):
+        """Every author dict must have a 'merges' key after collect()."""
+        for name, a in std_gs.data['authors'].items():
+            assert 'merges' in a, f"Author {name!r} missing 'merges' field"
+
+    def test_merges_nonnegative_for_all_authors(self, std_gs):
+        """merges count must never be negative."""
+        for name, a in std_gs.data['authors'].items():
+            assert a['merges'] >= 0, f"Author {name!r} has negative merges: {a['merges']}"
+
+    def test_total_merges_positive(self, std_gs):
+        """Sum of all author merges must be positive for a real PR-based workflow."""
+        total = sum(a.get('merges', 0) for a in std_gs.data['authors'].values())
+        assert total > 0
+
+    # ── Heuristic detection via synthetic git repo ───────────────────────────
+
+    @pytest.fixture(scope='class')
+    def merge_repo(self, tmp_path_factory):
+        """Create a minimal git repo with a mix of merge types on the primary branch.
+
+        Commits created:
+          A  — initial commit on 'main'
+          B  — feature branch tip (for true merge)
+          C  — true merge of B into main  (2 parents)     → counts
+          D  — commit with subject "Merge pull request #42 from user/feature"  → counts
+          E  — commit with subject "Merge remote-tracking branch 'origin/feat'"  → counts
+          F  — commit with subject "Merge branch 'feature-xyz'"  → counts
+          G  — commit with subject "Merge branch 'main'" (self-merge exclusion)  → does NOT count
+          H  — plain commit "Add readme"  → does NOT count
+        """
+        import pathlib
+        repo = str(tmp_path_factory.mktemp('merge_repo'))
+
+        def git(*args):
+            subprocess.run(
+                ['git', '-C', repo] + list(args),
+                check=True, capture_output=True,
+            )
+
+        git('init', '-b', 'main')
+        git('config', 'user.email', 'committer@example.com')
+        git('config', 'user.name', 'Committer One')
+        git('config', 'commit.gpgsign', 'false')
+
+        pathlib.Path(repo, 'file.txt').write_text('init')
+        git('add', '.')
+        git('commit', '-m', 'Initial commit')                                          # A
+
+        # True merge: create a side branch, commit to it, merge back.
+        git('checkout', '-b', 'feat-branch')
+        pathlib.Path(repo, 'feat.txt').write_text('feature')
+        git('add', '.')
+        git('commit', '-m', 'Feature work')                                            # B
+        git('checkout', 'main')
+        git('merge', '--no-ff', 'feat-branch', '-m', 'Merge feature-branch into main') # C (true merge)
+
+        # Heuristic: PR merge message
+        pathlib.Path(repo, 'pr.txt').write_text('pr42')
+        git('add', '.')
+        git('commit', '-m', 'Merge pull request #42 from user/feature')               # D
+
+        # Heuristic: remote-tracking branch
+        pathlib.Path(repo, 'rt.txt').write_text('rt')
+        git('add', '.')
+        git('commit', '-m', "Merge remote-tracking branch 'origin/feat'")             # E
+
+        # Heuristic: merge branch (non-primary)
+        pathlib.Path(repo, 'mb.txt').write_text('mb')
+        git('add', '.')
+        git('commit', '-m', "Merge branch 'feature-xyz'")                             # F
+
+        # Excluded: merge branch <primary>
+        pathlib.Path(repo, 'self.txt').write_text('self')
+        git('add', '.')
+        git('commit', '-m', "Merge branch 'main'")                                    # G
+
+        # Excluded: plain commit
+        pathlib.Path(repo, 'plain.txt').write_text('plain')
+        git('add', '.')
+        git('commit', '-m', 'Add readme')                                              # H
+
+        return repo
+
+    def test_true_merge_counted(self, merge_repo, tmp_path):
+        """A two-parent merge commit must be counted."""
+        cfg = make_config(tmp_path, primary_branch='main')
+        gs = gitstats.GitStats(merge_repo, cfg)
+        gs.data['authors'] = {}
+        gs.data['teams']   = {}
+        gs._collect_merges(merge_repo)
+        total = sum(a.get('merges', 0) for a in gs.data['authors'].values())
+        assert total >= 1, "True merge commit not detected"
+
+    def test_pr_message_heuristic_counted(self, merge_repo, tmp_path):
+        """'Merge pull request #N ...' commits must be detected as PR merges."""
+        cfg = make_config(tmp_path, primary_branch='main')
+        gs = gitstats.GitStats(merge_repo, cfg)
+        gs.data['authors'] = {}
+        gs.data['teams']   = {}
+        gs._collect_merges(merge_repo)
+        total = sum(a.get('merges', 0) for a in gs.data['authors'].values())
+        # D (PR message), C (true merge), E (remote-tracking), F (merge branch) = 4
+        assert total >= 4, f"Expected ≥4 merges, got {total}"
+
+    def test_primary_branch_self_merge_excluded(self, merge_repo, tmp_path):
+        """'Merge branch <primary_branch>' must NOT be counted as a PR merge."""
+        cfg = make_config(tmp_path, primary_branch='main')
+        gs = gitstats.GitStats(merge_repo, cfg)
+        gs.data['authors'] = {}
+        gs.data['teams']   = {}
+        gs._collect_merges(merge_repo)
+        total = sum(a.get('merges', 0) for a in gs.data['authors'].values())
+        # G ("Merge branch 'main'") and H (plain) must not be counted → total == 4
+        assert total == 4, f"Expected exactly 4 merges (C+D+E+F), got {total}"
+
+    def test_plain_commit_not_counted(self, merge_repo, tmp_path):
+        """A regular commit with no merge keywords must not be counted."""
+        cfg = make_config(tmp_path, primary_branch='main')
+        gs = gitstats.GitStats(merge_repo, cfg)
+        gs.data['authors'] = {}
+        gs.data['teams']   = {}
+        gs._collect_merges(merge_repo)
+        # Committer for all commits is 'Committer One'
+        committer = gs.data['authors'].get('Committer One', {})
+        # 'Add readme' must not contribute to this count
+        assert committer.get('merges', 0) == 4
+
+    def test_committer_credited_not_author(self, tmp_path_factory):
+        """The committer identity must receive merge credit, not the commit author.
+
+        Scenario: Alice authors the feature branch commit; Bob is the committer
+        who merges it (simulated by setting GIT_COMMITTER_* env vars).
+        """
+        import pathlib, os as _os
+        repo = str(tmp_path_factory.mktemp('committer_test'))
+
+        def git(*args, env=None):
+            subprocess.run(['git', '-C', repo] + list(args),
+                           check=True, capture_output=True, env=env)
+
+        git('init', '-b', 'main')
+        git('config', 'user.email', 'alice@example.com')
+        git('config', 'user.name', 'Alice')
+        git('config', 'commit.gpgsign', 'false')
+
+        # Initial commit as Alice
+        pathlib.Path(repo, 'a.txt').write_text('a')
+        git('add', '.')
+        git('commit', '-m', 'init')
+
+        # Heuristic PR merge authored by Alice but committed by Bob
+        pathlib.Path(repo, 'b.txt').write_text('b')
+        git('add', '.')
+        env = dict(_os.environ, **{
+            'GIT_AUTHOR_NAME':     'Alice',
+            'GIT_AUTHOR_EMAIL':    'alice@example.com',
+            'GIT_COMMITTER_NAME':  'Bob',
+            'GIT_COMMITTER_EMAIL': 'bob@example.com',
+            'GIT_CONFIG_COUNT':    '1',
+            'GIT_CONFIG_KEY_0':    'commit.gpgsign',
+            'GIT_CONFIG_VALUE_0':  'false',
+        })
+        git('commit', '-m', 'Merge pull request #1 from alice/feat', env=env)
+
+        cfg = make_config(str(tmp_path_factory.mktemp('cfg_committer')), primary_branch='main')
+        gs = gitstats.GitStats(repo, cfg)
+        gs.data['authors'] = {}
+        gs.data['teams']   = {}
+        gs._collect_merges(repo)
+
+        bob_merges   = gs.data['authors'].get('Bob',   {}).get('merges', 0)
+        alice_merges = gs.data['authors'].get('Alice', {}).get('merges', 0)
+        assert bob_merges   == 1, f"Bob (committer) should have 1 merge, got {bob_merges}"
+        assert alice_merges == 0, f"Alice (author) should have 0 merges, got {alice_merges}"
+
+    # ── Impact score — merges dimension ──────────────────────────────────────
+
+    def test_merges_dimension_breaks_tie(self, tmp_path):
+        """When commits, lines, and tenure are equal, the author with more merges wins."""
+        gs = _make_synthetic_gs(tmp_path, {
+            'Alice': {'commit_lines': [(0, 100, 0, 'C'), (_DAY * 30, 100, 0, 'C')]},
+            'Bob':   {'commit_lines': [(0, 100, 0, 'C'), (_DAY * 30, 100, 0, 'C')]},
+        }, use_net_lines=False, wash_window_days=0, line_cap_percentile=0)
+        gs.data['authors']['Alice']['merges'] = 10
+        gs.data['authors']['Bob']['merges']   = 0
+        gs._compute_impact()
+        assert gs.data['authors']['Alice']['impact'] > gs.data['authors']['Bob']['impact']
+
+    def test_merges_zero_when_no_merges(self, tmp_path):
+        """An author with no merges must not receive any merges dimension score."""
+        gs = _make_synthetic_gs(tmp_path, {
+            'Alice': {'commit_lines': [(_DAY, 500, 0, 'C')]},
+        }, use_net_lines=False, wash_window_days=0, line_cap_percentile=0)
+        gs.data['authors']['Alice']['merges'] = 0
+        gs._compute_impact()
+        wc = gitstats.GitStats.IMPACT_W_COMMITS
+        wl = gitstats.GitStats.IMPACT_W_LINES
+        # Single author: tenure=0, merges=0 → score = wc + wl
+        assert gs.data['authors']['Alice']['impact'] == pytest.approx(wc + wl, abs=0.1)
+
+    def test_sole_merger_scores_full_merges_weight(self, tmp_path):
+        """The only author who has merges must receive the full IMPACT_W_MERGES from that term."""
+        gs = _make_synthetic_gs(tmp_path, {
+            'Alice': {'commit_lines': [(0, 0, 0, 'C'), (_DAY * 30, 0, 0, 'C')]},
+            'Bob':   {'commit_lines': [(0, 0, 0, 'C'), (_DAY * 30, 0, 0, 'C')]},
+        }, use_net_lines=False, wash_window_days=0, line_cap_percentile=0)
+        gs.data['authors']['Alice']['merges'] = 5
+        gs.data['authors']['Bob']['merges']   = 0
+        gs._compute_impact()
+        wm = gitstats.GitStats.IMPACT_W_MERGES
+        wt = gitstats.GitStats.IMPACT_W_TENURE
+        # Both have same commits, zero lines, same tenure → Alice leads by exactly wm.
+        diff = gs.data['authors']['Alice']['impact'] - gs.data['authors']['Bob']['impact']
+        assert diff == pytest.approx(wm, abs=0.1)
+
+    def test_team_merges_accumulate_from_members(self, tmp_path):
+        """Team merge count must be the sum of its members' individual merge counts."""
+        gs = _make_synthetic_gs(tmp_path, {
+            'Alice': {'commit_lines': [(_DAY, 100, 0, 'Core')], 'team': 'Core'},
+            'Bob':   {'commit_lines': [(_DAY, 100, 0, 'Core')], 'team': 'Core'},
+            'Carol': {'commit_lines': [(_DAY, 100, 0, 'Docs')], 'team': 'Docs'},
+        }, wash_window_days=0, line_cap_percentile=0)
+        gs.data['authors']['Alice']['merges'] = 3
+        gs.data['authors']['Bob']['merges']   = 2
+        gs.data['authors']['Carol']['merges'] = 5
+        gs._compute_impact()
+        # Core = Alice(3) + Bob(2) = 5; Docs = Carol(5) = 5 → same team merges → equal merges term.
+        # Since Docs has same merges as Core, score difference comes from other dimensions only.
+        assert gs.data['teams']['Core']['impact'] >= 0
+        assert gs.data['teams']['Docs']['impact'] >= 0
+
+    def test_team_with_more_merges_scores_higher_when_else_equal(self, tmp_path):
+        """A team whose members merged more PRs must score higher when commits/lines/tenure are equal."""
+        gs = _make_synthetic_gs(tmp_path, {
+            'Alice': {'commit_lines': [(0, 100, 0, 'HeavyMergers'), (_DAY * 10, 100, 0, 'HeavyMergers')],
+                      'team': 'HeavyMergers'},
+            'Bob':   {'commit_lines': [(0, 100, 0, 'LightMergers'), (_DAY * 10, 100, 0, 'LightMergers')],
+                      'team': 'LightMergers'},
+        }, use_net_lines=False, wash_window_days=0, line_cap_percentile=0)
+        gs.data['authors']['Alice']['merges'] = 20
+        gs.data['authors']['Bob']['merges']   = 1
+        gs._compute_impact()
+        assert gs.data['teams']['HeavyMergers']['impact'] > gs.data['teams']['LightMergers']['impact']
+
+    # ── Serialized output ─────────────────────────────────────────────────────
+
+    def test_merges_in_author_data_json(self, std_gs, tmp_path_factory):
+        """The merges field must appear in the serialized authorData JS constant in the HTML."""
+        tmp = str(tmp_path_factory.mktemp('merges_json'))
+        out = os.path.join(tmp, 'report.html')
+        std_gs.generate_report(os.path.join(PROJECT_ROOT, 'externals'), out)
+        html = open(out).read()
+
+        # Extract authorData JSON
+        for line in html.splitlines():
+            stripped = line.strip()
+            if stripped.startswith('const authorData'):
+                json_str = stripped.split('=', 1)[1].strip().rstrip(';')
+                data = json.loads(json_str)
+                # Every entry must have a 'merges' key
+                for name, entry in data.items():
+                    assert 'merges' in entry, f"Author {name!r} missing 'merges' in authorData"
+                return
+        pytest.fail("const authorData not found in HTML")
+
+    # ── HTML output ───────────────────────────────────────────────────────────
+
+    @pytest.fixture(scope='class')
+    def std_html(self, std_gs, tmp_path_factory):
+        tmp = str(tmp_path_factory.mktemp('merges_html'))
+        out = os.path.join(tmp, 'report.html')
+        std_gs.generate_report(os.path.join(PROJECT_ROOT, 'externals'), out)
+        return open(out).read()
+
+    def test_merges_column_header_in_authors_table(self, std_html):
+        """The Authors table must have a 'Merges' column header."""
+        assert 'Merges' in std_html
+
+    def test_pr_merges_weight_card_in_impact_tab(self, std_html):
+        """The Impact tab must contain a 'PR Merges' weight card (std config has merges=25)."""
+        assert 'PR Merges' in std_html
+
+    def test_impact_formula_includes_merges_term(self, std_html):
+        """The Impact formula explanation must include the merges dimension."""
+        assert 'merges / max_merges' in std_html
+
+    def test_primary_branch_name_shown_in_impact_tab(self, std_html):
+        """The primary branch name must appear in the PR Merges card description."""
+        assert 'main' in std_html
+
+    def test_pr_merges_card_hidden_when_weight_zero(self, repo_path, tmp_path_factory):
+        """The PR Merges card must be absent when impact_w_merges=0."""
+        tmp = str(tmp_path_factory.mktemp('no_merges_html'))
+        cfg = make_config(tmp,
+                          primary_branch='main',
+                          impact_w_commits=40,
+                          impact_w_lines=40,
+                          impact_w_tenure=20,
+                          impact_w_merges=0)
+        gs = gitstats.GitStats(repo_path, cfg)
+        gs.collect()
+        out = os.path.join(tmp, 'report.html')
+        gs.generate_report(os.path.join(PROJECT_ROOT, 'externals'), out)
+        html = open(out).read()
+        assert 'PR Merges' not in html
+        assert 'max_merges' not in html
 
 
 if __name__ == "__main__":

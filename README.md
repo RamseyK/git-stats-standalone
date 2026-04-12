@@ -13,7 +13,7 @@ A Python script that analyzes a Git repository and generates a self-contained HT
 
 ## Requirements
 
-Python 3.11+
+* Python 3.11+
 
 ## Usage
 
@@ -25,7 +25,7 @@ python gitstats.py -s <repo-path> -o <output.html> [-c <config.json>] [-external
 |------|----------|-------------|
 | `-s`, `--source` | Yes | Path to the primary Git repository to analyze |
 | `-o`, `--output` | Yes | Path for the generated HTML file |
-| `-c`, `--config` | No | Path to a config JSON file (default: `./config.json`) |
+| `-c`, `--config` | No | Path to a config JSON file. If omitted, all settings use built-in defaults (no teams, no aliases). |
 | `-externals`, `--externals` | No | Path to the directory containing `tailwind.js` and `chart.js` (default: `./externals`) |
 | `-support`, `--support` | No | Path to an additional Git repository whose commits contribute to the combined stats. Repeatable for multiple support repositories. |
 
@@ -37,7 +37,7 @@ python gitstats.py -s ~/projects/myrepo -c config.json -o report.html \
 
 On success, `tailwind.js` and `chart.js` are copied from the externals directory into the same directory as the output HTML so the report works fully offline or from a self-hosted webserver.
 
-If no config file is found, all authors are grouped under a single "Community" team and no aliases are applied.
+Running without `-c` is fully supported. All settings use built-in defaults: every author is shown under a single **Community** label, no aliases are resolved, and all impact weights and noise-reduction settings use the values documented in [Impact Score](#impact-score).
 
 ## Support Repositories
 
@@ -73,6 +73,7 @@ All configuration lives in a single JSON file. Every key is optional.
 {
   "release_tag_prefix": "v",
   "max_release_tags": 50,
+  "primary_branch": "main",
 
   "teams": {
     "Core": {
@@ -99,6 +100,11 @@ All configuration lives in a single JSON file. Every key is optional.
     ]
   },
 
+  "impact_w_commits": 30,
+  "impact_w_lines": 30,
+  "impact_w_tenure": 15,
+  "impact_w_merges": 25,
+
   "impact_use_net_lines": true,
   "impact_wash_window_days": 7,
   "impact_wash_min_gross": 200,
@@ -119,6 +125,9 @@ All configuration lives in a single JSON file. Every key is optional.
 |-----|---------|-------------|
 | `release_tag_prefix` | `""` | Only tags whose name starts with this prefix appear in the Releases tab. `"v"` includes `v1.0` but excludes `nightly-20240101`. An empty string includes all tags. |
 | `max_release_tags` | `20` | Maximum number of release tags to display, taken from the most recent. `0` shows all tags. |
+| `max_commit_authors_per_tag` | `20` | Maximum number of authors shown in the per-release breakdown on the Releases tab. |
+| `max_teams_per_tag` | `10` | Maximum number of teams shown in the per-release breakdown on the Releases tab. |
+| `primary_branch` | `"develop"` | Name of the primary branch. Pull requests merged into this branch are counted toward each committer's PR Merges impact dimension. |
 | `summary_velocity_days` | `[30, 90]` | Day windows shown as velocity cards on the Summary tab. Each entry produces one card comparing commits in the last N days against the prior N days. |
 | `monthly_top_authors` | `3` | Number of top contributors listed in the monthly commit activity chart tooltip. Set to `0` to show only the total commit count. |
 | `bus_factor_threshold` | `0.5` | Fraction of total commits (0–1) used to compute the bus factor — the fewest contributors whose combined commits reach this fraction. |
@@ -154,7 +163,7 @@ Defining teams unlocks a dedicated **Teams tab** and enriches every other tab wi
 - **Releases tab** — each release card shows a per-team commit and impact breakdown
 - **Components tab** — team ownership breakdown per component
 
-Without teams, all authors are grouped under a single **Community** label and the Teams tab is not shown.
+The Teams tab is not shown if teams are not specified in the configuration.
 
 `teams` is an object where each key is a team name and the value is an object with:
 
@@ -199,19 +208,23 @@ Each key is the canonical display name. Each value is a list of alternate names 
 
 ## Impact Score
 
-The impact score is a single number in the range 0–100 that answers: *who did the most meaningful, sustained work in this repository?* It balances three signals so that no single dimension can dominate the ranking:
+The impact score is a single number in the range 0–100 that answers: *who did the most meaningful, sustained work in this repository?* It balances four signals so that no single dimension can dominate the ranking:
 
 ```
-score = (commits / max_commits)         × 40
-      + (effective_lines / max_lines)   × 40
-      + (tenure_days / max_tenure)      × 20
+raw   = (commits / max_commits)       × 30
+      + (effective_lines / max_lines) × 30
+      + (tenure_days / max_tenure)    × 15
+      + (pr_merges / max_merges)      × 25
+
+score = raw × (100 / sum_of_active_weights)
 ```
 
-Each metric is normalized against the top performer in that dimension.
+Each metric is normalized against the top performer in that dimension. The final rescaling step keeps scores in the 0–100 range even when one or more dimensions are disabled (see [Tuning](#tuning)).
 
-- **Commits (40%)** — rewards consistent, incremental contribution.
-- **Effective lines (40%)** — volume of real code changed, after noise filtering. Reformats and reverts score near zero.
-- **Tenure (20%)** — days between first and last commit. A burst of 500 commits over one week scores lower than 500 commits spread over three years.
+- **Commits (30%)** — rewards consistent, incremental contribution.
+- **Effective lines (30%)** — volume of real code changed, after noise filtering. Reformats and reverts score near zero.
+- **Tenure (15%)** — days between first and last commit. A burst of 500 commits over one week scores lower than 500 commits spread over three years.
+- **PR Merges (25%)** — number of pull requests merged into the primary branch, credited to the committer (the person who pressed the merge button). Includes true merge commits and squash/rebase merges detected by commit message heuristics.
 
 ### Noise filtering
 
@@ -227,24 +240,38 @@ The exact configured values and computed cap are displayed on the **Impact** tab
 
 | Key | Default | Description |
 |-----|---------|-------------|
+| `impact_w_commits` | `30` | Weight applied to the commit count dimension. Set to `0` to exclude commits from scoring. |
+| `impact_w_lines` | `30` | Weight applied to the effective lines changed dimension. Set to `0` to exclude lines from scoring. |
+| `impact_w_tenure` | `15` | Weight applied to active tenure in days. Set to `0` to exclude tenure from scoring. |
+| `impact_w_merges` | `25` | Weight applied to the PR merge count dimension. Set to `0` to exclude merges from scoring. |
 | `impact_use_net_lines` | `true` | `true` → `\|adds − dels\|` per commit; `false` → raw `adds + dels`. |
 | `impact_wash_window_days` | `7` | Size of the wash-window in days. Set to `0` to disable. |
 | `impact_wash_min_gross` | `200` | Minimum gross lines in a bucket to trigger wash detection. |
 | `impact_line_cap_percentile` | `95` | Per-commit line cap percentile. Set to `0` to disable. |
 
+### PR merge detection
+
+The PR Merges dimension counts merges into `primary_branch`. Two detection strategies are applied:
+
+- **True merge commits** — any commit with two or more parents (a `git merge --no-ff`).
+- **Heuristic merges** — single-parent commits whose subject matches one of:
+  - Contains `Pull request #` (GitHub squash/rebase merge)
+  - Starts with `Merge remote-tracking branch` (git push-based workflow)
+  - Starts with `Merge branch <name>` where `<name>` is not the primary branch itself
+
+The committer (`git log %cn/%ce`) receives credit — the author of the merged branch does not. Credit accumulates across all repositories (main and support repos).
+
 ### Tuning
 
-The defaults suit most open-source projects. To change the metric weights, edit the class constants at the top of `gitstats.py` (must sum to 100):
+Weights are configured via `config.json` using the `impact_w_*` keys (see the table above). **All four weights must sum to exactly 100** — if they do not, the program exits with an error. When a weight is `0` that dimension is excluded from scoring entirely and its card is hidden from the Impact tab; the remaining active dimensions must still sum to 100.
 
-```python
-IMPACT_W_COMMITS = 40   # commit count
-IMPACT_W_LINES   = 40   # effective lines changed
-IMPACT_W_TENURE  = 20   # active tenure in days
-```
+The same weights can also be changed permanently by editing the class constants at the top of `gitstats.py`; the config file always takes precedence over the class defaults when a key is present.
 
-- **Raise `IMPACT_W_COMMITS`, lower `IMPACT_W_LINES`** for projects that value steady incremental work over large code drops.
-- **Raise `IMPACT_W_LINES`, lower `IMPACT_W_COMMITS`** for greenfield codebases where volume of real code matters more than commit discipline.
-- **Raise `IMPACT_W_TENURE`** to weight long-term contributors more heavily relative to recent high-activity newcomers.
+- **Raise `impact_w_commits`, lower `impact_w_lines`** for projects that value steady incremental work over large code drops.
+- **Raise `impact_w_lines`, lower `impact_w_commits`** for greenfield codebases where volume of real code matters more than commit discipline.
+- **Raise `impact_w_tenure`** to weight long-term contributors more heavily relative to recent high-activity newcomers.
+- **Raise `impact_w_merges`** to heavily reward reviewers and integrators who merge many PRs.
+- **Set `impact_w_merges: 0`** for repositories that do not use a PR workflow or whose primary branch has no merge commits.
 - **Set `impact_use_net_lines: false`** if gross volume is genuinely meaningful (e.g., large automated test generation).
 - **Lower `impact_line_cap_percentile`** (e.g., `80`) for tighter outlier control; `0` to disable.
 - **Lower `impact_wash_window_days`** (e.g., `3`) for high-frequency repos where revert pairs happen within days.
