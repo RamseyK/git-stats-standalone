@@ -2042,6 +2042,132 @@ class TestTagImpacts:
             for team in tag['team_impacts'].values():
                 assert 0.0 <= team['impact'] <= 100.0
 
+    # ── Per-tag merge count consistency ──────────────────────────────────
+
+    def test_merges_field_preserved_through_score_tag_entities(self, gs):
+        """_score_tag_entities must pass the 'merges' count through to its
+        output unchanged — the tooltip and impact score both depend on it."""
+        ts = self._TS
+        authors = {
+            'Alice': {'commits': 5, 'add': 100, 'del': 0,
+                      'first_ts': ts, 'last_ts': ts + 86400, 'merges': 3},
+            'Bob':   {'commits': 3, 'add': 50,  'del': 0,
+                      'first_ts': ts, 'last_ts': ts + 86400, 'merges': 0},
+        }
+        result = {r['name']: r for r in gs._compute_tag_impacts(authors)}
+        assert result['Alice']['merges'] == 3, \
+            "merges count must be passed through _score_tag_entities unchanged"
+        assert result['Bob']['merges'] == 0
+
+    @pytest.fixture(scope='class')
+    def tagged_merge_repo(self, tmp_path_factory):
+        """Synthetic repo with two release tags and a known set of PR merges.
+
+        Timeline on 'main' (explicit dates ensure deterministic tag sort order):
+          A  — 2020-01-01  initial commit
+          B  — 2020-02-01  'Merge pull request #1 from user/feat-a'  [tag v1.0]
+          C  — 2020-03-01  plain commit
+          D  — 2020-04-01  'Merge pull request #2 from user/feat-b'
+          E  — 2020-05-01  'Merge pull request #3 from user/feat-c'  [tag v2.0]
+
+        All commits authored and committed by 'Merger' <merger@example.com>.
+
+        Expected per-tag merge counts for 'Merger':
+          v1.0 range (all commits up to v1.0): 1 merge  (B)
+          v2.0 range (v1.0..v2.0, C–E):        2 merges (D, E)
+        Global merge count (via _collect_merges --first-parent): 3
+        """
+        import pathlib, os as _os
+        repo = str(tmp_path_factory.mktemp('tagged_merge_repo'))
+
+        def git(*args, date=None):
+            env = dict(_os.environ)
+            if date:
+                env['GIT_AUTHOR_DATE']    = date
+                env['GIT_COMMITTER_DATE'] = date
+            env['GIT_CONFIG_COUNT']   = '1'
+            env['GIT_CONFIG_KEY_0']   = 'commit.gpgsign'
+            env['GIT_CONFIG_VALUE_0'] = 'false'
+            subprocess.run(['git', '-C', repo] + list(args),
+                           check=True, capture_output=True, env=env)
+
+        git('init', '-b', 'main')
+        git('config', 'user.email', 'merger@example.com')
+        git('config', 'user.name', 'Merger')
+
+        pathlib.Path(repo, 'init.txt').write_text('init')
+        git('add', '.')
+        git('commit', '-m', 'Initial commit', date='2020-01-01T00:00:00')             # A
+
+        pathlib.Path(repo, 'feat_a.txt').write_text('feat_a')
+        git('add', '.')
+        git('commit', '-m', 'Merge pull request #1 from user/feat-a',
+            date='2020-02-01T00:00:00')                                                # B
+        git('tag', 'v1.0')
+
+        pathlib.Path(repo, 'plain.txt').write_text('plain')
+        git('add', '.')
+        git('commit', '-m', 'Plain commit', date='2020-03-01T00:00:00')               # C
+
+        pathlib.Path(repo, 'feat_b.txt').write_text('feat_b')
+        git('add', '.')
+        git('commit', '-m', 'Merge pull request #2 from user/feat-b',
+            date='2020-04-01T00:00:00')                                                # D
+
+        pathlib.Path(repo, 'feat_c.txt').write_text('feat_c')
+        git('add', '.')
+        git('commit', '-m', 'Merge pull request #3 from user/feat-c',
+            date='2020-05-01T00:00:00')                                                # E
+        git('tag', 'v2.0')
+
+        return repo
+
+    def test_per_tag_merge_counts_match_expected(
+            self, tagged_merge_repo, tmp_path_factory):
+        """Each tag entry in data['tags'] must carry the correct per-tag merge count
+        for each author, matching what _is_pr_merge would detect in that range."""
+        tmp = str(tmp_path_factory.mktemp('tagged_merge_cfg'))
+        cfg = make_config(tmp, primary_branch='main',
+                          release_tag_prefix='v', max_release_tags=10)
+        gs = gitstats.GitStats(tagged_merge_repo, cfg)
+        gs.collect()
+
+        tags = {t['name']: t for t in gs.data['tags']}
+        assert 'v1.0' in tags, "v1.0 tag not found in collected data"
+        assert 'v2.0' in tags, "v2.0 tag not found in collected data"
+
+        def author_merges(tag_entry, name):
+            for a in tag_entry['authors']:
+                if a['name'] == name:
+                    return a.get('merges', 0)
+            return 0
+
+        assert author_merges(tags['v1.0'], 'Merger') == 1, \
+            "v1.0 must credit Merger with exactly 1 merge (commit B)"
+        assert author_merges(tags['v2.0'], 'Merger') == 2, \
+            "v2.0 must credit Merger with exactly 2 merges (commits D and E)"
+
+    def test_global_merge_count_credits_full_primary_branch_history(
+            self, tagged_merge_repo, tmp_path_factory):
+        """The global merge count in data['authors'] (from _collect_merges) must
+        reflect ALL PR merges on the primary branch across the entire repo history,
+        not just commits covered by release tags.
+
+        Note: the global count and the sum of per-tag counts serve different scopes
+        and are not required to match — tags may not cover the full history (commits
+        before the first tag or after the latest tag are outside any release window).
+        """
+        tmp = str(tmp_path_factory.mktemp('tagged_merge_global_cfg'))
+        cfg = make_config(tmp, primary_branch='main',
+                          release_tag_prefix='v', max_release_tags=10)
+        gs = gitstats.GitStats(tagged_merge_repo, cfg)
+        gs.collect()
+
+        global_merges = gs.data['authors'].get('Merger', {}).get('merges', 0)
+        # Repo has exactly 3 PR-merge subjects on main (commits B, D, E).
+        assert global_merges == 3, \
+            f"Expected 3 global merges for Merger (one per PR subject), got {global_merges}"
+
     # ── HTML output ───────────────────────────────────────────────────────
 
     def test_html_release_cards_show_impact_badge(self, std_gs, tmp_path_factory):
@@ -2053,6 +2179,32 @@ class TestTagImpacts:
         html = generate_html(std_gs, tmp_path_factory, 'tag_tooltip_html')
         # Author tooltips encode 'Commits:' in the title attribute
         assert 'Commits:' in html
+
+    def test_html_release_author_tooltip_contains_merges(self, std_gs, tmp_path_factory):
+        """Author tooltips must include 'Merges:' when impact_w_merges > 0."""
+        assert std_gs.IMPACT_W_MERGES > 0, "Test requires non-zero merges weight"
+        html = generate_html(std_gs, tmp_path_factory, 'tag_tooltip_merges_html')
+        assert 'Merges:' in html, \
+            "Author tooltip must contain 'Merges:' when IMPACT_W_MERGES > 0"
+
+    def test_html_release_author_tooltip_omits_merges_when_weight_zero(
+            self, repo_path, tmp_path_factory):
+        """When impact_w_merges=0, 'Merges:' must not appear inside title= tooltip
+        attributes on the Releases tab.  (It may still appear in JS template strings
+        for the Authors tab, which are not gated by the weight.)"""
+        import re as _re
+        tmp = str(tmp_path_factory.mktemp('tag_tooltip_no_merges'))
+        cfg = make_config(tmp, primary_branch='main',
+                          impact_w_commits=40, impact_w_lines=40,
+                          impact_w_tenure=20, impact_w_merges=0)
+        gs = gitstats.GitStats(repo_path, cfg)
+        gs.collect()
+        html = generate_html(gs, tmp_path_factory, 'tag_tooltip_no_merges_html')
+        # title= attributes use &#10; as separator; 'Merges:' must not appear
+        # inside any title="..." attribute.
+        title_with_merges = _re.search(r'title="[^"]*Merges:[^"]*"', html)
+        assert title_with_merges is None, \
+            "title= attributes must not contain 'Merges:' when IMPACT_W_MERGES=0"
 
     def test_html_release_team_chip_tooltip_present(self, std_gs, tmp_path_factory):
         html = generate_html(std_gs, tmp_path_factory, 'tag_team_tip_html')
