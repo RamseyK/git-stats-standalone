@@ -3652,6 +3652,47 @@ class TestDetectMerge:
         assert gs._detect_merge(self._NO_PARENTS, self._SAME_EMAIL, self._SAME_EMAIL,
                                  "Merge branch 'feature/cool-thing'") is True
 
+    def test_merge_branch_primary_with_url_into_non_primary_excluded(self, gs):
+        """Bitbucket-style subject that names primary as source and non-primary as target
+        must be excluded (source-is-primary check fires first)."""
+        assert gs._detect_merge(
+            self._NO_PARENTS, self._SAME_EMAIL, self._SAME_EMAIL,
+            "Merge branch 'main' of https://bitbucket.example.org/test into bugfix/asdf",
+        ) is False
+
+    def test_merge_remote_tracking_primary_into_non_primary_excluded(self, gs):
+        """'Merge remote-tracking branch <origin/primary> into <non-primary>' must be
+        excluded — the explicit non-primary target (into staging) marks it as a sync."""
+        assert gs._detect_merge(
+            self._NO_PARENTS, self._SAME_EMAIL, self._SAME_EMAIL,
+            "Merge remote-tracking branch 'origin/main' into staging",
+        ) is False
+
+    def test_merge_branch_non_primary_into_non_primary_excluded(self, gs):
+        """'Merge branch <non-primary> into <non-primary>' must be excluded —
+        neither the source nor the destination is the primary branch."""
+        assert gs._detect_merge(
+            self._NO_PARENTS, self._SAME_EMAIL, self._SAME_EMAIL,
+            "Merge branch 'develop' into staging",
+        ) is False
+
+    def test_merge_branch_feature_into_primary_credited(self, gs):
+        """'Merge branch <feature> into <primary>' must be credited — this is the
+        normal case of a PR landing on the primary branch."""
+        assert gs._detect_merge(
+            self._NO_PARENTS, self._SAME_EMAIL, self._SAME_EMAIL,
+            "Merge branch 'feature/my-work' into main",
+        ) is True
+
+    def test_into_non_primary_exclusion_unconditional(self, gs):
+        """The non-primary-target exclusion cannot be overridden by another pattern."""
+        # 'merge remote-tracking branch' also matches, but 'into staging'
+        # unconditionally marks this as a sync commit.
+        assert gs._detect_merge(
+            self._NO_PARENTS, self._SAME_EMAIL, self._SAME_EMAIL,
+            "Merge remote-tracking branch 'origin/feature' into staging",
+        ) is False
+
     # ── Integration: merge lines excluded from author/team totals ─────────────
 
     def test_merge_lines_excluded_from_author_totals(self, std_gs):
@@ -3823,6 +3864,60 @@ class TestIsPrMerge:
         gs = gitstats.GitStats(str(tmp_path), cfg)
         assert gs._is_pr_merge(self._TWO_PARENTS, self._SAME_EMAIL, self._SAME_EMAIL,
                                 "Merge branch 'feature/x'") is True
+
+    # ── Explicit non-primary target ("into <branch>") exclusion ──────────────
+
+    def test_bitbucket_style_primary_into_non_primary_not_pr_merge(self, gs):
+        """Bitbucket URL-style subject with primary source and non-primary target
+        must not count as a PR merge (true merge variant)."""
+        assert gs._is_pr_merge(
+            self._TWO_PARENTS, self._SAME_EMAIL, self._SAME_EMAIL,
+            "Merge branch 'main' of https://bitbucket.example.org/test into bugfix/asdf",
+        ) is False
+
+    def test_remote_tracking_primary_into_non_primary_not_pr_merge(self, gs):
+        """'Merge remote-tracking branch origin/main into staging' must not count
+        as a PR merge — the subject explicitly targets a non-primary branch."""
+        # Single-parent heuristic commit
+        assert gs._is_pr_merge(
+            self._NO_PARENTS, self._SAME_EMAIL, self._SAME_EMAIL,
+            "Merge remote-tracking branch 'origin/main' into staging",
+        ) is False
+        # True merge variant
+        assert gs._is_pr_merge(
+            self._TWO_PARENTS, self._SAME_EMAIL, self._SAME_EMAIL,
+            "Merge remote-tracking branch 'origin/main' into staging",
+        ) is False
+
+    def test_merge_branch_non_primary_into_non_primary_not_pr_merge(self, gs):
+        """'Merge branch develop into staging' must not count as a PR merge —
+        neither source nor target is the primary branch."""
+        # Single-parent heuristic commit
+        assert gs._is_pr_merge(
+            self._NO_PARENTS, self._SAME_EMAIL, self._SAME_EMAIL,
+            "Merge branch 'develop' into staging",
+        ) is False
+        # True merge variant
+        assert gs._is_pr_merge(
+            self._TWO_PARENTS, self._SAME_EMAIL, self._SAME_EMAIL,
+            "Merge branch 'develop' into staging",
+        ) is False
+
+    def test_merge_branch_feature_into_primary_is_pr_merge(self, gs):
+        """'Merge branch feature into primary' IS a PR merge — explicit primary target."""
+        assert gs._is_pr_merge(
+            self._TWO_PARENTS, self._SAME_EMAIL, self._SAME_EMAIL,
+            "Merge branch 'feature/my-work' into main",
+        ) is True
+
+    def test_committer_differs_sync_subject_not_pr_merge(self, gs):
+        """Even when committer ≠ author, a sync subject (into non-primary) must
+        not be credited.  The sync exclusion in _is_pr_merge overrides the
+        committer-differs result from _detect_merge."""
+        assert gs._is_pr_merge(
+            self._NO_PARENTS, 'bot@github.com', 'author@x.com',
+            "Merge remote-tracking branch 'origin/main' into staging",
+        ) is False
 
 
 # ---------------------------------------------------------------------------

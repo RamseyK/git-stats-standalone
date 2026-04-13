@@ -402,8 +402,13 @@ class GitStats:
           True merge        — two or more parents.
           Subject heuristic — matches built-in or user-supplied patterns.
                               When merge_exclude_primary_branch is True (default),
-                              "merge branch '<primary>'" subjects are excluded
-                              unless another configured pattern also matches.
+                              two additional exclusions apply:
+                                (a) source-is-primary subjects ("Merge branch
+                                    '<primary>'") are excluded unless a PR-
+                                    specific pattern also matches;
+                                (b) subjects with an explicit non-primary target
+                                    ("... into <branch>") are unconditionally
+                                    excluded — the target is stated explicitly.
           Committer differs — committer e-mail ≠ author e-mail; catches squash
                               merges whose edited messages bypass subject
                               heuristics.  Always applied regardless of other
@@ -416,23 +421,35 @@ class GitStats:
         # Subject heuristic: all configured patterns are checked first.
         is_subject_heuristic = any(h in s for h in self.merge_heuristics)
 
-        # Primary-branch exclusion: "merge branch '<primary>'" subjects are sync
-        # commits that pull the primary branch into a feature branch rather than
-        # a PR landing on it.  When merge_exclude_primary_branch is True (the
-        # default), negate the heuristic match — but only when 'merge branch' was
-        # the sole reason it matched; if another pattern also matches, the commit
-        # is still credited.
+        # Primary-branch exclusion: sync commits that are not a PR landing on
+        # the primary branch.  Applied when merge_exclude_primary_branch is True.
+        #
+        # Two independent checks, applied in order:
+        #
+        # (1) Source is the primary branch — "Merge branch '<primary>'"
+        #     subjects pull the primary branch into a feature branch.
+        #     A 'pull request #' co-match overrides the exclusion; other
+        #     direction-describing patterns ('merge branch', 'merge
+        #     remote-tracking branch') do not.
+        #
+        # (2) Explicit non-primary target — subject ends with "into <branch>"
+        #     where <branch> is not the primary branch.  Unconditional: the
+        #     subject explicitly states the commit is not landing on primary.
         if is_subject_heuristic and self.merge_exclude_primary_branch:
-            is_primary_sync = (
+            is_primary_source = (
                 s.startswith(f"merge branch '{pb}'")
                 or s.startswith(f'merge branch "{pb}"')
                 or s.startswith(f'merge branch {pb} ')
                 or s == f'merge branch {pb}'
             )
-            if is_primary_sync:
+            if is_primary_source:
                 is_subject_heuristic = any(
                     h in s for h in self.merge_heuristics if h != 'merge branch'
                 )
+            if is_subject_heuristic:
+                into_m = re.search(r'\binto\s+(\S+)\s*$', s)
+                if into_m and into_m.group(1).strip("'\"") != pb:
+                    is_subject_heuristic = False
 
         # Committer-differs: always applied regardless of heuristic settings —
         # catches squash merges whose commit messages bypass all subject patterns.
@@ -445,35 +462,47 @@ class GitStats:
     def _is_pr_merge(self, parents_str: str, c_email: str, a_email: str, subject: str) -> bool:
         """Return True when a commit is a PR merge *into* the primary branch.
 
-        Extends _detect_merge with an additional exclusion for sync commits —
-        true merges whose subject indicates the primary branch being pulled
-        into another branch (e.g. "Merge branch 'main' into feature/x").
+        Extends _detect_merge with a sync-commit exclusion applied to all
+        commits (not just true merges):
 
-        _collect_merges avoids this naturally by walking ``--first-parent``
-        on the primary branch, which only visits commits that sit on that
-        branch's history.  The tag loop has no such constraint and sees all
-        commits between tags, so this check provides the equivalent filter.
+          Source is primary  — "Merge branch '<primary>'" or
+                               "Merge remote-tracking branch 'origin/<primary>'"
+                               subject patterns.
+          Non-primary target — subject ends with "into <branch>" where
+                               <branch> is not the primary branch.
+
+        _collect_merges avoids sync commits naturally by walking
+        ``--first-parent`` on the primary branch.  The tag loop has no such
+        constraint and sees all commits between tags, so this check provides
+        the equivalent filter.
 
         Line exclusion always uses _detect_merge so that sync-commit diffs
         are still suppressed even though the committer is not credited.
         """
         if not self._detect_merge(parents_str, c_email, a_email, subject):
             return False
-        # True merge commits need a direction check: two-parent merges that
-        # pull the primary branch into another branch are sync commits, not PRs.
-        if len(parents_str.split()) >= 2:
-            s  = subject.lower().strip()
-            pb = self.primary_branch.lower()
-            is_pb_sync = (
-                s.startswith(f"merge branch '{pb}'")
-                or s.startswith(f'merge branch "{pb}"')
-                or s.startswith(f'merge branch {pb} ')
-                or s == f'merge branch {pb}'
-                or (s.startswith('merge remote-tracking branch')
-                    and bool(re.search(rf'/{re.escape(pb)}(?:[\'"\s]|$)', s)))
-            )
-            if is_pb_sync:
-                return False
+        # Sync commit exclusion: applied to all commits regardless of parent
+        # count.  _collect_merges avoids sync commits naturally via
+        # --first-parent; the tag loop sees all commits between tags and needs
+        # this filter.
+        s  = subject.lower().strip()
+        pb = self.primary_branch.lower()
+        # (1) Source is the primary branch (remote-tracking or local).
+        is_pb_sync = (
+            s.startswith(f"merge branch '{pb}'")
+            or s.startswith(f'merge branch "{pb}"')
+            or s.startswith(f'merge branch {pb} ')
+            or s == f'merge branch {pb}'
+            or (s.startswith('merge remote-tracking branch')
+                and bool(re.search(rf'/{re.escape(pb)}(?:[\'"\s]|$)', s)))
+        )
+        # (2) Explicit non-primary target: "... into <branch>" where branch ≠ primary.
+        if not is_pb_sync:
+            into_m = re.search(r'\binto\s+(\S+)\s*$', s)
+            if into_m and into_m.group(1).strip("'\"") != pb:
+                is_pb_sync = True
+        if is_pb_sync:
+            return False
         return True
 
     def _collect_commits(self, repo_path, component_dirs, components,
