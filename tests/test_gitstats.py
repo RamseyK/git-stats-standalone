@@ -16,6 +16,7 @@ Requirements:
 
 import json
 import os
+import re
 import subprocess
 import sys
 
@@ -1764,6 +1765,77 @@ class TestReleaseTags:
         gs.collect()
         for tag in gs.data['tags']:
             assert len(tag['top_teams']) <= 2
+
+    def test_issues_key_present_on_every_tag(self, std_gs):
+        """Every tag dict must have an 'issues' key (list), even when no prefixes are configured."""
+        for tag in std_gs.data['tags']:
+            assert 'issues' in tag
+            assert isinstance(tag['issues'], list)
+
+    def test_issue_tag_prefixes_invalid_skipped(self, repo_path, tmp_path):
+        """Invalid prefixes (lowercase, digits, mixed) must be silently skipped."""
+        cfg = make_config(tmp_path, issue_tag_prefixes=['valid', 'VALID', '123', 'has space'])
+        gs = gitstats.GitStats(repo_path, cfg)
+        assert gs.issue_tag_prefixes == ['VALID']
+
+    def test_issue_tag_prefixes_empty_by_default(self, repo_path, tmp_path):
+        """When issue_tag_prefixes is absent from config, no regex is built."""
+        cfg = make_config(tmp_path)
+        gs = gitstats.GitStats(repo_path, cfg)
+        assert gs.issue_tag_prefixes == []
+        assert gs._issue_tag_re is None
+
+    def test_issue_tag_regex_matches_valid_tags(self, repo_path, tmp_path):
+        """Compiled regex must match well-formed PREFIX-digits tokens."""
+        cfg = make_config(tmp_path, issue_tag_prefixes=['PROJ', 'ABC'])
+        gs = gitstats.GitStats(repo_path, cfg)
+        assert gs._issue_tag_re is not None
+        assert gs._issue_tag_re.findall('fixes PROJ-1234 and ABC-9999') == ['PROJ-1234', 'ABC-9999']
+
+    def test_issue_tag_regex_ignores_non_matching(self, repo_path, tmp_path):
+        """Regex must not match partial tokens, bare prefixes, or wrong formats."""
+        cfg = make_config(tmp_path, issue_tag_prefixes=['PROJ'])
+        gs = gitstats.GitStats(repo_path, cfg)
+        # No digits after dash, no dash, different prefix, word boundary
+        assert gs._issue_tag_re.findall('PROJ- OTHER-123 XPROJ-1 PROJ') == []
+
+    def test_issue_tags_collected_from_commits(self, tmp_path):
+        """Issue tags in commit messages must be extracted and stored per release window."""
+        repo = str(tmp_path / 'repo')
+        os.makedirs(repo)
+        # Use -c flags so no global git config is required; disable signing for CI
+        base = ['git', '-c', 'user.name=Dev', '-c', 'user.email=dev@x.com',
+                '-c', 'commit.gpgsign=false', '-C', repo]
+        env = {**os.environ, 'GIT_AUTHOR_NAME': 'Dev', 'GIT_AUTHOR_EMAIL': 'dev@x.com',
+               'GIT_COMMITTER_NAME': 'Dev', 'GIT_COMMITTER_EMAIL': 'dev@x.com',
+               'GIT_AUTHOR_DATE': '2024-01-01T00:00:00', 'GIT_COMMITTER_DATE': '2024-01-01T00:00:00'}
+        def git(*args, extra_env=None):
+            e = {**env, **(extra_env or {})}
+            subprocess.check_call(base + list(args), env=e,
+                                  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        git('init', '-b', 'main')
+        git('commit', '--allow-empty', '-m', 'initial')
+        git('tag', 'v1.0')
+        env2 = {'GIT_AUTHOR_DATE': '2024-02-01T00:00:00', 'GIT_COMMITTER_DATE': '2024-02-01T00:00:00'}
+        git('commit', '--allow-empty', '-m', 'fix PROJ-1234 and PROJ-5678', extra_env=env2)
+        git('commit', '--allow-empty', '-m', 'feat PROJ-1234 again', extra_env=env2)
+        git('tag', 'v2.0')
+        cfg_path = make_config(tmp_path, issue_tag_prefixes=['PROJ'], max_release_tags=0)
+        gs = gitstats.GitStats(repo, cfg_path)
+        gs.collect()
+        v2 = next(t for t in gs.data['tags'] if t['name'] == 'v2.0')
+        # PROJ-1234 appears twice but must be deduplicated; PROJ-5678 once
+        assert set(v2['issues']) == {'PROJ-1234', 'PROJ-5678'}
+        # Must be sorted
+        assert v2['issues'] == sorted(v2['issues'])
+
+    def test_issue_tags_no_prefix_config_yields_empty_lists(self, repo_path, tmp_path):
+        """When no issue_tag_prefixes are configured, all issues lists must be empty."""
+        cfg = make_config(tmp_path, max_release_tags=0)
+        gs = gitstats.GitStats(repo_path, cfg)
+        gs.collect()
+        for tag in gs.data['tags']:
+            assert tag['issues'] == []
 
 
 # ---------------------------------------------------------------------------

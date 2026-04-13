@@ -287,6 +287,26 @@ class GitStats:
         self.max_authors_per_tag = int(config.get('max_authors_per_tag', 20))
         self.max_teams_per_tag   = int(config.get('max_teams_per_tag', 10))
 
+        # Issue tag prefixes for extracting ticket references from commit messages.
+        # Config format: "issue_tag_prefixes": ["PROJ", "ABC"]
+        # Each prefix must be one or more uppercase ASCII letters (e.g. "JIRA", "GH").
+        # Tags are matched as <PREFIX>-<digits> (e.g. "PROJ-1234").
+        self.issue_tag_prefixes = []
+        for p in config.get('issue_tag_prefixes', []):
+            if re.fullmatch(r'[A-Z]+', p):
+                self.issue_tag_prefixes.append(p)
+            else:
+                print(
+                    f"Warning: issue_tag_prefix {p!r} is invalid "
+                    f"(must be uppercase ASCII letters only) — skipping.",
+                    file=sys.stderr,
+                )
+        if self.issue_tag_prefixes:
+            _pfx_pat = '|'.join(re.escape(p) for p in self.issue_tag_prefixes)
+            self._issue_tag_re = re.compile(rf'\b(?:{_pfx_pat})-\d+\b')
+        else:
+            self._issue_tag_re = None
+
         # Central data store populated by collect() and consumed by generate_report().
         self.data = {
             'project_name': os.path.basename(os.path.abspath(repo_path)),
@@ -883,6 +903,7 @@ class GitStats:
                 'commits': 0, 'add': 0, 'del': 0,
                 'first_ts': float('inf'), 'last_ts': 0, 'merges': 0,
             })
+            tag_issues     = set()   # unique issue tags (e.g. "PROJ-123") in this window
             current_author = None
             current_team   = None
             current_skip_lines = False  # True for merge commits
@@ -899,6 +920,8 @@ class GitStats:
                     current_author = canon
                     current_team   = team
                     current_skip_lines = self._detect_merge(parents_str, c_email, a_email, subject)
+                    if self._issue_tag_re:
+                        tag_issues.update(self._issue_tag_re.findall(subject))
 
                     if canon not in tag_authors:
                         tag_authors[canon] = {
@@ -954,12 +977,18 @@ class GitStats:
                 top_teams    = sorted(tag_teams.keys(),
                                       key=lambda t: tag_teams[t]['commits'],
                                       reverse=True)[:self.max_teams_per_tag]
+                try:
+                    tag_ts = int(self._run_git(['log', '-1', '--format=%at', tag]).strip())
+                except (subprocess.CalledProcessError, ValueError):
+                    tag_ts = 0
                 self.data['tags'].append({
                     'name':         tag,
+                    'date_ts':      tag_ts,
                     'count':        sum(a['commits'] for a in tag_authors.values()),
                     'authors':      ranked[:self.max_authors_per_tag],
                     'top_teams':    [(t, tag_teams[t]['commits']) for t in top_teams],
                     'team_impacts': team_impacts,
+                    'issues':       sorted(tag_issues),
                 })
 
         self._compute_impact()
@@ -1324,6 +1353,25 @@ class GitStats:
             return '&#10;'.join(parts)
 
         for t in self.data['tags']:
+            tag_date = (datetime.datetime.fromtimestamp(t['date_ts']).strftime('%b %d, %Y')
+                        if t.get('date_ts') else '')
+            issues = t.get('issues', [])
+            if issues:
+                issue_chips = ''.join(
+                    f'<span class="inline-flex items-center text-[11px] font-bold px-2 py-0.5 rounded-lg '
+                    f'bg-blue-50 text-blue-700 border border-blue-100">'
+                    f'{html.escape(issue)}</span>'
+                    for issue in issues
+                )
+                issues_section = (
+                    f'<div class="mt-4 pt-4 border-t border-slate-100">'
+                    f'<p class="text-[10px] font-bold text-slate-400 uppercase tracking-widest mb-2">'
+                    f'Referenced Issues <span class="normal-case font-semibold text-slate-300">({len(issues)})</span></p>'
+                    f'<div class="flex flex-wrap gap-1.5">{issue_chips}</div>'
+                    f'</div>'
+                )
+            else:
+                issues_section = ''
             author_items = ''.join([
                 f'<div class="flex justify-between items-center text-sm bg-slate-50 p-2 rounded-xl '
                 f'border border-transparent hover:border-slate-200 transition-all">'
@@ -1356,6 +1404,7 @@ class GitStats:
                 <div class="flex flex-col md:flex-row justify-between items-start md:items-center gap-4 mb-6 border-b border-slate-100 pb-6">
                     <div>
                         <span class="text-3xl font-black text-slate-900 group-hover:text-blue-600 transition-colors">{t["name"]}</span>
+                        {f'<p class="text-xs font-semibold text-slate-400 mt-0.5">{tag_date}</p>' if tag_date else ''}
                         <p class="text-[10px] font-bold text-slate-400 uppercase tracking-widest mt-1">Release Contributors</p>
                         <div class="flex flex-wrap gap-1 mt-2">{team_badges}</div>
                     </div>
@@ -1364,6 +1413,7 @@ class GitStats:
                 <div class="grid grid-cols-2 lg:grid-cols-4 xl:grid-cols-5 gap-3">
                     {author_items}
                 </div>
+                {issues_section}
             </div>''')
         return '\n'.join(parts)
 
