@@ -79,6 +79,8 @@ All configuration lives in a single JSON file. Every key is optional.
   "impact_w_tenure": 15,
   "impact_w_merges": 25,
 
+  "merge_exclude_primary_branch": true,
+
   "impact_use_net_lines": true,
   "impact_wash_window_days": 7,
   "impact_wash_min_gross": 200,
@@ -105,7 +107,8 @@ All configuration lives in a single JSON file. Every key is optional.
 | `summary_velocity_days` | `[30, 90]` | Day windows shown as velocity cards on the Summary tab. Each entry produces one card comparing commits in the last N days against the prior N days. |
 | `monthly_top_authors` | `3` | Number of top contributors listed in the monthly commit activity chart tooltip. Set to `0` to show only the total commit count. |
 | `bus_factor_threshold` | `0.5` | Fraction (0–1) used to compute both bus factors — the fewest contributors whose combined commits (or PR merges) reach this fraction. The PR Merges bus factor is hidden when `impact_w_merges` is `0`. |
-| `merge_heuristics` | *(see below)* | Substrings matched case-insensitively against commit subjects to detect squash/rebase merges. Replaces the built-in heuristics entirely when present. |
+| `merge_heuristics` | *(see below)* | Substrings matched case-insensitively against commit subjects to detect squash/rebase merges. Replaces the built-in subject patterns entirely when present. |
+| `merge_exclude_primary_branch` | `true` | When `true`, subjects matching `"Merge branch '<primary>'"` are excluded from the subject heuristics — they indicate a sync commit pulling the primary branch into a feature branch rather than a PR landing. Set to `false` to credit those commits. |
 | `component_markers` | *(see below)* | Filenames that identify a component root. Any directory directly containing one of these files becomes a component in the churn chart. Replaces the default set entirely. |
 | `loc_extensions` | *(see below)* | File extensions (with leading dot) counted toward the **Lines of Code** tile. Matched case-insensitively. Replaces the default set entirely. |
 
@@ -115,16 +118,19 @@ In addition to true merge commits (two or more parents), GitStats detects squash
 
 - Subject contains `Pull request #`
 - Subject starts with `Merge remote-tracking branch`
-- Subject starts with `Merge branch` but does **not** merge the primary branch back into itself
-- Committer e-mail differs from author e-mail — catches squash merges where the message was edited before landing, which subjects heuristics miss
+- Subject starts with `Merge branch`
 
-When `merge_heuristics` is present in config it **replaces** the built-in patterns entirely (including the committer-differs check). Each string is matched as a case-insensitive substring of the commit subject. The primary-branch self-merge exclusion is not applied to custom patterns — only the built-in defaults include that logic.
+The committer e-mail differs from author e-mail check is **always applied** regardless of whether built-in or custom heuristics are active — it catches squash merges whose commit messages were edited before landing, bypassing all subject patterns.
+
+When `merge_exclude_primary_branch` is `true` (the default), subjects that match `"Merge branch '<primary>'"` are excluded from the `Merge branch` pattern — they indicate a sync commit pulling the primary branch into a feature branch, not a PR landing. If another configured pattern also matches the same subject, the exclusion does not apply. Set `merge_exclude_primary_branch` to `false` to credit these commits.
+
+When `merge_heuristics` is present in config it **replaces** the built-in subject patterns entirely. Each string is matched as a case-insensitive substring of the commit subject. The committer-differs check and the `merge_exclude_primary_branch` exclusion both continue to apply.
 
 ```json
 "merge_heuristics": ["Pull request #", "Merge remote-tracking branch"]
 ```
 
-Set to an empty array `[]` to count only true merge commits (two-parent merges) and ignore all subject-based detection.
+Set to an empty array `[]` to rely solely on the committer-differs check and true merge commits (two-parent merges); all subject-based detection is disabled.
 
 **Line count exclusion:** any commit identified as a merge — true or heuristic — has its line additions and deletions excluded from all author and team metrics. Component churn is still tracked. See [Noise filtering — Step 0](#noise-filtering) for the full rationale.
 
@@ -133,10 +139,10 @@ Set to an empty array `[]` to count only true merge commits (two-parent merges) 
 A component is any directory whose immediate contents include a marker file. The built-in defaults are:
 
 ```
-make.py  pyproject.toml  setup.py  Makefile  meta.yaml
+make.py  pyproject.toml  setup.py  Makefile  meta.yaml  Cargo.toml  CMakeLists.txt
 ```
 
-Add build-system-specific markers (`"Cargo.toml"`, `"CMakeLists.txt"`, `"go.mod"`, `"BUILD"`) or remove any that appear in too many directories and would fragment the chart into trivial components.
+Add build-system-specific markers (`"go.mod"`, `"BUILD"`) or remove any that appear in too many directories and would fragment the chart into trivial components.
 
 #### Lines of code extensions
 
@@ -270,7 +276,7 @@ The exact configured values and computed cap are displayed on the **Impact** tab
 
 ### PR merge detection
 
-The PR Merges dimension counts merges into `primary_branch` using two strategies: true merge commits (two or more parents) and heuristic detection of squash/rebase merges by commit subject — see [Merge heuristics](#merge-heuristics) for the built-in patterns and how to override them.
+The PR Merges dimension counts merges into `primary_branch` using three strategies: true merge commits (two or more parents), heuristic detection of squash/rebase merges by commit subject, and a committer-differs check that catches squash merges whose messages were edited before landing — see [Merge heuristics](#merge-heuristics) for the built-in patterns and how to configure them.
 
 The committer (`git log %cn/%ce`) receives credit — the author of the merged branch does not. Credit accumulates across all repositories (main and support repos).
 

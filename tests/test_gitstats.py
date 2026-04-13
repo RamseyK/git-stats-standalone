@@ -3134,11 +3134,20 @@ class TestPRMergeRate:
 
     # ── Configurable merge heuristics ────────────────────────────────────────
 
-    def test_default_merge_heuristics_is_none(self, repo_path, tmp_path):
-        """When 'merge_heuristics' is absent from config, the attribute must be None."""
+    def test_default_merge_heuristics_equals_class_constant(self, repo_path, tmp_path):
+        """When 'merge_heuristics' is absent from config, the attribute must equal
+        the class-level _DEFAULT_MERGE_HEURISTICS constant and the default flag must
+        be set so that built-in logic (primary-branch exclusion, committer-differs)
+        still applies."""
         cfg = make_config(tmp_path)
         gs = gitstats.GitStats(repo_path, cfg)
-        assert gs.merge_heuristics is None
+        assert gs.merge_heuristics == list(gitstats.GitStats._DEFAULT_MERGE_HEURISTICS)
+
+    def test_custom_merge_heuristics_clears_default_flag(self, repo_path, tmp_path):
+        """When merge_heuristics is supplied in config, _default_merge_heuristics
+        must be False — indicating user-supplied patterns are active."""
+        cfg = make_config(tmp_path, merge_heuristics=['squash merge'])
+        gs = gitstats.GitStats(repo_path, cfg)
 
     def test_custom_merge_heuristics_stored_lowercased(self, repo_path, tmp_path):
         """Configured merge_heuristics must be stored as lowercase strings."""
@@ -3242,6 +3251,115 @@ class TestPRMergeRate:
         alice_merges = gs.data['authors'].get('Alice', {}).get('merges', 0)
         assert bob_merges   == 1, f"Bob (committer) should have 1 merge, got {bob_merges}"
         assert alice_merges == 0, f"Alice (author) should have 0 merges, got {alice_merges}"
+
+    # ── Non-primary branch merges excluded ───────────────────────────────────
+
+    @pytest.fixture(scope='class')
+    def non_primary_merge_repo(self, tmp_path_factory):
+        """Repo where a heuristic-matching merge lands on a feature branch, not main.
+
+        Layout:
+          main:    A ──── C (plain commit, 'Add main work')
+          feature: A → B → M  where M = 'Merge pull request #7 from user/sub'
+
+        Only commits reachable via main's first-parent history should be credited.
+        M sits only on 'feature', so _collect_merges must not count it.
+        """
+        import pathlib
+        repo = str(tmp_path_factory.mktemp('non_primary_merge_repo'))
+
+        def git(*args):
+            subprocess.run(['git', '-C', repo] + list(args),
+                           check=True, capture_output=True)
+
+        git('init', '-b', 'main')
+        git('config', 'user.email', 'dev@example.com')
+        git('config', 'user.name', 'Dev')
+        git('config', 'commit.gpgsign', 'false')
+
+        # A — initial commit on main
+        pathlib.Path(repo, 'init.txt').write_text('init')
+        git('add', '.')
+        git('commit', '-m', 'Initial commit')
+
+        # Branch off to feature
+        git('checkout', '-b', 'feature')
+
+        # B — regular commit on feature
+        pathlib.Path(repo, 'feat.txt').write_text('feat')
+        git('add', '.')
+        git('commit', '-m', 'Feature work')
+
+        # M — heuristic merge commit on feature (NOT on main)
+        pathlib.Path(repo, 'sub.txt').write_text('sub')
+        git('add', '.')
+        git('commit', '-m', 'Merge pull request #7 from user/sub')
+
+        # Back to main — add an ordinary commit so main is ahead of A
+        git('checkout', 'main')
+        pathlib.Path(repo, 'main.txt').write_text('main')
+        git('add', '.')
+        git('commit', '-m', 'Add main work')
+
+        return repo
+
+    def test_merge_on_non_primary_branch_not_counted(
+            self, non_primary_merge_repo, tmp_path_factory):
+        """_collect_merges must not credit a PR-style merge that lands on a
+        feature branch rather than the primary branch.
+
+        The underlying mechanism is '--first-parent primary' in the git log
+        command: commits that exist only on other branches are never visited.
+        """
+        tmp = str(tmp_path_factory.mktemp('non_primary_cfg'))
+        cfg = make_config(tmp, primary_branch='main')
+        gs = gitstats.GitStats(non_primary_merge_repo, cfg)
+        gs.data['authors'] = {}
+        gs.data['teams']   = {}
+        gs._collect_merges(non_primary_merge_repo)
+
+        total = sum(a.get('merges', 0) for a in gs.data['authors'].values())
+        assert total == 0, (
+            f"Expected 0 merges (PR merge was on feature branch, not main), got {total}"
+        )
+
+    def test_same_merge_on_primary_branch_is_counted(
+            self, non_primary_merge_repo, tmp_path_factory):
+        """Control: an identical PR-style merge that DOES land on the primary
+        branch must be counted — confirming the exclusion is branch-specific,
+        not subject-specific."""
+        import pathlib
+        repo = str(tmp_path_factory.mktemp('primary_merge_control'))
+
+        def git(*args):
+            subprocess.run(['git', '-C', repo] + list(args),
+                           check=True, capture_output=True)
+
+        git('init', '-b', 'main')
+        git('config', 'user.email', 'dev@example.com')
+        git('config', 'user.name', 'Dev')
+        git('config', 'commit.gpgsign', 'false')
+
+        pathlib.Path(repo, 'init.txt').write_text('init')
+        git('add', '.')
+        git('commit', '-m', 'Initial commit')
+
+        # Same subject as M above — but now directly on main
+        pathlib.Path(repo, 'pr.txt').write_text('pr')
+        git('add', '.')
+        git('commit', '-m', 'Merge pull request #7 from user/sub')
+
+        tmp = str(tmp_path_factory.mktemp('primary_merge_control_cfg'))
+        cfg = make_config(tmp, primary_branch='main')
+        gs = gitstats.GitStats(repo, cfg)
+        gs.data['authors'] = {}
+        gs.data['teams']   = {}
+        gs._collect_merges(repo)
+
+        total = sum(a.get('merges', 0) for a in gs.data['authors'].values())
+        assert total == 1, (
+            f"Expected 1 merge (PR merge on main), got {total}"
+        )
 
     # ── Impact score — merges dimension ──────────────────────────────────────
 
@@ -3469,7 +3587,7 @@ class TestDetectMerge:
         assert gs._detect_merge(self._NO_PARENTS, ' same@x.com ', ' same@x.com ',
                                  'Fix bug') is False
 
-    # ── Custom merge_heuristics — committer-differs NOT applied ───────────────
+    # ── Custom merge_heuristics ───────────────────────────────────────────────
 
     def test_custom_heuristics_replace_defaults(self, tmp_path):
         cfg = make_config(str(tmp_path), primary_branch=self._PRIMARY,
@@ -3483,20 +3601,56 @@ class TestDetectMerge:
         # Built-in subject heuristics no longer apply
         assert gs._detect_merge(self._NO_PARENTS, self._SAME_EMAIL, self._SAME_EMAIL,
                                  'Merge pull request #5') is False
-        # Committer-differs not applied for custom heuristics
-        assert gs._detect_merge(self._NO_PARENTS, 'committer@x.com', 'author@y.com',
-                                 'Regular commit') is False
 
-    def test_empty_custom_heuristics_only_true_merges(self, tmp_path):
+    def test_committer_differs_always_applied_with_custom_heuristics(self, tmp_path):
+        """Committer-differs check must fire even when a custom heuristics list is used."""
+        cfg = make_config(str(tmp_path), primary_branch=self._PRIMARY,
+                          merge_heuristics=['landed via'])
+        gs = gitstats.GitStats(str(tmp_path), cfg)
+        # Different committer/author — must be detected regardless of heuristic list.
+        assert gs._detect_merge(self._NO_PARENTS, 'committer@x.com', 'author@y.com',
+                                 'Regular commit') is True
+
+    def test_committer_differs_always_applied_with_empty_heuristics(self, tmp_path):
+        """Committer-differs check must fire even when merge_heuristics=[]."""
         cfg = make_config(str(tmp_path), primary_branch=self._PRIMARY,
                           merge_heuristics=[])
         gs = gitstats.GitStats(str(tmp_path), cfg)
-        # Only true merges (2+ parents) are detected
+        assert gs._detect_merge(self._NO_PARENTS, 'committer@x.com', 'author@y.com',
+                                 'Regular commit') is True
+        # True merge still works
         assert gs._detect_merge(self._TWO_PARENTS, self._SAME_EMAIL, self._SAME_EMAIL, '') is True
+        # No subject match, same email → not a merge
         assert gs._detect_merge(self._NO_PARENTS, self._SAME_EMAIL, self._SAME_EMAIL,
                                  'Merge pull request #5') is False
-        assert gs._detect_merge(self._NO_PARENTS, 'committer@x.com', 'author@y.com',
-                                 'Regular commit') is False
+
+    # ── merge_exclude_primary_branch config flag ──────────────────────────────
+
+    def test_primary_branch_excluded_by_default(self, gs):
+        """'merge branch <primary>' is not detected as a merge by default."""
+        assert gs._detect_merge(self._NO_PARENTS, self._SAME_EMAIL, self._SAME_EMAIL,
+                                 "Merge branch 'main'") is False
+
+    def test_primary_branch_exclusion_disabled_via_config(self, tmp_path):
+        """When merge_exclude_primary_branch=false, primary-branch subjects are credited."""
+        cfg = make_config(str(tmp_path), primary_branch=self._PRIMARY,
+                          merge_exclude_primary_branch=False)
+        gs = gitstats.GitStats(str(tmp_path), cfg)
+        assert gs._detect_merge(self._NO_PARENTS, self._SAME_EMAIL, self._SAME_EMAIL,
+                                 "Merge branch 'main'") is True
+
+    def test_primary_branch_exclusion_does_not_suppress_other_pattern_matches(self, tmp_path):
+        """A primary-sync subject that ALSO matches another heuristic must still be credited."""
+        # Subject starts with 'merge branch main' but also contains 'pull request #'.
+        cfg = make_config(str(tmp_path), primary_branch=self._PRIMARY)
+        gs = gitstats.GitStats(str(tmp_path), cfg)
+        assert gs._detect_merge(self._NO_PARENTS, self._SAME_EMAIL, self._SAME_EMAIL,
+                                 "Merge branch 'main' - pull request #99") is True
+
+    def test_non_primary_merge_branch_not_affected_by_exclusion(self, gs):
+        """'merge branch <feature>' must still be credited regardless of exclusion setting."""
+        assert gs._detect_merge(self._NO_PARENTS, self._SAME_EMAIL, self._SAME_EMAIL,
+                                 "Merge branch 'feature/cool-thing'") is True
 
     # ── Integration: merge lines excluded from author/team totals ─────────────
 

@@ -81,6 +81,18 @@ class GitStats:
     _DEFAULT_TEAM       = 'Community'    # fallback team for unassigned authors
     _DEFAULT_TEAM_COLOR = '#94a3b8'      # slate — always shown for the fallback team
 
+    # ── Built-in merge subject heuristics ────────────────────────────────────────
+    # These patterns are applied as case-insensitive substrings when no
+    # merge_heuristics key is present in config.json.  The built-in mode also
+    # enables the committer-differs check and the primary-branch exclusion for
+    # "merge branch" subjects — neither of which applies when the user supplies a
+    # custom list.
+    _DEFAULT_MERGE_HEURISTICS = (
+        'pull request #',
+        'merge remote-tracking branch',
+        'merge branch',
+    )
+
     def __init__(self, repo_path, config_file=None, support_paths=None):
         self.repo_path = repo_path
         # Additional git repositories whose commit histories contribute to the
@@ -221,14 +233,23 @@ class GitStats:
 
         # Heuristic patterns for detecting squash/rebase merges by commit subject.
         # Each string is matched as a case-insensitive substring of the subject.
-        # None means use the built-in defaults (pull request #, merge remote-tracking
-        # branch, merge branch) which include primary-branch exclusion logic.
-        # Any commit identified as a merge — true or heuristic — also has its line
-        # counts excluded from all author/team metrics.
+        # When merge_heuristics is absent from config.json the built-in defaults
+        # are used (see _DEFAULT_MERGE_HEURISTICS).  The committer-differs check
+        # (committer e-mail ≠ author e-mail) is always applied regardless of this
+        # setting.  Any commit identified as a merge also has its line counts
+        # excluded from all author/team metrics.
         raw_h = config.get('merge_heuristics', None)
-        self.merge_heuristics = (
-            None if raw_h is None
-            else [s.lower() for s in raw_h]
+        if raw_h is None:
+            self.merge_heuristics = list(self._DEFAULT_MERGE_HEURISTICS)
+        else:
+            self.merge_heuristics = [s.lower() for s in raw_h]
+
+        # When True (default), "merge branch '<primary>'" subjects are excluded
+        # from the subject heuristics — they indicate a sync commit pulling the
+        # primary branch into a feature branch, not a PR landing on the primary
+        # branch.  Set to false in config.json to credit those commits as merges.
+        self.merge_exclude_primary_branch = bool(
+            config.get('merge_exclude_primary_branch', True)
         )
 
         # ── Impact score weights (config-overridable) ─────────────────────────
@@ -378,33 +399,43 @@ class GitStats:
             subject:     Commit subject line (%s).
 
         A commit is a merge when any of the following hold:
-          True merge       — two or more parents.
+          True merge        — two or more parents.
           Subject heuristic — matches built-in or user-supplied patterns.
-          Committer differs — committer e-mail ≠ author e-mail (built-in only);
-                              catches squash merges whose edited messages bypass
-                              subject heuristics.
-        When merge_heuristics is a user-supplied list the committer-differs check
-        is not applied, matching the behaviour documented in the README.
+                              When merge_exclude_primary_branch is True (default),
+                              "merge branch '<primary>'" subjects are excluded
+                              unless another configured pattern also matches.
+          Committer differs — committer e-mail ≠ author e-mail; catches squash
+                              merges whose edited messages bypass subject
+                              heuristics.  Always applied regardless of other
+                              settings.
         """
         is_true_merge = len(parents_str.split()) >= 2
         s = subject.lower().strip()
         pb = self.primary_branch.lower()
 
-        if self.merge_heuristics is not None:
-            return is_true_merge or any(h in s for h in self.merge_heuristics)
+        # Subject heuristic: all configured patterns are checked first.
+        is_subject_heuristic = any(h in s for h in self.merge_heuristics)
 
-        # Built-in defaults
-        is_subject_heuristic = (
-            'pull request #' in s
-            or s.startswith('merge remote-tracking branch')
-            or (
-                s.startswith('merge branch')
-                and not s.startswith(f"merge branch '{pb}'")
-                and not s.startswith(f'merge branch "{pb}"')
-                and not s.startswith(f'merge branch {pb} ')
-                and s != f'merge branch {pb}'
+        # Primary-branch exclusion: "merge branch '<primary>'" subjects are sync
+        # commits that pull the primary branch into a feature branch rather than
+        # a PR landing on it.  When merge_exclude_primary_branch is True (the
+        # default), negate the heuristic match — but only when 'merge branch' was
+        # the sole reason it matched; if another pattern also matches, the commit
+        # is still credited.
+        if is_subject_heuristic and self.merge_exclude_primary_branch:
+            is_primary_sync = (
+                s.startswith(f"merge branch '{pb}'")
+                or s.startswith(f'merge branch "{pb}"')
+                or s.startswith(f'merge branch {pb} ')
+                or s == f'merge branch {pb}'
             )
-        )
+            if is_primary_sync:
+                is_subject_heuristic = any(
+                    h in s for h in self.merge_heuristics if h != 'merge branch'
+                )
+
+        # Committer-differs: always applied regardless of heuristic settings —
+        # catches squash merges whose commit messages bypass all subject patterns.
         is_committer_merge = (
             not is_true_merge
             and c_email.strip().lower() != a_email.strip().lower()
