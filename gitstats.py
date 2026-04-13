@@ -1932,7 +1932,7 @@ class GitStats:
                 f'score += (effective_lines / max_lines) × {iw_lines}'))
         if iw_tenure > 0:
             _active_dims.append(('Active Tenure', iw_tenure,
-                "Days between a contributor's first and last commit. Rewards long-term, sustained engagement.",
+                "Days between a contributor's first and last commit. Five hundred commits over one week score lower than five hundred commits spread over three years.",
                 f'score += (tenure_days / max_tenure) × {iw_tenure}'))
         if iw_merges > 0:
             _active_dims.append(('PR Merges', iw_merges,
@@ -2095,22 +2095,22 @@ class GitStats:
         <!-- Score methodology explanation -->
         <div class="card">
             <h3 class="text-xl font-black text-slate-900 mb-1">How the Impact Score Is Computed</h3>
-            <p class="text-xs text-slate-400 font-medium mb-6">Scores range from 0 to 100. Each metric is normalized relative to the top performer, so the highest scorer in each dimension always contributes the full weight for that dimension.</p>
+            <p class="text-xs text-slate-400 font-medium mb-6">The score answers: <em>who did the most meaningful, sustained work in this repository?</em> Each dimension is normalized against the top performer, so the leader in that dimension always contributes its full weight to their score. A score of 100 is the top of the peer group — it means no other contributor outperformed them across every active dimension. It is not an absolute measure of completeness.</p>
             <div class="grid {_grid_cols} gap-6 mb-6">
 {_weight_cards_html}
             </div>
             <div class="bg-blue-50 border border-blue-100 rounded-xl p-4 text-xs text-blue-800 mb-4">
                 <span class="font-black">Formula: </span>
                 Impact = {_formula_terms}
-                <br><span class="text-blue-500 mt-1 block">All normalizations are computed independently for authors and for teams.</span>
+                <br><span class="text-blue-500 mt-1 block">Each metric is divided by the top value in that dimension. Normalizations are computed independently for authors and for teams.</span>
             </div>
             <div class="bg-slate-50 border border-slate-200 rounded-xl p-4 text-xs text-slate-700">
                 <span class="font-black text-slate-800">Lines noise filtering</span>
                 <span class="text-slate-400 ml-2">(configured via config.json)</span>
                 <ul class="mt-2 space-y-1 text-slate-500 leading-relaxed">
-                    <li><span class="font-bold text-slate-600">Net lines per commit</span> <span class="font-mono bg-slate-200 text-slate-700 rounded px-1">{cfg_use_net}</span> — each commit scores <span class="font-mono">|adds − dels|</span> instead of <span class="font-mono">adds + dels</span>, so reformatting commits that delete and re-add the same code count near zero. Config key: <span class="font-mono">impact_use_net_lines</span>.</li>
-                    <li><span class="font-bold text-slate-600">Winsorization</span> <span class="font-mono bg-slate-200 text-slate-700 rounded px-1">{cfg_cap_status}</span> — per-commit effective lines are capped at this percentile of all commits in the repo, preventing a single mass import from dominating the metric. Config key: <span class="font-mono">impact_line_cap_percentile</span>.</li>
-                    <li><span class="font-bold text-slate-600">Wash-window detection</span> <span class="font-mono bg-slate-200 text-slate-700 rounded px-1">{cfg_wash_status}</span> — commits are grouped into time buckets; if a bucket's raw changes exceed the minimum and adds ≈ dels, the bucket scores only its net <span class="font-mono">|adds − dels|</span>, catching the pattern of a mass delete followed by a mass re-add. Config keys: <span class="font-mono">impact_wash_window_days</span>, <span class="font-mono">impact_wash_min_gross</span>.</li>
+                    <li><span class="font-bold text-slate-600">Net lines per commit</span> <span class="font-mono bg-slate-200 text-slate-700 rounded px-1">{cfg_use_net}</span> — each commit scores <span class="font-mono">|adds − dels|</span> instead of <span class="font-mono">adds + dels</span>. A reformatting pass that deletes and re-adds the same code scores near zero. Config key: <span class="font-mono">impact_use_net_lines</span>.</li>
+                    <li><span class="font-bold text-slate-600">Percentile cap</span> <span class="font-mono bg-slate-200 text-slate-700 rounded px-1">{cfg_cap_status}</span> — each commit's contribution is capped at this percentile of all commits in the repo. A one-time bulk import won't overshadow years of regular work. Config key: <span class="font-mono">impact_line_cap_percentile</span>.</li>
+                    <li><span class="font-bold text-slate-600">Wash-window detection</span> <span class="font-mono bg-slate-200 text-slate-700 rounded px-1">{cfg_wash_status}</span> — catches the two-commit revert pattern that net lines alone misses. Commits are grouped into time buckets per author; if a bucket's gross changes exceed the minimum and at least 67% cancel out, the bucket scores only its net <span class="font-mono">|adds − dels|</span>. Config keys: <span class="font-mono">impact_wash_window_days</span>, <span class="font-mono">impact_wash_min_gross</span>.</li>
                 </ul>
             </div>
         </div>
