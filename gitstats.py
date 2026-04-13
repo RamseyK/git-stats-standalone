@@ -2141,6 +2141,31 @@ class GitStats:
     <!-- ═══ TEAMS ═════════════════════════════════════════════════════════════ -->
     <div id="tab-teams" class="tab-content hidden{teams_tab_hidden}">
         <div id="teams-grid" class="grid grid-cols-1 md:grid-cols-2 gap-6"></div>
+
+        <!-- Teams explanation card -->
+        <div class="card mt-6">
+            <h3 class="text-xl font-black text-slate-900 mb-1">How Team Scores Are Computed</h3>
+            <p class="text-xs text-slate-400 font-medium mb-5">Team impact scores use the same weighted formula as author scores and are normalized independently against the top-performing team. A score of 100 means no other team outperformed this one across every active dimension.</p>
+            <div class="space-y-3">
+                <div class="bg-slate-50 border border-slate-200 rounded-xl p-4 text-xs text-slate-700">
+                    <span class="font-black text-slate-800">Attribution and membership windows</span>
+                    <p class="mt-2 text-slate-500 leading-relaxed">Each commit is credited to whichever team the author belonged to <span class="font-bold text-slate-600">at the time of that commit</span>. Work done outside a member's active window is credited to their team at that time and never contributes to their current team's score. This means a member who switches teams has their contributions split at the switch date.</p>
+                    <ul class="mt-2 space-y-1 text-slate-500 leading-relaxed">
+                        <li><span class="font-bold text-slate-600">No date range</span> — permanent member; all of their commits count toward this team.</li>
+                        <li><span class="font-bold text-slate-600">from only</span> — contributes from that date onward through the present.</li>
+                        <li><span class="font-bold text-slate-600">to only / from + to</span> — contributes only within that window; work outside it is credited elsewhere.</li>
+                    </ul>
+                </div>
+                <div class="bg-slate-50 border border-slate-200 rounded-xl p-4 text-xs text-slate-700">
+                    <span class="font-black text-slate-800">Days Active (tenure)</span>
+                    <p class="mt-2 text-slate-500 leading-relaxed">The <span class="font-bold text-slate-600">Days Active</span> figure and the tenure dimension of the impact score both measure the span between the team's earliest and latest attributed commit — counting only commits that actually fell within each member's active window. It reflects how long the team has been producing credited work, not calendar membership duration.</p>
+                </div>
+                <div class="bg-slate-50 border border-slate-200 rounded-xl p-4 text-xs text-slate-700">
+                    <span class="font-black text-slate-800">Members vs. Previous Members</span>
+                    <p class="mt-2 text-slate-500 leading-relaxed"><span class="font-bold text-slate-600">Members</span> are authors whose membership is currently active. <span class="font-bold text-slate-600">Previous Members</span> contributed historically but whose membership window has since ended — their past work still counts toward the team's totals. Authors not assigned to any team are grouped into <span class="font-mono bg-slate-200 text-slate-700 rounded px-1">Community</span>.</p>
+                </div>
+            </div>
+        </div>
     </div>
 
     <!-- ═══ RELEASES ══════════════════════════════════════════════════════════ -->
