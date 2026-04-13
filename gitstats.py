@@ -5,7 +5,9 @@
 # ///
 
 import html
+import math
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -405,7 +407,7 @@ class GitStats:
         )
         is_committer_merge = (
             not is_true_merge
-            and c_email.lower() != a_email.strip().lower()
+            and c_email.strip().lower() != a_email.strip().lower()
         )
         return is_true_merge or is_subject_heuristic or is_committer_merge
 
@@ -436,7 +438,8 @@ class GitStats:
                 or s.startswith(f'merge branch "{pb}"')
                 or s.startswith(f'merge branch {pb} ')
                 or s == f'merge branch {pb}'
-                or (s.startswith('merge remote-tracking branch') and f'/{pb}' in s)
+                or (s.startswith('merge remote-tracking branch')
+                    and bool(re.search(rf'/{re.escape(pb)}(?:[\'"\s]|$)', s)))
             )
             if is_pb_sync:
                 return False
@@ -1146,7 +1149,14 @@ class GitStats:
         def _tenure(name, e):
             if tenure_map and name in tenure_map:
                 return tenure_map[name]
-            return (e['last_ts'] - e['first_ts']) // self._SECS_PER_DAY
+            first = e['first_ts']
+            last  = e['last_ts']
+            # first_ts is initialised to float('inf') for entities that only
+            # received merge credits (no commit timestamps).  Guard against
+            # non-finite values so floor-division doesn't produce nan.
+            if not (math.isfinite(first) and math.isfinite(last)):
+                return 0
+            return (last - first) // self._SECS_PER_DAY
 
         tenure_values = {name: _tenure(name, e) for name, e in entities.items()}
 

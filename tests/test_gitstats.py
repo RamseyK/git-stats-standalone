@@ -993,6 +993,81 @@ class TestImpactLogicUnit:
         gs._compute_impact()
         assert gs.data['teams']['LongTeam']['impact'] > gs.data['teams']['ShortTeam']['impact']
 
+    def test_team_tenure_computed_from_commit_timestamps_not_member_config(self, tmp_path):
+        """Team tenure is derived from the actual commit timestamps attributed to the
+        team, not from any configured member join/leave dates.
+
+        Alice and Bob are both on Core.  Alice commits at day 0; Bob commits at
+        day 200.  Core's first/last must span exactly those two timestamps.
+        """
+        gs = _make_synthetic_gs(tmp_path, {
+            'Alice': {'commit_lines': [(0, 100, 0, 'Core')], 'team': 'Core'},
+            'Bob':   {'commit_lines': [(_DAY * 200, 100, 0, 'Core')], 'team': 'Core'},
+        }, wash_window_days=0, line_cap_percentile=0)
+        team = gs.data['teams']['Core']
+        assert team['first'] == 0
+        assert team['last']  == _DAY * 200
+        # Tenure in days as the scorer sees it
+        assert (team['last'] - team['first']) // _DAY == 200
+
+    def test_team_tenure_normalised_against_longest_team(self, tmp_path):
+        """The team scoring formula normalises tenure as (days / max_days) * wt.
+        The longest-tenured team gets the full tenure weight; others get a fraction.
+
+        Use merges=0 (via make_config overrides) so the formula reduces to three
+        active dimensions: commits (30) + lines (30) + tenure (40) = 100.
+
+        LongTeam: 365-day span → tenure = (365/365) * 40 = 40
+        ShortTeam: 1-day span  → tenure = (1/365) * 40 ≈ 0.11
+
+        Both teams have identical commits (2) and lines (200), so the gap between
+        them equals exactly wt * (1 - 1/365).
+        """
+        wt = 40
+        gs = _make_synthetic_gs(tmp_path, {
+            'Alice': {'commit_lines': [
+                (0,          100, 0, 'LongTeam'),
+                (_DAY * 365, 100, 0, 'LongTeam'),
+            ], 'team': 'LongTeam'},
+            'Bob': {'commit_lines': [
+                (0,        100, 0, 'ShortTeam'),
+                (_DAY * 1, 100, 0, 'ShortTeam'),
+            ], 'team': 'ShortTeam'},
+        }, use_net_lines=False, wash_window_days=0, line_cap_percentile=0)
+        # Override weights: commits=30, lines=30, tenure=40, merges=0
+        gs.IMPACT_W_COMMITS = 30
+        gs.IMPACT_W_LINES   = 30
+        gs.IMPACT_W_TENURE  = wt
+        gs.IMPACT_W_MERGES  = 0
+        gs._compute_impact()
+        long_impact  = gs.data['teams']['LongTeam']['impact']
+        short_impact = gs.data['teams']['ShortTeam']['impact']
+        assert long_impact == 100.0
+        expected_short = pytest.approx(100.0 - wt * (1 - 1 / 365), abs=0.5)
+        assert short_impact == expected_short
+
+    def test_team_tenure_not_influenced_by_author_tenure(self, tmp_path):
+        """Team tenure (first/last commit credited to the team) is independent of
+        author tenure.  An author with long personal tenure but who recently joined
+        a team should not inflate that team's tenure.
+
+        Alice has commits spanning 365 days total, but only joined NewTeam at day 300.
+        NewTeam's tenure must reflect only the 65 days of Alice's NewTeam commits.
+        """
+        gs = _make_synthetic_gs(tmp_path, {
+            'Alice': {'commit_lines': [
+                (0,          100, 0, 'OldTeam'),   # day 0: on OldTeam
+                (_DAY * 300, 100, 0, 'NewTeam'),   # day 300: switched to NewTeam
+                (_DAY * 365, 100, 0, 'NewTeam'),   # day 365: still on NewTeam
+            ], 'team': 'NewTeam'},
+        }, wash_window_days=0, line_cap_percentile=0)
+        old_team = gs.data['teams']['OldTeam']
+        new_team = gs.data['teams']['NewTeam']
+        # OldTeam: only day-0 commit → 0-day tenure
+        assert (old_team['last'] - old_team['first']) // _DAY == 0
+        # NewTeam: day-300 to day-365 → 65-day tenure
+        assert (new_team['last'] - new_team['first']) // _DAY == 65
+
     def test_all_three_noise_steps_combined(self, tmp_path):
         """Net lines + percentile cap + wash window must all apply together correctly.
 
@@ -1875,6 +1950,63 @@ class TestTagImpacts:
         result = gs._compute_tag_team_impacts(tag_teams)
         assert 'Core' in result
         assert result['Core']['impact'] == 100.0
+
+    def test_merge_only_team_absent_from_data_gets_zero_tenure(self, gs):
+        """A team that only received merge credits in a release window has
+        first_ts=float('inf') and last_ts=0 (the defaultdict sentinel values,
+        never updated because no regular commits were attributed to it).
+
+        When that team is also absent from data['teams'] (no global history),
+        the _tenure fallback must return 0 rather than nan, and the resulting
+        impact score must be a finite number in [0, 100].
+
+        This models a configured team member who only presses the merge button
+        but never authors commits.
+        """
+        from collections import defaultdict
+        gs.data['teams'].pop('MergeOnly', None)
+        tag_teams = defaultdict(lambda: {
+            'commits': 0, 'add': 0, 'del': 0,
+            'first_ts': float('inf'), 'last_ts': 0, 'merges': 0,
+        })
+        tag_teams['MergeOnly']['merges'] = 3   # only merges, no commits or lines
+        result = gs._compute_tag_team_impacts(tag_teams)
+        assert result['MergeOnly']['tenure_days'] == 0
+        assert 0.0 <= result['MergeOnly']['impact'] <= 100.0
+
+    def test_merge_only_team_absent_produces_valid_json(self, gs):
+        """Impact result for a merge-only team must be JSON-serialisable
+        (nan would produce invalid JSON and crash report generation)."""
+        gs.data['teams'].pop('MergeOnly', None)
+        tag_teams = {
+            'MergeOnly': {
+                'commits': 0, 'add': 0, 'del': 0,
+                'first_ts': float('inf'), 'last_ts': 0, 'merges': 2,
+            }
+        }
+        result = gs._compute_tag_team_impacts(tag_teams)
+        json.dumps(result)   # must not raise ValueError
+
+    def test_merge_only_team_alongside_normal_team(self, gs):
+        """A merge-only team (first_ts=inf) mixed with a normal team must not
+        corrupt the normal team's score.  The normal team leads on all dimensions
+        so it must score 100; the merge-only team scores below 100."""
+        from collections import defaultdict
+        ts = self._TS
+        gs.data['teams'].pop('MergeOnly', None)
+        tag_teams = defaultdict(lambda: {
+            'commits': 0, 'add': 0, 'del': 0,
+            'first_ts': float('inf'), 'last_ts': 0, 'merges': 0,
+        })
+        tag_teams['Normal'].update({
+            'commits': 10, 'add': 200, 'del': 0,
+            'first_ts': ts, 'last_ts': ts + 30 * 86400,
+            'merges': 2,
+        })
+        tag_teams['MergeOnly']['merges'] = 1
+        result = gs._compute_tag_team_impacts(tag_teams)
+        assert result['Normal']['impact'] == 100.0
+        assert 0.0 <= result['MergeOnly']['impact'] <= 100.0
 
     # ── Integration: tag data structure ──────────────────────────────────
 
@@ -3319,6 +3451,24 @@ class TestDetectMerge:
         assert gs._detect_merge(self._NO_PARENTS, 'USER@X.COM', 'user@x.com',
                                  'Regular commit message') is False
 
+    def test_committer_email_whitespace_not_falsely_detected(self, gs):
+        """Whitespace on either email must be stripped before comparison.
+
+        Before the fix, c_email was not stripped while a_email was, so a
+        committer email with a trailing space ('same@x.com ') would compare
+        unequal to 'same@x.com', falsely flagging a normal commit as a merge
+        and discarding its line stats.
+        """
+        # Trailing space on c_email — must NOT be detected as a merge.
+        assert gs._detect_merge(self._NO_PARENTS, 'same@x.com ', 'same@x.com',
+                                 'Fix bug') is False
+        # Trailing space on a_email — must NOT be detected as a merge.
+        assert gs._detect_merge(self._NO_PARENTS, 'same@x.com', 'same@x.com ',
+                                 'Fix bug') is False
+        # Both have spaces — still the same address, must NOT be a merge.
+        assert gs._detect_merge(self._NO_PARENTS, ' same@x.com ', ' same@x.com ',
+                                 'Fix bug') is False
+
     # ── Custom merge_heuristics — committer-differs NOT applied ───────────────
 
     def test_custom_heuristics_replace_defaults(self, tmp_path):
@@ -3461,6 +3611,33 @@ class TestIsPrMerge:
         """Remote-tracking merge of a non-primary branch is a PR merge."""
         assert gs._is_pr_merge(self._TWO_PARENTS, self._SAME_EMAIL, self._SAME_EMAIL,
                                 "Merge remote-tracking branch 'origin/feature/x'") is True
+
+    def test_remote_tracking_branch_prefixed_with_primary_name_is_pr_merge(self, gs):
+        """A branch whose name *starts with* the primary branch name must NOT be
+        treated as a sync commit.
+
+        Before the fix, `f'/{pb}' in s` was a plain substring check, so a branch
+        named 'main-release' (when pb='main') would match '/main' and be incorrectly
+        excluded from PR merge credit.  The fix uses a regex word-boundary check so
+        only the exact primary branch name is excluded.
+        """
+        # 'main-release' starts with 'main' — must still be counted as a PR merge.
+        assert gs._is_pr_merge(self._TWO_PARENTS, self._SAME_EMAIL, self._SAME_EMAIL,
+                                "Merge remote-tracking branch 'origin/main-release'") is True
+        # 'main-v2' similarly must not be excluded.
+        assert gs._is_pr_merge(self._TWO_PARENTS, self._SAME_EMAIL, self._SAME_EMAIL,
+                                "Merge remote-tracking branch 'origin/main-v2'") is True
+
+    def test_remote_tracking_primary_branch_no_quotes_excluded(self, gs):
+        """Remote-tracking sync commit without quotes around the branch name must
+        still be excluded (e.g. git produces this format on some systems)."""
+        assert gs._is_pr_merge(self._TWO_PARENTS, self._SAME_EMAIL, self._SAME_EMAIL,
+                                "Merge remote-tracking branch origin/main") is False
+
+    def test_remote_tracking_primary_branch_double_quote_excluded(self, gs):
+        """Remote-tracking sync commit using double quotes must be excluded."""
+        assert gs._is_pr_merge(self._TWO_PARENTS, self._SAME_EMAIL, self._SAME_EMAIL,
+                                'Merge remote-tracking branch "origin/main"') is False
 
     def test_sync_commit_single_parent_not_excluded(self, gs):
         """Single-parent commit with primary-branch subject is not a true merge;
