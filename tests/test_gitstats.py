@@ -3890,6 +3890,52 @@ class TestDetectMerge:
 
 
 # ---------------------------------------------------------------------------
+# _never_merge_subjects — commits that must never count as PR merges
+# ---------------------------------------------------------------------------
+
+class TestNeverMergeSubjects:
+    """Commits whose subjects appear in _NEVER_MERGE_SUBJECTS must return False
+    from _detect_merge regardless of committer/author mismatch or heuristics."""
+
+    @pytest.fixture
+    def gs(self, tmp_path):
+        cfg = make_config(str(tmp_path), primary_branch='main')
+        return gitstats.GitStats(str(tmp_path), cfg)
+
+    def _dm(self, gs, subject, *, committer='bot@github.com', author='dev@example.com'):
+        # Single parent → true-merge path is disabled; committer differs.
+        return gs._detect_merge('abc123', committer, author, subject)
+
+    def test_applied_suggestion_lowercase_not_a_merge(self, gs):
+        assert self._dm(gs, 'applied suggestion') is False
+
+    def test_applied_suggestion_title_case_not_a_merge(self, gs):
+        assert self._dm(gs, 'Applied suggestion') is False
+
+    def test_applied_suggestion_upper_case_not_a_merge(self, gs):
+        assert self._dm(gs, 'APPLIED SUGGESTION') is False
+
+    def test_applied_suggestion_mixed_case_not_a_merge(self, gs):
+        assert self._dm(gs, 'Applied Suggestion') is False
+
+    def test_applied_suggestion_leading_trailing_whitespace(self, gs):
+        assert self._dm(gs, '  Applied suggestion  ') is False
+
+    def test_applied_suggestion_partial_match_still_a_merge(self, gs):
+        # Subject that *contains* the phrase but is not equal to it should
+        # fall through to the committer-differs path and be credited.
+        assert self._dm(gs, 'applied suggestion to fix typo') is True
+
+    def test_non_excluded_subject_still_detected_via_committer_differs(self, gs):
+        assert self._dm(gs, 'fix typo') is True
+
+    def test_same_emails_applied_suggestion_not_a_merge(self, gs):
+        # Sanity: even if committer == author, the subject is excluded.
+        assert gs._detect_merge('abc123', 'dev@example.com', 'dev@example.com',
+                                'Applied suggestion') is False
+
+
+# ---------------------------------------------------------------------------
 # _is_pr_merge — direction-aware PR merge detection for the tag loop
 # ---------------------------------------------------------------------------
 

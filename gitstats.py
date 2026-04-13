@@ -93,6 +93,13 @@ class GitStats:
         'merge branch',
     )
 
+    # Commit subjects that should *never* be counted as a PR merge, regardless
+    # of committer/author mismatch or heuristic matches.  Matched after
+    # lower-casing and stripping the subject.
+    _NEVER_MERGE_SUBJECTS = frozenset({
+        'applied suggestion',
+    })
+
     def __init__(self, repo_path, config_file=None, support_paths=None):
         self.repo_path = repo_path
         # Additional git repositories whose commit histories contribute to the
@@ -417,6 +424,10 @@ class GitStats:
         is_true_merge = len(parents_str.split()) >= 2
         s = subject.lower().strip()
         pb = self.primary_branch.lower()
+
+        # Never-merge subjects: override all other detection paths.
+        if s in self._NEVER_MERGE_SUBJECTS:
+            return False
 
         # Subject heuristic: all configured patterns are checked first.
         is_subject_heuristic = any(h in s for h in self.merge_heuristics)
