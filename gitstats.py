@@ -2053,7 +2053,7 @@ class GitStats:
                 f'score += (merges / max_merges) × {iw_merges}'))
         if iw_issues > 0:
             _active_dims.append(('Issues Addressed', iw_issues,
-                'Unique issues referenced in commit messages (e.g. PROJ-1234). Rewards contributors who resolve tracked features and bug reports. Requires <span class="font-mono">issue_tag_prefixes</span> in config.',
+                'Unique issues referenced in commit messages. Rewards contributors who resolve tracked features and bug reports. Requires <span class="font-mono">issue_tag_prefixes</span> in config.',
                 f'score += (issues / max_issues) × {iw_issues}'))
 
         _ncards = len(_active_dims)
@@ -2216,9 +2216,9 @@ class GitStats:
                 <div id="impact-teams" class="space-y-1"></div>
             </div>
         </div>
-        <div class="card" style="height:360px">
+        <div class="card" style="height:360px;display:flex;flex-direction:column">
             <h3 class="text-xl font-black mb-4">Impact Score — Top 15 Contributors</h3>
-            <canvas id="impactChart"></canvas>
+            <div style="flex:1;position:relative;min-height:0"><canvas id="impactChart"></canvas></div>
         </div>
 
         <!-- Score methodology explanation -->

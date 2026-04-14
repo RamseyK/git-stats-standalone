@@ -4637,6 +4637,79 @@ class TestTimeRangedMembership:
         ]
         assert 'Alice' in current
 
+    def test_author_rejoins_original_team(self, tmp_path, tmp_path_factory):
+        """An author who was on Team Alpha, moved to Team Beta, then rejoined Team Alpha
+        must have their commits attributed to the correct team in each period.
+
+        Timeline:
+          Days  1–10  Alice on Alpha  (period 1)
+          Days 20–30  Alice on Beta   (period 2)
+          Days 40–50  Alice on Alpha  (period 3, rejoining original team)
+
+        Expected after _compute_impact():
+          Alpha commits = 3  (days 5, 8, 45  — two in period 1, one in period 3)
+          Beta  commits = 2  (days 22, 28    — both in period 2)
+          No double-counting: Alpha + Beta totals == 5 == all of Alice's commits
+          Alice's display team is Alpha (most-recent team)
+          Alpha's impact is non-zero; Beta's impact is non-zero
+        """
+        ALPHA_END_1  = _DAY * 15   # Alice leaves Alpha at day 15
+        BETA_START   = _DAY * 18   # Alice joins Beta  at day 18
+        BETA_END     = _DAY * 35   # Alice leaves Beta  at day 35
+        ALPHA_START_2 = _DAY * 38  # Alice rejoins Alpha at day 38
+
+        gs = _make_synthetic_gs(tmp_path, {
+            'Alice': {
+                'commit_lines': [
+                    (_DAY *  5,  100, 10, 'Alpha'),  # period 1
+                    (_DAY *  8,   80,  0, 'Alpha'),  # period 1
+                    (_DAY * 22,   60, 20, 'Beta'),   # period 2
+                    (_DAY * 28,   40,  0, 'Beta'),   # period 2
+                    (_DAY * 45,  120, 30, 'Alpha'),  # period 3 (rejoined)
+                ],
+                'team': 'Alpha',
+            },
+        }, wash_window_days=0, line_cap_percentile=0)
+
+        # Set non-contiguous Alpha ranges so the scoring window respects each period.
+        gs.author_to_team_ranges['Alice'] = [
+            ('Alpha', 0,              ALPHA_END_1 - 1),
+            ('Beta',  BETA_START,     BETA_END),
+            ('Alpha', ALPHA_START_2,  float('inf')),
+        ]
+
+        gs._compute_impact()
+
+        alpha = gs.data['teams']['Alpha']
+        beta  = gs.data['teams']['Beta']
+
+        # Commit counts split correctly
+        assert alpha['commits'] == 3, f"Alpha expected 3 commits, got {alpha['commits']}"
+        assert beta['commits']  == 2, f"Beta expected 2 commits, got {beta['commits']}"
+
+        # No double-counting
+        assert alpha['commits'] + beta['commits'] == 5
+
+        # Line stats split correctly
+        # Alpha: (100-10) + (80-0) + (120-30) = 90 + 80 + 90 = 260 gross adds
+        assert alpha['add'] == 100 + 80 + 120
+        assert beta['add']  ==  60 + 40
+
+        # Both teams scored
+        assert alpha['impact'] > 0
+        assert beta['impact']  > 0
+
+        # Alice's display team reflects her most-recent active team (Alpha)
+        assert gs.data['authors']['Alice']['team'] == 'Alpha'
+
+        # _get_team must resolve each period to the right team
+        assert gs._get_team('Alice', '', _DAY *  5) == 'Alpha'  # period 1
+        assert gs._get_team('Alice', '', _DAY * 22) == 'Beta'   # period 2
+        assert gs._get_team('Alice', '', _DAY * 45) == 'Alpha'  # period 3
+
+        # Gap between ALPHA_END_1 and BETA_START (days 15–18) → Community
+        assert gs._get_team('Alice', '', _DAY * 16) == 'Community'
+
     def test_unassigned_community_members_always_current(self, tmp_path, tmp_path_factory):
         """Unassigned authors binned to Community must appear as current members,
         never as previous members, even when they have no author_to_team_ranges entry.
