@@ -283,6 +283,11 @@ class TestTeams:
 
     # ── Alias tooltip in HTML ────────────────────────────────────────────────
 
+    @pytest.fixture(scope='class')
+    def std_html(self, std_gs, tmp_path_factory):
+        """Generate the standard-config HTML once for all HTML tests in this class."""
+        return generate_html(std_gs, tmp_path_factory, 'teams_std_html')
+
     def test_canonical_to_aliases_populated(self, std_gs):
         """canonical_to_aliases must be built from the config aliases block."""
         # STD_CONFIG defines aliases for Hood Chatham and Roman Yurchak.
@@ -295,24 +300,13 @@ class TestTeams:
         assert 'roberthoodchatham@gmail.com' in aliases
         assert 'hood@mit.edu' in aliases
 
-    def test_author_aliases_in_html_script(self, std_gs, tmp_path_factory):
-        """authorAliases must be present in the rendered HTML with correct data."""
-        html = generate_html(std_gs, tmp_path_factory, 'alias_html')
-        assert 'const authorAliases' in html
-        # The aliases for Hood Chatham must appear somewhere in the script block.
-        assert 'roberthoodchatham@gmail.com' in html
-
-    def test_member_badge_has_tooltip_with_full_name(self, std_gs, tmp_path_factory):
-        """Each member badge in the Teams grid must carry a title= attribute with the full name."""
-        html = generate_html(std_gs, tmp_path_factory, 'tooltip_html')
+    def test_author_aliases_and_tooltips_in_html(self, std_html):
+        """authorAliases must be in the rendered HTML; badge tooltips must carry aliases label."""
+        assert 'const authorAliases' in std_html
+        assert 'roberthoodchatham@gmail.com' in std_html
         # The JS template generates title="${{tip}}" which resolves to title="Full Name..."
-        # The literal text 'title="${{tip}}"' must appear in the template source.
-        assert "title=\"${tip}\"" in html
-
-    def test_member_badge_tooltip_includes_aliases_label(self, std_gs, tmp_path_factory):
-        """The tooltip template must include the 'Aliases:' label for authors that have them."""
-        html = generate_html(std_gs, tmp_path_factory, 'alias_label_html')
-        assert 'Aliases:' in html
+        assert "title=\"${tip}\"" in std_html
+        assert 'Aliases:' in std_html
 
 
 # ---------------------------------------------------------------------------
@@ -2242,47 +2236,50 @@ class TestTagImpacts:
 
     # ── HTML output ───────────────────────────────────────────────────────
 
-    def test_html_release_cards_show_impact_badge(self, std_gs, tmp_path_factory):
-        html = generate_html(std_gs, tmp_path_factory, 'tag_impact_html')
-        # Each author entry must have the ⚡ impact badge
-        assert '⚡' in html
+    @pytest.fixture(scope='class')
+    def std_html(self, std_gs, tmp_path_factory):
+        """Generate the standard-config HTML once for all HTML tests in this class."""
+        return generate_html(std_gs, tmp_path_factory, 'tag_impact_std_html')
 
-    def test_html_release_author_tooltip_contains_commits(self, std_gs, tmp_path_factory):
-        html = generate_html(std_gs, tmp_path_factory, 'tag_tooltip_html')
-        # Author tooltips encode 'Commits:' in the title attribute
-        assert 'Commits:' in html
-
-    def test_html_release_author_tooltip_contains_merges(self, std_gs, tmp_path_factory):
-        """Author tooltips must include 'Merges:' when impact_w_merges > 0."""
+    def test_html_release_cards_impact_and_tooltips(self, std_gs, std_html):
+        """Release cards must show the ⚡ impact badge and author/team tooltips."""
+        assert '⚡' in std_html
+        assert 'Commits:' in std_html        # author tooltip
         assert std_gs.IMPACT_W_MERGES > 0, "Test requires non-zero merges weight"
-        html = generate_html(std_gs, tmp_path_factory, 'tag_tooltip_merges_html')
-        assert 'Merges:' in html, \
-            "Author tooltip must contain 'Merges:' when IMPACT_W_MERGES > 0"
+        assert 'Merges:' in std_html         # author tooltip when wm > 0
 
-    def test_html_release_author_tooltip_omits_merges_when_weight_zero(
+    def test_html_release_tooltip_omits_optional_fields_when_weights_zero(
             self, repo_path, tmp_path_factory):
-        """When impact_w_merges=0, 'Merges:' must not appear inside title= tooltip
-        attributes on the Releases tab.  (It may still appear in JS template strings
-        for the Authors tab, which are not gated by the weight.)"""
+        """When impact_w_merges=0 and impact_w_issues=0, neither 'Merges:' nor 'Issues:'
+        must appear in title= tooltip attributes on the Releases tab."""
         import re as _re
-        tmp = str(tmp_path_factory.mktemp('tag_tooltip_no_merges'))
+        tmp = str(tmp_path_factory.mktemp('tag_tooltip_no_optional'))
         cfg = make_config(tmp, primary_branch='main',
                           impact_w_commits=40, impact_w_lines=40,
                           impact_w_tenure=20, impact_w_merges=0)
         gs = gitstats.GitStats(repo_path, cfg)
         gs.collect()
-        html = generate_html(gs, tmp_path_factory, 'tag_tooltip_no_merges_html')
-        # title= attributes use &#10; as separator; 'Merges:' must not appear
-        # inside any title="..." attribute.
-        title_with_merges = _re.search(r'title="[^"]*Merges:[^"]*"', html)
-        assert title_with_merges is None, \
+        html = generate_html(gs, tmp_path_factory, 'tag_tooltip_no_optional_html')
+        assert _re.search(r'title="[^"]*Merges:[^"]*"', html) is None, \
             "title= attributes must not contain 'Merges:' when IMPACT_W_MERGES=0"
+        assert _re.search(r'title="[^"]*Issues:[^"]*"', html) is None, \
+            "title= attributes must not contain 'Issues:' when IMPACT_W_ISSUES=0"
 
-    def test_html_release_team_chip_tooltip_present(self, std_gs, tmp_path_factory):
-        html = generate_html(std_gs, tmp_path_factory, 'tag_team_tip_html')
-        # Team chip tooltips also encode 'Commits:' in their title attributes
-        # (only when has_teams is True, which it is for std_gs)
-        assert 'Commits:' in html
+    def test_html_release_tooltip_shows_issues_when_weight_nonzero(
+            self, repo_path, tmp_path_factory):
+        """When impact_w_issues > 0, 'Issues:' must appear in title= tooltip attributes
+        on the Releases tab for authors and teams."""
+        import re as _re
+        tmp = str(tmp_path_factory.mktemp('tag_tooltip_issues_on'))
+        cfg = make_config(tmp, primary_branch='main',
+                          impact_w_commits=30, impact_w_lines=30,
+                          impact_w_tenure=15, impact_w_merges=20,
+                          impact_w_issues=5)
+        gs = gitstats.GitStats(repo_path, cfg)
+        gs.collect()
+        html = generate_html(gs, tmp_path_factory, 'tag_tooltip_issues_on_html')
+        assert _re.search(r'title="[^"]*Issues:[^"]*"', html) is not None, \
+            "title= attributes must contain 'Issues:' when IMPACT_W_ISSUES > 0"
 
 
 # ---------------------------------------------------------------------------
@@ -2292,43 +2289,175 @@ class TestTagImpacts:
 class TestMergesSortButton:
     """Verify the Merges sort button on the Authors tab is gated on IMPACT_W_MERGES."""
 
-    def test_merges_sort_button_present_when_merges_weighted(self, std_gs, tmp_path_factory):
-        """Default config has IMPACT_W_MERGES=25, so the Merges sort button must appear."""
-        assert std_gs.IMPACT_W_MERGES > 0
-        html = generate_html(std_gs, tmp_path_factory, 'merges_sort_btn_on')
-        assert 'id="sort-merges"' in html
-
-    def test_merges_sort_button_absent_when_merges_weight_zero(self, repo_path, tmp_path_factory):
-        """When IMPACT_W_MERGES=0, the Merges sort button must not be rendered."""
-        tmp = str(tmp_path_factory.mktemp('merges_sort_btn_off'))
-        cfg = make_config(tmp,
-                          impact_w_commits=40,
-                          impact_w_lines=40,
-                          impact_w_tenure=20,
-                          impact_w_merges=0)
+    @pytest.fixture(scope='class')
+    def merges_off_html(self, repo_path, tmp_path_factory):
+        """HTML generated with IMPACT_W_MERGES=0; shared across 'off' tests."""
+        tmp = str(tmp_path_factory.mktemp('merges_sort_off'))
+        cfg = make_config(tmp, impact_w_commits=40, impact_w_lines=40,
+                          impact_w_tenure=20, impact_w_merges=0)
         gs = gitstats.GitStats(repo_path, cfg)
         gs.collect()
-        html = generate_html(gs, tmp_path_factory, 'merges_sort_html_off')
-        assert 'id="sort-merges"' not in html
+        return generate_html(gs, tmp_path_factory, 'merges_sort_off_html')
 
-    def test_merges_sort_onclick_in_html_when_merges_weighted(self, std_gs, tmp_path_factory):
-        """When merges dimension is active, the button onclick must reference setSortKey('merges')."""
+    def test_merges_sort_button_present_when_merges_weighted(self, std_gs, tmp_path_factory):
+        """Default config has IMPACT_W_MERGES=25, so the Merges sort button and onclick must appear."""
         assert std_gs.IMPACT_W_MERGES > 0
-        html = generate_html(std_gs, tmp_path_factory, 'merges_sort_js_on')
+        html = generate_html(std_gs, tmp_path_factory, 'merges_sort_on_html')
+        assert 'id="sort-merges"' in html
         assert "setSortKey('merges')" in html
 
-    def test_merges_sort_onclick_absent_when_merges_weight_zero(self, repo_path, tmp_path_factory):
-        """When IMPACT_W_MERGES=0, no button for merges sort should be in the HTML."""
-        tmp = str(tmp_path_factory.mktemp('merges_sort_js_off'))
-        cfg = make_config(tmp,
-                          impact_w_commits=40,
-                          impact_w_lines=40,
-                          impact_w_tenure=20,
-                          impact_w_merges=0)
-        gs = gitstats.GitStats(repo_path, cfg)
+    def test_merges_sort_button_absent_when_merges_weight_zero(self, merges_off_html):
+        """When IMPACT_W_MERGES=0, neither the Merges sort button nor its onclick must appear."""
+        assert 'id="sort-merges"' not in merges_off_html
+        assert "setSortKey('merges')" not in merges_off_html
+
+
+# ---------------------------------------------------------------------------
+# Per-author issue tag tracking
+# ---------------------------------------------------------------------------
+
+class TestIssueTagsAuthors:
+    """Verify that issue tags in commit subjects are tracked per-author.
+
+    Alice commits "PROJ-1" twice and "PROJ-2" once (2 unique issues).
+    Bob commits "PROJ-3" once (1 issue).
+    Charlie commits without any issue references (0 issues).
+    """
+
+    @pytest.fixture(scope='class')
+    def issue_repo(self, tmp_path_factory):
+        """Synthetic git repo whose commit messages contain PROJ-NNN issue references."""
+        import pathlib, os as _os
+        repo = str(tmp_path_factory.mktemp('issue_author_repo'))
+
+        def git(*args, name='Dev', email='dev@x.com'):
+            env = {**_os.environ,
+                   'GIT_AUTHOR_NAME': name, 'GIT_AUTHOR_EMAIL': email,
+                   'GIT_COMMITTER_NAME': name, 'GIT_COMMITTER_EMAIL': email,
+                   'GIT_CONFIG_COUNT': '1',
+                   'GIT_CONFIG_KEY_0': 'commit.gpgsign',
+                   'GIT_CONFIG_VALUE_0': 'false'}
+            subprocess.check_call(
+                ['git', '-C', repo] + list(args),
+                env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+        git('init', '-b', 'main')
+        git('config', 'user.email', 'dev@x.com')
+        git('config', 'user.name', 'Dev')
+
+        for i, (msg, nm, em) in enumerate([
+            ('fix PROJ-1 crash',     'Alice',   'alice@x.com'),
+            ('feat PROJ-2 thing',    'Alice',   'alice@x.com'),
+            ('PROJ-1 followup',      'Alice',   'alice@x.com'),   # duplicate
+            ('implement PROJ-3',     'Bob',     'bob@x.com'),
+            ('refactor code',        'Charlie', 'charlie@x.com'),  # no issue
+        ], 1):
+            pathlib.Path(repo, f'f{i}.txt').write_text(str(i))
+            git('add', '.')
+            git('commit', '-m', msg, name=nm, email=em)
+
+        return repo
+
+    @pytest.fixture(scope='class')
+    def issue_gs(self, issue_repo, tmp_path_factory):
+        """GitStats collected from issue_repo with PROJ prefix configured."""
+        tmp = str(tmp_path_factory.mktemp('issue_author_cfg'))
+        cfg = make_config(tmp, issue_tag_prefixes=['PROJ'], max_release_tags=0)
+        gs = gitstats.GitStats(issue_repo, cfg)
         gs.collect()
-        html = generate_html(gs, tmp_path_factory, 'merges_sort_js_off_html')
-        assert "setSortKey('merges')" not in html
+        return gs
+
+    @pytest.fixture(scope='class')
+    def issue_html(self, issue_gs, tmp_path_factory):
+        """Generated HTML for issue_gs; shared across HTML-checking tests."""
+        return generate_html(issue_gs, tmp_path_factory, 'issue_author_html')
+
+    # ── Data-layer ───────────────────────────────────────────────────────────
+
+    def test_issues_key_present_on_every_author(self, issue_gs):
+        """Every author dict must have an integer 'issues' key after collect()."""
+        for name, a in issue_gs.data['authors'].items():
+            assert 'issues' in a, f"{name} missing 'issues' key"
+            assert isinstance(a['issues'], int), f"{name} 'issues' is not an int"
+
+    def test_alice_deduplicates_to_two_issues(self, issue_gs):
+        """Alice referenced PROJ-1 twice and PROJ-2 once — must deduplicate to 2."""
+        assert issue_gs.data['authors']['Alice']['issues'] == 2
+
+    def test_bob_has_one_issue(self, issue_gs):
+        """Bob referenced PROJ-3 exactly once — must have issues=1."""
+        assert issue_gs.data['authors']['Bob']['issues'] == 1
+
+    def test_charlie_has_zero_issues(self, issue_gs):
+        """Charlie's commit had no issue references — must have issues=0."""
+        assert issue_gs.data['authors']['Charlie']['issues'] == 0
+
+    def test_issues_zero_for_all_authors_when_no_prefix(self, issue_repo, tmp_path_factory):
+        """When no issue_tag_prefixes are configured, every author must have issues=0."""
+        tmp = str(tmp_path_factory.mktemp('no_prefix_cfg'))
+        cfg = make_config(tmp, max_release_tags=0)
+        gs = gitstats.GitStats(issue_repo, cfg)
+        gs.collect()
+        for name, a in gs.data['authors'].items():
+            assert a['issues'] == 0, f"{name} should have 0 issues without prefix config"
+
+    # ── HTML output ──────────────────────────────────────────────────────────
+
+    def test_has_issue_tags_js_true_when_configured(self, issue_html):
+        """hasIssueTags must be true when issue_tag_prefixes are configured."""
+        assert 'const hasIssueTags   = true;' in issue_html
+
+    def test_has_issue_tags_js_false_when_not_configured(self, std_gs, tmp_path_factory):
+        """hasIssueTags must be false when no issue_tag_prefixes are configured."""
+        assert std_gs._issue_tag_re is None
+        html = generate_html(std_gs, tmp_path_factory, 'no_issue_tags_html')
+        assert 'const hasIssueTags   = false;' in html
+
+    def test_issues_sort_button_present_and_absent(self, issue_html, std_gs, tmp_path_factory):
+        """Issues sort button appears when prefix configured; absent otherwise."""
+        assert 'id="sort-issues"' in issue_html
+        assert "setSortKey('issues')" in issue_html
+
+        no_pfx_html = generate_html(std_gs, tmp_path_factory, 'no_issues_sort_html')
+        assert 'id="sort-issues"' not in no_pfx_html
+        assert "setSortKey('issues')" not in no_pfx_html
+
+    def test_issues_in_author_data_json(self, issue_html):
+        """The authorData JSON blob must include the 'issues' field."""
+        assert '"issues"' in issue_html
+
+    def test_impact_w_issues_js_constant_nonzero(self, issue_repo, tmp_path_factory):
+        """When impact_w_issues > 0, the JS constant must reflect the configured value."""
+        tmp = str(tmp_path_factory.mktemp('impact_w_issues_nonzero_cfg'))
+        cfg = make_config(tmp, issue_tag_prefixes=['PROJ'], max_release_tags=0,
+                          impact_w_commits=30, impact_w_lines=30,
+                          impact_w_tenure=15, impact_w_merges=20,
+                          impact_w_issues=5)
+        gs = gitstats.GitStats(issue_repo, cfg)
+        gs.collect()
+        html = generate_html(gs, tmp_path_factory, 'impact_w_issues_nonzero_html')
+        assert 'const impactWIssues  = 5;' in html
+
+    def test_impact_scoring_with_nonzero_issues_weight(self, issue_repo, tmp_path_factory):
+        """Impact scores must differ from the no-issues baseline when impact_w_issues > 0.
+        Alice (2 issues) should score higher than Charlie (0 issues) when issues is the
+        only dimension that differs significantly between them."""
+        tmp = str(tmp_path_factory.mktemp('impact_w_issues_score_cfg'))
+        cfg = make_config(tmp, issue_tag_prefixes=['PROJ'], max_release_tags=0,
+                          impact_w_commits=0, impact_w_lines=0,
+                          impact_w_tenure=0, impact_w_merges=0,
+                          impact_w_issues=100)
+        gs = gitstats.GitStats(issue_repo, cfg)
+        gs.collect()
+        alice   = gs.data['authors']['Alice']['impact']
+        bob     = gs.data['authors']['Bob']['impact']
+        charlie = gs.data['authors']['Charlie']['impact']
+        # Alice has 2 unique issues — should be the top scorer (100)
+        assert alice == 100.0
+        # Bob has 1 issue, Charlie has 0 — Bob should outscore Charlie
+        assert bob > charlie
+        # Charlie has 0 issues — scores 0
+        assert charlie == 0.0
 
 
 # ---------------------------------------------------------------------------

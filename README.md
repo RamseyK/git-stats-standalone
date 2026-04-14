@@ -5,10 +5,10 @@ A Python script that analyzes a Git repository and generates a self-contained HT
 ## Primary Metrics
 
 - **Summary** — project age, lines of code, weekly cadence, release count, commit velocity trend, monthly commit activity chart, bus factor (commits and PR merges), and hourly punchcard
-- **Impact** — weighted leaderboard ranking authors and teams by commit volume, lines changed, active tenure, and PR merges
-- **Authors** — sortable contributor table with team badges, filterable by component or team
+- **Impact** — weighted leaderboard ranking authors and teams by commit volume, lines changed, active tenure, PR merges, and (optionally) issues addressed; each row shows all active dimensions inline
+- **Authors** — sortable contributor table with team badges, filterable by component or team; optional Issues column when `issue_tag_prefixes` is configured
 - **Teams** — per-team stats, member lists, and top components
-- **Releases** — per-release breakdown of commits by author and team
+- **Releases** — per-release breakdown of commits by author and team, with referenced issue count when `issue_tag_prefixes` is configured
 - **Components** — churn chart for directories that contain a component marker file (configurable; defaults to `make.py`, `pyproject.toml`, `setup.py`, `Makefile`, `meta.yaml`)
 
 ## Requirements
@@ -74,10 +74,13 @@ All configuration lives in a single JSON file. Every key is optional.
     ]
   },
 
+  "issue_tag_prefixes": ["PROJ", "BUG"],
+
   "impact_w_commits": 30,
   "impact_w_lines": 30,
   "impact_w_tenure": 15,
   "impact_w_merges": 25,
+  "impact_w_issues": 0,
 
   "merge_exclude_primary_branch": true,
 
@@ -104,6 +107,7 @@ All configuration lives in a single JSON file. Every key is optional.
 | `max_authors_per_tag` | `20` | Maximum number of authors shown in the per-release breakdown on the Releases tab. |
 | `max_teams_per_tag` | `10` | Maximum number of teams shown in the per-release breakdown on the Releases tab. |
 | `primary_branch` | `"develop"` | Name of the primary branch. Pull requests merged into this branch are counted toward each committer's PR Merges impact dimension. |
+| `issue_tag_prefixes` | `[]` | List of issue tracker prefixes (e.g. `["PROJ", "BUG"]`). Commit subjects are scanned for patterns like `PROJ-1234`. When set, the Authors tab gains an Issues column and sort button, each release card shows its referenced issue count, and the `impact_w_issues` dimension becomes available. Each unique issue is counted once per author even if referenced multiple times. |
 | `summary_velocity_days` | `[30, 90]` | Day windows shown as velocity cards on the Summary tab. Each entry produces one card comparing commits in the last N days against the prior N days. |
 | `monthly_top_authors` | `3` | Number of top contributors listed in the monthly commit activity chart tooltip. Set to `0` to show only the total commit count. |
 | `bus_factor_threshold` | `0.5` | Fraction (0–1) used to compute both bus factors — the fewest contributors whose combined commits (or PR merges) reach this fraction. The PR Merges bus factor is hidden when `impact_w_merges` is `0`. |
@@ -219,23 +223,27 @@ Each key is the canonical display name. Each value is a list of alternate names 
 
 ## Impact Score
 
-The impact score is a single number in the range 0–100 that answers: *who did the most meaningful, sustained work in this repository?* It balances four signals so that no single dimension can dominate the ranking:
+The impact score is a single number in the range 0–100 that answers: *who did the most meaningful, sustained work in this repository?* It balances up to five signals so that no single dimension can dominate the ranking:
 
 ```
-raw   = (commits / max_commits)       × 30
-      + (effective_lines / max_lines) × 30
-      + (tenure_days / max_tenure)    × 15
-      + (pr_merges / max_merges)      × 25
+raw   = (commits / max_commits)       × impact_w_commits
+      + (effective_lines / max_lines) × impact_w_lines
+      + (tenure_days / max_tenure)    × impact_w_tenure
+      + (pr_merges / max_merges)      × impact_w_merges
+      + (issues / max_issues)         × impact_w_issues   (when > 0)
 
 score = raw × (100 / sum_of_active_weights)
 ```
 
 Each metric is normalized against the top performer in that dimension. The final rescaling step keeps scores in the 0–100 range even when one or more dimensions are disabled (see [Tuning](#tuning)).
 
-- **Commits (30%)** — rewards consistent, incremental contribution.
-- **Effective lines (30%)** — volume of real code changed, after noise filtering. Reformats and reverts score near zero.
-- **Tenure (15%)** — days between first and last commit. A burst of 500 commits over one week scores lower than 500 commits spread over three years.
-- **PR Merges (25%)** — number of pull requests merged into the primary branch, credited to the committer (the person who pressed the merge button). Includes true merge commits and squash/rebase merges detected by commit message heuristics.
+- **Commits** — rewards consistent, incremental contribution.
+- **Effective lines** — volume of real code changed, after noise filtering. Reformats and reverts score near zero.
+- **Tenure** — days between first and last commit. A burst of 500 commits over one week scores lower than 500 commits spread over three years.
+- **PR Merges** — number of pull requests merged into the primary branch, credited to the committer. Includes true merge commits and squash/rebase merges detected by commit message heuristics.
+- **Issues Addressed** — count of unique issue tags (e.g. `PROJ-1234`) found in commit subjects, deduplicated per author. Requires `issue_tag_prefixes` in config. Disabled (`0` weight) by default.
+
+The Impact tab's author and team leaderboard rows show all active dimensions inline — commits, lines, tenure, and (when enabled) PR merges and issues addressed.
 
 ### Noise filtering
 
@@ -269,6 +277,7 @@ The exact configured values and computed cap are displayed on the **Impact** tab
 | `impact_w_lines` | `30` | Weight applied to the effective lines changed dimension. Set to `0` to exclude lines from scoring. |
 | `impact_w_tenure` | `15` | Weight applied to active tenure in days. Set to `0` to exclude tenure from scoring. |
 | `impact_w_merges` | `25` | Weight applied to the PR merge count dimension. Set to `0` to exclude merges from scoring. |
+| `impact_w_issues` | `0` | Weight applied to unique issues addressed. Set to a non-zero value (and rebalance other weights) to include this dimension. Requires `issue_tag_prefixes`. |
 | `impact_use_net_lines` | `true` | `true` → `\|adds − dels\|` per commit; `false` → raw `adds + dels`. |
 | `impact_wash_window_days` | `7` | Size of the wash-window in days. Set to `0` to disable. |
 | `impact_wash_min_gross` | `200` | Minimum gross lines in a bucket to trigger wash detection. |
@@ -282,7 +291,7 @@ The committer (`git log %cn/%ce`) receives credit — the author of the merged b
 
 ### Tuning
 
-Weights are configured via `config.json` using the `impact_w_*` keys (see the table above). **All four weights must sum to exactly 100** — if they do not, the program exits with an error. When a weight is `0` that dimension is excluded from scoring entirely and its card is hidden from the Impact tab; the remaining active dimensions must still sum to 100.
+Weights are configured via `config.json` using the `impact_w_*` keys (see the table above). **All active weights must sum to exactly 100** — if they do not, the program exits with an error. When a weight is `0` that dimension is excluded from scoring entirely and its card is hidden from the Impact tab; the remaining active dimensions must still sum to 100.
 
 The same weights can also be changed permanently by editing the class constants at the top of `gitstats.py`; the config file always takes precedence over the class defaults when a key is present.
 
@@ -291,6 +300,7 @@ The same weights can also be changed permanently by editing the class constants 
 - **Raise `impact_w_tenure`** to weight long-term contributors more heavily relative to recent high-activity newcomers.
 - **Raise `impact_w_merges`** to heavily reward reviewers and integrators who merge many PRs.
 - **Set `impact_w_merges: 0`** for repositories that do not use a PR workflow or whose primary branch has no merge commits.
+- **Set `impact_w_issues` to a non-zero value** (e.g. `10`) and configure `issue_tag_prefixes` to reward contributors who resolve tracked bugs and features. Rebalance the other weights so all active dimensions still sum to 100.
 - **Set `impact_use_net_lines: false`** if gross volume is genuinely meaningful (e.g., large automated test generation).
 - **Lower `impact_line_cap_percentile`** (e.g., `80`) for tighter outlier control; `0` to disable.
 - **Lower `impact_wash_window_days`** (e.g., `3`) for high-frequency repos where revert pairs happen within days.

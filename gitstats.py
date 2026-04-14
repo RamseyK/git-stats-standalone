@@ -54,6 +54,7 @@ class GitStats:
     IMPACT_W_LINES   = 30   # effective lines changed — set to 0 to disable
     IMPACT_W_TENURE  = 15   # active tenure in days  — set to 0 to disable
     IMPACT_W_MERGES  = 25   # PR merges into primary branch — set to 0 to disable
+    IMPACT_W_ISSUES  =  0   # unique issues addressed — requires issue_tag_prefixes config
 
     # ── Component marker filenames ───────────────────────────────────────────────
     # A directory that directly contains one of these files is treated as a
@@ -272,14 +273,17 @@ class GitStats:
         self.IMPACT_W_LINES   = _w('impact_w_lines',   self.IMPACT_W_LINES)
         self.IMPACT_W_TENURE  = _w('impact_w_tenure',  self.IMPACT_W_TENURE)
         self.IMPACT_W_MERGES  = _w('impact_w_merges',  self.IMPACT_W_MERGES)
+        self.IMPACT_W_ISSUES  = _w('impact_w_issues',  self.IMPACT_W_ISSUES)
 
         # Validate that all impact weights sum to exactly 100.
-        _total_w = self.IMPACT_W_COMMITS + self.IMPACT_W_LINES + self.IMPACT_W_TENURE + self.IMPACT_W_MERGES
+        _total_w = (self.IMPACT_W_COMMITS + self.IMPACT_W_LINES + self.IMPACT_W_TENURE
+                    + self.IMPACT_W_MERGES + self.IMPACT_W_ISSUES)
         if _total_w != 100:
             raise ValueError(
                 f"Impact score weights must sum to 100, but got {_total_w} "
                 f"(commits={self.IMPACT_W_COMMITS}, lines={self.IMPACT_W_LINES}, "
-                f"tenure={self.IMPACT_W_TENURE}, merges={self.IMPACT_W_MERGES}). "
+                f"tenure={self.IMPACT_W_TENURE}, merges={self.IMPACT_W_MERGES}, "
+                f"issues={self.IMPACT_W_ISSUES}). "
                 f"Adjust the impact_w_* values in config.json so they sum to 100."
             )
 
@@ -617,6 +621,9 @@ class GitStats:
                 au['commits'] += 1
                 au['last'] = max(au['last'], ts)
                 au['first'] = min(au['first'], ts)
+                _issue_matches = self._issue_tag_re.findall(subject) if self._issue_tag_re else []
+                if _issue_matches:
+                    au.setdefault('_issue_tags', set()).update(_issue_matches)
                 # Per-team commit counts — used by the bus factor bar to show a
                 # proportional colour split when an author has spanned multiple teams.
                 tc = au.setdefault('team_commits', {})
@@ -633,6 +640,8 @@ class GitStats:
                 tm['last'] = max(tm['last'], ts)
                 tm['first'] = min(tm['first'], ts)
                 tm['members'].add(author)
+                if _issue_matches:
+                    tm.setdefault('_issue_tags', set()).update(_issue_matches)
 
                 # Activity counters used for the heatmap and punchcard charts
                 self.data['general']['total_commits'] += 1
@@ -921,15 +930,21 @@ class GitStats:
                     current_team   = team
                     current_skip_lines = self._detect_merge(parents_str, c_email, a_email, subject)
                     if self._issue_tag_re:
-                        tag_issues.update(self._issue_tag_re.findall(subject))
+                        _tag_issue_matches = self._issue_tag_re.findall(subject)
+                        tag_issues.update(_tag_issue_matches)
+                    else:
+                        _tag_issue_matches = []
 
                     if canon not in tag_authors:
                         tag_authors[canon] = {
                             'commits': 0, 'add': 0, 'del': 0,
                             'first_ts': ts, 'last_ts': ts, 'merges': 0,
+                            '_issue_tags': set(),
                         }
                     a = tag_authors[canon]
                     a['commits']  += 1
+                    if _tag_issue_matches:
+                        a['_issue_tags'].update(_tag_issue_matches)
                     a['first_ts']  = min(a['first_ts'], ts)
                     a['last_ts']   = max(a['last_ts'],  ts)
                     tt = tag_teams[team]
@@ -1064,20 +1079,29 @@ class GitStats:
         wl = self.IMPACT_W_LINES
         wt = self.IMPACT_W_TENURE
         wm = self.IMPACT_W_MERGES
+        wi = self.IMPACT_W_ISSUES
+
+        # Convert per-author and per-team _issue_tags sets to integer counts
+        # before scoring so the issues dimension is available during the loop.
+        authors = self.data['authors']
+        for a in authors.values():
+            a['issues'] = len(a.pop('_issue_tags', set()))
+        teams = self.data['teams']
+        for t in teams.values():
+            t['issues'] = len(t.pop('_issue_tags', set()))
 
         # Scale factor that renormalizes scores to 0–100 when one or more
-        # dimensions are disabled (weight = 0).  When all four weights are
-        # active (the default), total_w = 100 and scale = 1.0 exactly.
-        total_w = (wc if wc > 0 else 0) + (wl if wl > 0 else 0) + \
-                  (wt if wt > 0 else 0) + (wm if wm > 0 else 0)
+        # dimensions are disabled (weight = 0).  When all five weights are
+        # active, total_w = 100 and scale = 1.0 exactly.
+        total_w = ((wc if wc > 0 else 0) + (wl if wl > 0 else 0) +
+                   (wt if wt > 0 else 0) + (wm if wm > 0 else 0) +
+                   (wi if wi > 0 else 0))
         scale = (100.0 / total_w) if total_w > 0 else 0.0
 
         use_net   = self.use_net_lines
         wash_days = self.wash_window_days
         wash_min  = self.wash_min_gross
         cap_pct   = self.line_cap_percentile
-
-        authors = self.data['authors']
 
         # ── Step 1: per-commit effective lines ───────────────────────────────
         # Compute abs(adds - dels) or adds + dels for each commit depending on
@@ -1143,13 +1167,15 @@ class GitStats:
             max_d = (max((a['last'] - a['first']) // self._SECS_PER_DAY
                          for a in authors.values()) or 1)                if wt > 0 else 1
             max_m = (max(a.get('merges', 0) for a in authors.values()) or 1) if wm > 0 else 1
+            max_i = (max(a.get('issues', 0) for a in authors.values()) or 1) if wi > 0 else 1
             for name, a in authors.items():
                 days = (a['last'] - a['first']) // self._SECS_PER_DAY
                 raw = (
                     ((a['commits']       / max_c) * wc if wc > 0 else 0.0) +
                     ((eff_map[name]      / max_k) * wl if wl > 0 else 0.0) +
                     ((days               / max_d) * wt if wt > 0 else 0.0) +
-                    ((a.get('merges', 0) / max_m) * wm if wm > 0 else 0.0)
+                    ((a.get('merges', 0) / max_m) * wm if wm > 0 else 0.0) +
+                    ((a.get('issues', 0) / max_i) * wi if wi > 0 else 0.0)
                 )
                 a['impact']   = round(raw * scale, 1)
                 a['eff_lines'] = int(eff_map[name])
@@ -1197,13 +1223,15 @@ class GitStats:
             max_d = (max((t['last'] - t['first']) // self._SECS_PER_DAY
                          for t in teams.values()) or 1)                if wt > 0 else 1
             max_m = ((max(team_merges.values()) if team_merges else 1)) if wm > 0 else 1
+            max_i = (max(t.get('issues', 0) for t in teams.values()) or 1) if wi > 0 else 1
             for tname, t in teams.items():
                 days = (t['last'] - t['first']) // self._SECS_PER_DAY
                 raw = (
                     ((t['commits']           / max_c) * wc if wc > 0 else 0.0) +
                     ((team_eff[tname]        / max_k) * wl if wl > 0 else 0.0) +
                     ((days                   / max_d) * wt if wt > 0 else 0.0) +
-                    ((team_merges[tname]     / max_m) * wm if wm > 0 else 0.0)
+                    ((team_merges[tname]     / max_m) * wm if wm > 0 else 0.0) +
+                    ((t.get('issues', 0)     / max_i) * wi if wi > 0 else 0.0)
                 )
                 t['impact'] = round(raw * scale, 1)
                 t['merges'] = team_merges[tname]
@@ -1237,12 +1265,20 @@ class GitStats:
         wl = self.IMPACT_W_LINES
         wt = self.IMPACT_W_TENURE
         wm = self.IMPACT_W_MERGES
+        wi = self.IMPACT_W_ISSUES
         active_w = ((wc if wc > 0 else 0) + (wl if wl > 0 else 0) +
-                    (wt if wt > 0 else 0) + (wm if wm > 0 else 0))
+                    (wt if wt > 0 else 0) + (wm if wm > 0 else 0) +
+                    (wi if wi > 0 else 0))
         scale = (100.0 / active_w) if active_w > 0 else 0.0
 
         eff_map = {
             name: abs(e['add'] - e['del']) if self.use_net_lines else (e['add'] + e['del'])
+            for name, e in entities.items()
+        }
+        # Convert per-entity _issue_tags sets to integer counts for scoring.
+        issues_map = {
+            name: len(e.pop('_issue_tags', set())) if isinstance(e.get('_issue_tags'), set)
+                  else e.get('issues', 0)
             for name, e in entities.items()
         }
 
@@ -1264,22 +1300,26 @@ class GitStats:
         max_k = (max(eff_map.values()) or 1)                                  if wl > 0 else 1
         max_d = (max(tenure_values.values()) or 1)                            if wt > 0 else 1
         max_m = (max(e.get('merges', 0) for e in entities.values()) or 1)    if wm > 0 else 1
+        max_i = (max(issues_map.values()) or 1)                               if wi > 0 else 1
 
         results = {}
         for name, e in entities.items():
             tenure  = tenure_values[name]
             merges  = e.get('merges', 0)
+            issues  = issues_map[name]
             raw = (
                 ((e['commits']  / max_c) * wc if wc > 0 else 0.0) +
                 ((eff_map[name] / max_k) * wl if wl > 0 else 0.0) +
                 ((tenure        / max_d) * wt if wt > 0 else 0.0) +
-                ((merges        / max_m) * wm if wm > 0 else 0.0)
+                ((merges        / max_m) * wm if wm > 0 else 0.0) +
+                ((issues        / max_i) * wi if wi > 0 else 0.0)
             )
             results[name] = {
                 'commits':     e['commits'],
                 'eff_lines':   int(eff_map[name]),
                 'tenure_days': tenure,
                 'merges':      merges,
+                'issues':      issues,
                 'impact':      round(raw * scale, 1),
             }
         return results
@@ -1332,6 +1372,7 @@ class GitStats:
         parts = []
         _release_medals = ['🥇', '🥈', '🥉']
         _show_merges = self.IMPACT_W_MERGES > 0
+        _show_issues = self.IMPACT_W_ISSUES > 0
 
         def _author_prefix(i):
             if i < 3:
@@ -1350,6 +1391,8 @@ class GitStats:
             ]
             if _show_merges:
                 parts.append(f'Merges: {data.get("merges", 0):,}')
+            if _show_issues:
+                parts.append(f'Issues: {data.get("issues", 0):,}')
             return '&#10;'.join(parts)
 
         for t in self.data['tags']:
@@ -1408,7 +1451,10 @@ class GitStats:
                         <p class="text-[10px] font-bold text-slate-400 uppercase tracking-widest mt-1">Release Contributors</p>
                         <div class="flex flex-wrap gap-1 mt-2">{team_badges}</div>
                     </div>
-                    <div class="px-6 py-2 bg-slate-900 text-white rounded-2xl font-black text-sm shrink-0">{t["count"]} Commits</div>
+                    <div class="flex flex-col items-end gap-1.5 shrink-0">
+                        <div class="px-6 py-2 bg-slate-900 text-white rounded-2xl font-black text-sm">{t["count"]} Commits</div>
+                        {f'<div class="px-6 py-2 bg-blue-50 text-blue-700 border border-blue-100 rounded-2xl font-black text-sm">{len(issues)} Issue{"s" if len(issues) != 1 else ""}</div>' if self._issue_tag_re else ''}
+                    </div>
                 </div>
                 <div class="grid grid-cols-2 lg:grid-cols-4 xl:grid-cols-5 gap-3">
                     {author_items}
@@ -1967,6 +2013,7 @@ class GitStats:
         iw_lines   = self.IMPACT_W_LINES
         iw_tenure  = self.IMPACT_W_TENURE
         iw_merges  = self.IMPACT_W_MERGES
+        iw_issues  = self.IMPACT_W_ISSUES
         primary_branch = self.primary_branch
 
         # Build the weight cards and formula for the Impact explanation section.
@@ -1988,10 +2035,15 @@ class GitStats:
             _active_dims.append(('PR Merges', iw_merges,
                 f'Number of pull requests merged into <span class="font-mono">{primary_branch}</span>. Credits the committer — the person who pressed the merge button. Includes true merges and squash/rebase merges detected by commit message.',
                 f'score += (merges / max_merges) × {iw_merges}'))
+        if iw_issues > 0:
+            _active_dims.append(('Issues Addressed', iw_issues,
+                'Unique issues referenced in commit messages (e.g. PROJ-1234). Rewards contributors who resolve tracked features and bug reports. Requires <span class="font-mono">issue_tag_prefixes</span> in config.',
+                f'score += (issues / max_issues) × {iw_issues}'))
 
         _ncards = len(_active_dims)
         _grid_cols = {1: 'grid-cols-1', 2: 'grid-cols-1 md:grid-cols-2',
-                      3: 'grid-cols-1 md:grid-cols-3', 4: 'grid-cols-1 md:grid-cols-2 lg:grid-cols-4'}.get(_ncards, 'grid-cols-1 md:grid-cols-2')
+                      3: 'grid-cols-1 md:grid-cols-3', 4: 'grid-cols-1 md:grid-cols-2 lg:grid-cols-4',
+                      5: 'grid-cols-1 md:grid-cols-2 lg:grid-cols-5'}.get(_ncards, 'grid-cols-1 md:grid-cols-2')
         _weight_cards_html = '\n'.join(
             f'''                <div class="bg-slate-50 rounded-2xl p-5">
                     <div class="flex items-center justify-between mb-2">
@@ -2005,10 +2057,11 @@ class GitStats:
             for label, w, desc, formula in _active_dims
         )
         _formula_terms = ' &nbsp;+&nbsp; '.join(
-            {'Commit Volume': f'(commits / max_commits) × {iw_commits}',
-             'Lines Changed': f'(effective_lines / max_lines) × {iw_lines}',
-             'Active Tenure': f'(tenure_days / max_tenure) × {iw_tenure}',
-             'PR Merges':     f'(merges / max_merges) × {iw_merges}'}[label]
+            {'Commit Volume':    f'(commits / max_commits) × {iw_commits}',
+             'Lines Changed':    f'(effective_lines / max_lines) × {iw_lines}',
+             'Active Tenure':    f'(tenure_days / max_tenure) × {iw_tenure}',
+             'PR Merges':        f'(merges / max_merges) × {iw_merges}',
+             'Issues Addressed': f'(issues / max_issues) × {iw_issues}'}[label]
             for label, w, desc, formula in _active_dims
         )
         _impact_subtitle_parts = []
@@ -2016,6 +2069,7 @@ class GitStats:
         if iw_lines   > 0: _impact_subtitle_parts.append(f'lines&nbsp;{iw_lines}%')
         if iw_tenure  > 0: _impact_subtitle_parts.append(f'tenure&nbsp;{iw_tenure}%')
         if iw_merges  > 0: _impact_subtitle_parts.append(f'merges&nbsp;{iw_merges}%')
+        if iw_issues  > 0: _impact_subtitle_parts.append(f'issues&nbsp;{iw_issues}%')
         impact_subtitle = 'Impact = ' + '&nbsp;·&nbsp;'.join(_impact_subtitle_parts)
 
         # Teams tab visibility
@@ -2027,12 +2081,21 @@ class GitStats:
         iw_lines_js      = json.dumps(self.IMPACT_W_LINES)
         iw_tenure_js     = json.dumps(self.IMPACT_W_TENURE)
         iw_merges_js     = json.dumps(self.IMPACT_W_MERGES)
+        iw_issues_js     = json.dumps(self.IMPACT_W_ISSUES)
         tags_tab_html    = self._render_tags_html()
         # Merges sort button — only shown when merges dimension is active
         merges_sort_btn  = (
             '<button onclick="setSortKey(\'merges\')" id="sort-merges"'
             ' class="px-3 py-1.5 rounded-lg text-slate-500 hover:bg-slate-100 transition-all">Merges</button>'
             if self.IMPACT_W_MERGES > 0 else ''
+        )
+        # Issues sort button and column — only shown when issue tag tracking is configured
+        has_issue_tags   = self._issue_tag_re is not None
+        has_issue_tags_js = 'true' if has_issue_tags else 'false'
+        issues_sort_btn  = (
+            '<button onclick="setSortKey(\'issues\')" id="sort-issues"'
+            ' class="px-3 py-1.5 rounded-lg text-slate-500 hover:bg-slate-100 transition-all">Issues</button>'
+            if has_issue_tags else ''
         )
 
         # Noise-reduction settings — displayed in the impact explanation section
@@ -2180,6 +2243,7 @@ class GitStats:
                     <button onclick="setSortKey('commits')" id="sort-commits" class="px-3 py-1.5 rounded-lg text-slate-500 hover:bg-slate-100 transition-all">Commits</button>
                     <button onclick="setSortKey('lines')"   id="sort-lines"   class="px-3 py-1.5 rounded-lg text-slate-500 hover:bg-slate-100 transition-all">Lines</button>
                     {merges_sort_btn}
+                    {issues_sort_btn}
                 </div>
             </div>
         </div>
@@ -2237,10 +2301,12 @@ const teamsData      = {teams_json};
 const authorAliases  = {author_aliases_json};
 const teamColors     = {team_colors_json};
 const hasTeams       = {has_teams_js};
+const hasIssueTags   = {has_issue_tags_js};
 const impactWCommits = {iw_commits_js};
 const impactWLines   = {iw_lines_js};
 const impactWTenure  = {iw_tenure_js};
 const impactWMerges  = {iw_merges_js};
+const impactWIssues  = {iw_issues_js};
 const componentData     = {component_json};
 const teamComponentData = {team_component_json};
 const totalCommits   = {tcom};
@@ -2345,6 +2411,7 @@ function authorImpactTooltip(name, s) {{
     if (impactWLines   > 0) lines.push(`  Eff. Lines: ${{(s.eff_lines || 0).toLocaleString()}}`);
     if (impactWTenure  > 0) lines.push(`  Tenure: ${{days}} day${{plural}}`);
     if (impactWMerges  > 0) lines.push(`  Merges: ${{(s.merges || 0).toLocaleString()}}`);
+    if (impactWIssues  > 0) lines.push(`  Issues: ${{(s.issues || 0).toLocaleString()}}`);
     lines.push(`Score: ${{s.impact || 0}} / 100`);
     return lines.join('&#10;');
 }}
@@ -2378,6 +2445,7 @@ function setSortKey(key) {{
     currentSortKey = key;
     const keys = ['impact','commits','lines'];
     if (impactWMerges > 0) keys.push('merges');
+    if (hasIssueTags) keys.push('issues');
     keys.forEach(k => {{
         const b = document.getElementById('sort-' + k);
         if (!b) return;
@@ -2429,6 +2497,7 @@ function renderAuthorTable(filter, filterType) {{
         if (currentSortKey === 'commits') return b[1].commits - a[1].commits;
         if (currentSortKey === 'lines')   return (b[1].add + b[1].del) - (a[1].add + a[1].del);
         if (currentSortKey === 'merges')  return (b[1].merges || 0) - (a[1].merges || 0);
+        if (currentSortKey === 'issues')  return (b[1].issues || 0) - (a[1].issues || 0);
         return 0;
     }});
 
@@ -2441,8 +2510,12 @@ function renderAuthorTable(filter, filterType) {{
         const color      = teamColor(s.team);
         const impact     = s.impact || 0;
         const merges     = s.merges || 0;
+        const issues     = s.issues || 0;
         const als = authorAliases[name] || [];
         const authorTip = als.length ? `${{name}}\nAliases: ${{als.join(', ')}}` : name;
+        const issuesCell = hasIssueTags
+            ? `<td class="px-4 font-mono text-sm font-bold text-blue-600">${{issues > 0 ? issues : '<span class="text-slate-300">—</span>'}}</td>`
+            : '';
         return `<tr class="hover:bg-slate-50 transition-colors">
             <td class="px-8 py-4">
                 <div class="font-bold text-slate-800 cursor-default" title="${{authorTip}}">${{name}}</div>
@@ -2463,6 +2536,7 @@ function renderAuthorTable(filter, filterType) {{
                 <span class="text-red-400">-${{fmt(s.del)}}</span>
             </td>
             <td class="px-4 font-mono text-sm font-bold text-slate-600">${{merges > 0 ? merges : '<span class="text-slate-300">—</span>'}}</td>
+            ${{issuesCell}}
             <td>
                 <div class="flex items-center gap-2" style="min-width:140px">
                     <span class="text-xs font-black text-slate-700 w-8 cursor-default"
@@ -2474,6 +2548,7 @@ function renderAuthorTable(filter, filterType) {{
         </tr>`;
     }}).join('');
 
+    const issuesHeader = hasIssueTags ? '<th class="px-4">Issues</th>' : '';
     table.innerHTML = `
         <thead class="bg-slate-50 border-b text-[10px] uppercase font-bold text-slate-500">
             <tr>
@@ -2482,6 +2557,7 @@ function renderAuthorTable(filter, filterType) {{
                 <th>Share</th>
                 <th>Lines +/−</th>
                 <th class="px-4">Merges</th>
+                ${{issuesHeader}}
                 <th>Impact Score</th>
                 <th class="px-6">Tenure</th>
             </tr>
@@ -2521,11 +2597,15 @@ function renderImpactLeaderboard() {{
 
     document.getElementById('impact-authors').innerHTML = filtered.length
         ? filtered.map(([name, s], i) => {{
-            const color  = teamColor(s.team);
-            const rank   = allAuthors.findIndex(([n]) => n === name);
+            const color      = teamColor(s.team);
+            const rank       = allAuthors.findIndex(([n]) => n === name);
+            const activeDays = Math.floor((s.last - s.first) / 86400);
             const prefix = rank < 3
                 ? `<span class="text-xl w-8 text-center shrink-0">${{medals[rank]}}</span>`
                 : `<span class="text-xs font-black text-slate-300 w-8 text-center shrink-0">#${{rank+1}}</span>`;
+            const metaParts = [`${{fmt(s.commits)}} commits`, `+${{fmt(s.add)}} lines`, `${{activeDays}}d tenure`];
+            if (impactWMerges > 0) metaParts.push(`${{s.merges || 0}} merges`);
+            if (impactWIssues > 0) metaParts.push(`${{s.issues || 0}} issues`);
             return `<div class="flex items-center gap-3 p-3 rounded-xl hover:bg-slate-50 transition-colors">
                 ${{prefix}}
                 <div class="flex-1 min-w-0">
@@ -2536,7 +2616,7 @@ function renderImpactLeaderboard() {{
                     ${{impactBar(s.impact, '#3b82f6')}}
                     <div class="flex items-center gap-2 mt-1">
                         ${{teamBadge(s.team)}}
-                        <span class="text-[10px] text-slate-400">${{fmt(s.commits)}} commits · +${{fmt(s.add)}} lines</span>
+                        <span class="text-[10px] text-slate-400">${{metaParts.join(' · ')}}</span>
                     </div>
                 </div>
             </div>`;
@@ -2549,6 +2629,7 @@ function renderImpactLeaderboard() {{
     document.getElementById('impact-teams').innerHTML = topTeams.map(([name, s], i) => {{
         const color      = teamColor(name);
         const members    = Array.isArray(s.members) ? s.members.length : 0;
+        const teamDays   = Math.floor((s.last - s.first) / 86400);
         const isActive   = impactTeamFilter === name;
         const prefix     = i < 3
             ? `<span class="text-xl w-8 text-center shrink-0">${{medals[i]}}</span>`
@@ -2557,6 +2638,9 @@ function renderImpactLeaderboard() {{
             ? `border border-2 rounded-xl`
             : `hover:bg-slate-50 rounded-xl`;
         const activeStyle = isActive ? `border-color:${{color}};background:${{color}}11` : '';
+        const teamMetaParts = [`${{members}} members`, `${{fmt(s.commits)}} commits`, `${{teamDays}}d tenure`];
+        if (impactWMerges > 0) teamMetaParts.push(`${{s.merges || 0}} merges`);
+        if (impactWIssues > 0) teamMetaParts.push(`${{s.issues || 0}} issues`);
         return `<div class="flex items-center gap-3 p-3 ${{activeCls}} transition-colors cursor-pointer"
                      style="${{activeStyle}}" data-team="${{name.replace(/"/g,'&quot;')}}"
                      onclick="filterImpactByTeam(this.dataset.team)"
@@ -2568,7 +2652,7 @@ function renderImpactLeaderboard() {{
                     <span class="text-sm font-black text-slate-700 ml-2 shrink-0">${{s.impact}}</span>
                 </div>
                 ${{impactBar(s.impact, color)}}
-                <span class="text-[10px] text-slate-400">${{members}} members · ${{fmt(s.commits)}} commits</span>
+                <span class="text-[10px] text-slate-400">${{teamMetaParts.join(' · ')}}</span>
             </div>
         </div>`;
     }}).join('');
