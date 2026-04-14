@@ -310,6 +310,13 @@ class GitStats:
             self._issue_tag_re = re.compile(rf'\b(?:{_pfx_pat})-\d+\b')
         else:
             self._issue_tag_re = None
+            if self.IMPACT_W_ISSUES > 0:
+                print(
+                    f"Warning: impact_w_issues={self.IMPACT_W_ISSUES} but no issue_tag_prefixes "
+                    f"are configured — the Issues Addressed dimension will score 0 for every "
+                    f"contributor, reducing the maximum achievable score below 100.",
+                    file=sys.stderr,
+                )
 
         # Central data store populated by collect() and consumed by generate_report().
         self.data = {
@@ -906,11 +913,12 @@ class GitStats:
                 continue
 
             # Accumulate per-author and per-team data: commits, line stats,
-            # first/last commit timestamp, and PR merges.
-            tag_authors  = {}    # name → {commits, add, del, first_ts, last_ts, merges}
+            # first/last commit timestamp, PR merges, and issue tags.
+            tag_authors  = {}    # name → {commits, add, del, first_ts, last_ts, merges, _issue_tags}
             tag_teams    = defaultdict(lambda: {
                 'commits': 0, 'add': 0, 'del': 0,
                 'first_ts': float('inf'), 'last_ts': 0, 'merges': 0,
+                '_issue_tags': set(),
             })
             tag_issues     = set()   # unique issue tags (e.g. "PROJ-123") in this window
             current_author = None
@@ -951,6 +959,8 @@ class GitStats:
                     tt['commits']  += 1
                     tt['first_ts']  = min(tt['first_ts'], ts)
                     tt['last_ts']   = max(tt['last_ts'],  ts)
+                    if _tag_issue_matches:
+                        tt['_issue_tags'].update(_tag_issue_matches)
 
                     # Credit the committer with the merge only when the commit
                     # is a PR merge INTO the primary branch.  _is_pr_merge adds
@@ -1040,6 +1050,7 @@ class GitStats:
                   + (effective_lines / max_eff)  * IMPACT_W_LINES     (if wl > 0)
                   + (tenure_days / max_tenure)   * IMPACT_W_TENURE    (if wt > 0)
                   + (merges / max_merges)         * IMPACT_W_MERGES   (if wm > 0)
+                  + (issues / max_issues)         * IMPACT_W_ISSUES   (if wi > 0)
             score = raw * (100 / sum_of_active_weights)
 
         Setting any weight to 0 removes that dimension from scoring entirely.
@@ -1248,18 +1259,21 @@ class GitStats:
         """Compute per-release impact scores for a dict of authors or teams.
 
         Both callers (_compute_tag_impacts and _compute_tag_team_impacts) share
-        the same schema: {name: {commits, add, del, first_ts, last_ts, merges}}.
-        Uses all four configured impact weights normalized within the release.
+        the same schema: {name: {commits, add, del, first_ts, last_ts, merges,
+        _issue_tags}}.  Uses all configured impact weights normalized within
+        the release window.
 
         Args:
-            entities:    {name: {commits, add, del, first_ts, last_ts, merges}}
+            entities:    {name: {commits, add, del, first_ts, last_ts, merges,
+                         _issue_tags}}. The _issue_tags set is consumed (popped)
+                         during scoring and converted to an integer issues count.
             tenure_map:  Optional {name: tenure_days} supplying global tenure values.
                          When provided, a name's global tenure is used instead of the
                          release-range tenure derived from first_ts/last_ts.  Names
                          absent from tenure_map fall back to release-range tenure.
 
         Returns:
-            {name: {'commits', 'eff_lines', 'tenure_days', 'merges', 'impact'}}
+            {name: {'commits', 'eff_lines', 'tenure_days', 'merges', 'issues', 'impact'}}
         """
         wc = self.IMPACT_W_COMMITS
         wl = self.IMPACT_W_LINES
@@ -1276,9 +1290,10 @@ class GitStats:
             for name, e in entities.items()
         }
         # Convert per-entity _issue_tags sets to integer counts for scoring.
+        # Entities from the tag loop carry a set; entities passed in from other
+        # callers may already carry a pre-computed 'issues' int.
         issues_map = {
-            name: len(e.pop('_issue_tags', set())) if isinstance(e.get('_issue_tags'), set)
-                  else e.get('issues', 0)
+            name: len(e.pop('_issue_tags')) if '_issue_tags' in e else e.get('issues', 0)
             for name, e in entities.items()
         }
 
@@ -1935,7 +1950,7 @@ class GitStats:
             if team_name not in self.data['teams']:
                 self.data['teams'][team_name] = {
                     'commits': 0, 'add': 0, 'del': 0, 'merges': 0,
-                    'members': set(), 'first': 0, 'last': 0,
+                    'issues': 0, 'members': set(), 'first': 0, 'last': 0,
                     'impact': 0,
                 }
 

@@ -164,8 +164,9 @@ def make_config(tmp_path, **overrides):
     Write a minimal config JSON file to tmp_path and return the file path.
     Pass keyword arguments to override top-level keys.
 
-    Impact weights default to 30/30/15/25 (sum=100).  Any test that changes
-    one or more weight keys must supply all four so they still sum to 100.
+    Impact weights default to 30/30/15/25/0 (sum=100).  Any test that changes
+    one or more weight keys must ensure all five weights still sum to 100.
+    impact_w_issues defaults to 0 so existing tests need not include it.
     """
     cfg = {
         'release_tag_prefix': '',
@@ -2458,6 +2459,153 @@ class TestIssueTagsAuthors:
         assert bob > charlie
         # Charlie has 0 issues — scores 0
         assert charlie == 0.0
+
+
+# ---------------------------------------------------------------------------
+# Issue tag tracking for teams (per-release and global)
+# ---------------------------------------------------------------------------
+
+class TestIssueTagsTeams:
+    """Verify that issue tags are tracked per-team globally and per release.
+
+    Repo layout:
+      main branch, two tags (v1.0 after commit B, v2.0 at HEAD):
+        A: Alice (team Core)   — "fix PROJ-1"
+        B: Bob   (team Other)  — "feat PROJ-2" + tag v1.0
+        C: Alice (team Core)   — "PROJ-1 follow-up" (duplicate for Alice/Core)
+        D: Bob   (team Other)  — "implement PROJ-3"  + tag v2.0
+
+    Expected global:
+      Core  issues = {PROJ-1}  → 1
+      Other issues = {PROJ-2, PROJ-3} → 2
+
+    Expected per-release (v1.0 window = A..B):
+      Core  issues = {PROJ-1} → 1   (Alice's commit A)
+      Other issues = {PROJ-2} → 1   (Bob's commit B)
+
+    Expected per-release (v2.0 window = B..D):
+      Core  issues = {PROJ-1} → 1   (Alice's commit C, duplicate of PROJ-1)
+      Other issues = {PROJ-3} → 1   (Bob's commit D)
+    """
+
+    @pytest.fixture(scope='class')
+    def team_issue_repo(self, tmp_path_factory):
+        import pathlib, os as _os
+        repo = str(tmp_path_factory.mktemp('team_issue_repo'))
+
+        def git(*args, name='Dev', email='dev@x.com', date=None):
+            env = {**_os.environ,
+                   'GIT_AUTHOR_NAME': name, 'GIT_AUTHOR_EMAIL': email,
+                   'GIT_COMMITTER_NAME': name, 'GIT_COMMITTER_EMAIL': email,
+                   'GIT_CONFIG_COUNT': '1',
+                   'GIT_CONFIG_KEY_0': 'commit.gpgsign',
+                   'GIT_CONFIG_VALUE_0': 'false'}
+            if date:
+                env['GIT_AUTHOR_DATE']    = date
+                env['GIT_COMMITTER_DATE'] = date
+            subprocess.check_call(
+                ['git', '-C', repo] + list(args),
+                env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+        git('init', '-b', 'main')
+        git('config', 'user.email', 'dev@x.com')
+        git('config', 'user.name', 'Dev')
+
+        # Commits A and B: before v1.0 tag
+        # Explicit dates ensure --sort=-creatordate gives v2.0 > v1.0 stably.
+        pathlib.Path(repo, 'f1.txt').write_text('1')
+        git('add', '.')
+        git('commit', '-m', 'fix PROJ-1',
+            name='Alice', email='alice@x.com', date='2020-01-01T00:00:00')
+        pathlib.Path(repo, 'f2.txt').write_text('2')
+        git('add', '.')
+        git('commit', '-m', 'feat PROJ-2',
+            name='Bob', email='bob@x.com', date='2020-02-01T00:00:00')
+        git('tag', 'v1.0')
+
+        # Commits C and D: before v2.0 tag
+        pathlib.Path(repo, 'f3.txt').write_text('3')
+        git('add', '.')
+        git('commit', '-m', 'PROJ-1 follow-up',
+            name='Alice', email='alice@x.com', date='2020-03-01T00:00:00')
+        pathlib.Path(repo, 'f4.txt').write_text('4')
+        git('add', '.')
+        git('commit', '-m', 'implement PROJ-3',
+            name='Bob', email='bob@x.com', date='2020-04-01T00:00:00')
+        git('tag', 'v2.0')
+
+        return repo
+
+    @pytest.fixture(scope='class')
+    def team_issue_gs(self, team_issue_repo, tmp_path_factory):
+        tmp = str(tmp_path_factory.mktemp('team_issue_cfg'))
+        cfg = make_config(tmp, issue_tag_prefixes=['PROJ'],
+                          primary_branch='main',
+                          release_tag_prefix='v', max_release_tags=10,
+                          teams={'Core': {'members': ['Alice', 'alice@x.com']},
+                                 'Other': {'members': ['Bob', 'bob@x.com']}})
+        gs = gitstats.GitStats(team_issue_repo, cfg)
+        gs.collect()
+        return gs
+
+    # ── Global team issue tracking ───────────────────────────────────────────
+
+    def test_core_team_global_issues(self, team_issue_gs):
+        """Core team (Alice only) references PROJ-1 twice — must deduplicate to 1."""
+        assert team_issue_gs.data['teams']['Core']['issues'] == 1
+
+    def test_other_team_global_issues(self, team_issue_gs):
+        """Other team (Bob) references PROJ-2 and PROJ-3 — must have issues=2."""
+        assert team_issue_gs.data['teams']['Other']['issues'] == 2
+
+    # ── Per-release (tag window) team issue tracking ─────────────────────────
+
+    def test_tag_team_impacts_have_issues_key(self, team_issue_gs):
+        """Every team_impacts dict on every release card must contain 'issues'."""
+        for tag in team_issue_gs.data['tags']:
+            for team_name, data in tag.get('team_impacts', {}).items():
+                assert 'issues' in data, \
+                    f"tag {tag['name']!r} team {team_name!r} missing 'issues' key"
+
+    def test_v1_tag_team_issues(self, team_issue_gs):
+        """In the v1.0 window: Core has PROJ-1 (1), Other has PROJ-2 (1)."""
+        tags_by_name = {t['name']: t for t in team_issue_gs.data['tags']}
+        v1 = tags_by_name.get('v1.0', {})
+        ti = v1.get('team_impacts', {})
+        assert ti.get('Core', {}).get('issues', -1) == 1
+        assert ti.get('Other', {}).get('issues', -1) == 1
+
+    def test_v2_tag_team_issues(self, team_issue_gs):
+        """In the v2.0 window: Core has PROJ-1 follow-up (1 unique), Other has PROJ-3 (1)."""
+        tags_by_name = {t['name']: t for t in team_issue_gs.data['tags']}
+        v2 = tags_by_name.get('v2.0', {})
+        ti = v2.get('team_impacts', {})
+        assert ti.get('Core', {}).get('issues', -1) == 1
+        assert ti.get('Other', {}).get('issues', -1) == 1
+
+    # ── Warning when impact_w_issues > 0 but no prefixes ────────────────────
+
+    def test_warns_when_issues_weight_nonzero_without_prefixes(
+            self, team_issue_repo, tmp_path_factory, capsys):
+        """A warning must be printed to stderr when impact_w_issues > 0 but
+        issue_tag_prefixes is not configured."""
+        tmp = str(tmp_path_factory.mktemp('warn_no_prefix_cfg'))
+        cfg = make_config(tmp, impact_w_commits=30, impact_w_lines=30,
+                          impact_w_tenure=15, impact_w_merges=20,
+                          impact_w_issues=5)
+        gitstats.GitStats(team_issue_repo, cfg)
+        captured = capsys.readouterr()
+        assert 'impact_w_issues' in captured.err
+        assert 'issue_tag_prefixes' in captured.err
+
+    def test_no_warn_when_issues_weight_zero(
+            self, team_issue_repo, tmp_path_factory, capsys):
+        """No warning when impact_w_issues=0 (the default) even without prefixes."""
+        tmp = str(tmp_path_factory.mktemp('no_warn_cfg'))
+        cfg = make_config(tmp)
+        gitstats.GitStats(team_issue_repo, cfg)
+        captured = capsys.readouterr()
+        assert 'impact_w_issues' not in captured.err
 
 
 # ---------------------------------------------------------------------------
