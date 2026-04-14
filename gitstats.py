@@ -975,6 +975,7 @@ class GitStats:
                             tag_authors[committer] = {
                                 'commits': 0, 'add': 0, 'del': 0,
                                 'first_ts': ts, 'last_ts': ts, 'merges': 0,
+                                '_issue_tags': set(),
                             }
                         tag_authors[committer]['merges'] += 1
                         tag_teams[c_team]['merges'] += 1
