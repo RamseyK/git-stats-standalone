@@ -1832,6 +1832,72 @@ class TestReleaseTags:
         for tag in gs.data['tags']:
             assert tag['issues'] == []
 
+    def test_oldest_displayed_tag_excludes_commits_from_undisplayed_older_tags(
+            self, tmp_path_factory):
+        """When max_release_tags caps the displayed list, the oldest displayed tag
+        must only contain commits between itself and the next-older tag — even though
+        that next-older tag is not itself displayed.
+
+        Repo layout (four tags, max_release_tags=2 so only v4.0 and v3.0 are shown):
+          commit A — 'alice only v1.0'    → tagged v1.0  (NOT displayed)
+          commit B — 'bob only v2.0'      → tagged v2.0  (NOT displayed)
+          commit C — 'charlie only v3.0'  → tagged v3.0  (displayed, oldest)
+          commit D — 'diana only v4.0'    → tagged v4.0  (displayed, newest)
+
+        With the bug: v3.0's range would be 'v3.0' (all commits up to it), pulling in
+        Alice's and Bob's commits and inflating v3.0's count from 1 to 3.
+        After the fix: v3.0's range is 'v2.0..v3.0' — exactly commit C.
+        """
+        import pathlib, os as _os
+        repo = str(tmp_path_factory.mktemp('max_tags_range_repo'))
+
+        def git(*args, name='Dev', email='dev@x.com', date='2020-01-01T00:00:00'):
+            env = {**_os.environ,
+                   'GIT_AUTHOR_NAME': name, 'GIT_AUTHOR_EMAIL': email,
+                   'GIT_COMMITTER_NAME': name, 'GIT_COMMITTER_EMAIL': email,
+                   'GIT_AUTHOR_DATE': date, 'GIT_COMMITTER_DATE': date,
+                   'GIT_CONFIG_COUNT': '1',
+                   'GIT_CONFIG_KEY_0': 'commit.gpgsign',
+                   'GIT_CONFIG_VALUE_0': 'false'}
+            subprocess.check_call(['git', '-C', repo] + list(args),
+                                  env=env, stdout=subprocess.DEVNULL,
+                                  stderr=subprocess.DEVNULL)
+
+        git('init', '-b', 'main')
+        git('config', 'user.email', 'dev@x.com')
+        git('config', 'user.name', 'Dev')
+
+        for i, (msg, nm, date) in enumerate([
+            ('alice only v1.0',   'Alice',   '2020-01-01T00:00:00'),
+            ('bob only v2.0',     'Bob',     '2020-02-01T00:00:00'),
+            ('charlie only v3.0', 'Charlie', '2020-03-01T00:00:00'),
+            ('diana only v4.0',   'Diana',   '2020-04-01T00:00:00'),
+        ], 1):
+            pathlib.Path(repo, f'f{i}.txt').write_text(str(i))
+            git('add', '.')
+            git('commit', '-m', msg, name=nm, date=date)
+            git('tag', f'v{i}.0')
+
+        cfg = make_config(tmp_path_factory.mktemp('max_tags_range_cfg'),
+                          release_tag_prefix='v', max_release_tags=2)
+        gs = gitstats.GitStats(repo, cfg)
+        gs.collect()
+
+        tags_by_name = {t['name']: t for t in gs.data['tags']}
+
+        # Only the two newest tags are displayed
+        assert set(tags_by_name.keys()) == {'v4.0', 'v3.0'}
+
+        # v4.0 window = v3.0..v4.0 → exactly Diana's commit
+        assert tags_by_name['v4.0']['count'] == 1
+        v4_authors = [a['name'] for a in tags_by_name['v4.0']['authors']]
+        assert v4_authors == ['Diana']
+
+        # v3.0 window = v2.0..v3.0 → exactly Charlie's commit (NOT Alice's or Bob's)
+        assert tags_by_name['v3.0']['count'] == 1
+        v3_authors = [a['name'] for a in tags_by_name['v3.0']['authors']]
+        assert v3_authors == ['Charlie']
+
 
 # ---------------------------------------------------------------------------
 # Per-release impact scoring (_score_tag_entities / _compute_tag_impacts)

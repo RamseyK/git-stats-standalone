@@ -880,28 +880,32 @@ class GitStats:
 
         # ── Phase 3: release tag breakdown (main repo only) ──────────────────
         # Tags are sorted newest-first. For each tag we attribute the commits
-        # between it and the previous tag (tag_range) to authors and teams.
-        # The oldest tag uses just its name as the range (all commits up to it).
+        # between it and the next-older tag (tag_range).  The true oldest tag
+        # in the repo (no predecessor) uses just its name as the range.
         try:
-            tags = self._run_git(['tag', '--sort=-creatordate']).splitlines()
+            all_tags = self._run_git(['tag', '--sort=-creatordate']).splitlines()
         except subprocess.CalledProcessError:
-            tags = []
+            all_tags = []
 
         if self.release_tag_prefix:
-            tags = [t for t in tags if t.startswith(self.release_tag_prefix)]
+            all_tags = [t for t in all_tags if t.startswith(self.release_tag_prefix)]
 
         # Record the full count before capping so the Summary tab can show the
         # true total even when display is limited by max_release_tags.
-        self.data['general']['total_tags'] = len(tags)
+        self.data['general']['total_tags'] = len(all_tags)
 
-        # 0 means no limit; any positive value caps the list
-        if self.max_release_tags:
-            tags = tags[:self.max_release_tags]
+        # 0 means no limit; any positive value caps the list.
+        # The full list is retained so the oldest *displayed* tag can still use
+        # its true predecessor as a lower bound even when that predecessor is
+        # itself not displayed.
+        tags = all_tags[:self.max_release_tags] if self.max_release_tags else all_tags
 
         for i, tag in enumerate(tags):
             # Range: commits between the next-older tag and this one.
-            # For the oldest tag in the list, include all its commits.
-            tag_range = tag if i == len(tags) - 1 else f"{tags[i + 1]}..{tag}"
+            # Use all_tags[i + 1] as the lower bound so that the oldest displayed
+            # tag excludes commits that belong to undisplayed older releases.
+            # Falls back to the bare tag name only for the true oldest tag in the repo.
+            tag_range = f"{all_tags[i + 1]}..{tag}" if i + 1 < len(all_tags) else tag
             try:
                 # Include --numstat so per-author line stats are available.
                 # Include parent hashes (%P), committer email (%ce), committer
