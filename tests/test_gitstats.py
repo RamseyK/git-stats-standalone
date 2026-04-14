@@ -2301,6 +2301,102 @@ class TestTagImpacts:
         assert global_merges == 3, \
             f"Expected 3 global merges for Merger (one per PR subject), got {global_merges}"
 
+    def test_feature_branch_internal_merge_not_credited_in_tag_loop(
+            self, tmp_path_factory):
+        """A merge commit inside a feature branch must NOT receive merge credit
+        in the per-tag breakdown, even though it is reachable from the tag via
+        the full DAG walk.
+
+        Setup:
+          main: A ── B (PR merge of feat-a) ── D (feature-internal merge) ── [v1.0 tag]
+                              ↑                             ↑
+          feat-a branch:    work              ← Merge branch 'sub-feature' (feature-internal)
+
+        The "Merge branch 'sub-feature'" commit lives on feat-a's branch history.
+        It is reachable from v1.0 via the full DAG but is NOT on the first-parent
+        spine of main.  Only the PR merge (B) should receive credit.
+        """
+        import pathlib, os as _os
+        repo = str(tmp_path_factory.mktemp('fb_internal_merge_repo'))
+
+        def git(*args, env_extra=None, date=None):
+            env = dict(_os.environ)
+            if date:
+                env['GIT_AUTHOR_DATE']    = date
+                env['GIT_COMMITTER_DATE'] = date
+            env['GIT_CONFIG_COUNT']   = '1'
+            env['GIT_CONFIG_KEY_0']   = 'commit.gpgsign'
+            env['GIT_CONFIG_VALUE_0'] = 'false'
+            if env_extra:
+                env.update(env_extra)
+            subprocess.run(['git', '-C', repo] + list(args),
+                           check=True, capture_output=True, env=env)
+
+        def sha():
+            return subprocess.check_output(
+                ['git', '-C', repo, 'rev-parse', 'HEAD'], text=True,
+            ).strip()
+
+        git('init', '-b', 'main')
+        git('config', 'user.email', 'merger@example.com')
+        git('config', 'user.name', 'Merger')
+
+        # A: initial commit on main
+        pathlib.Path(repo, 'readme.txt').write_text('init')
+        git('add', '.')
+        git('commit', '-m', 'Initial commit', date='2020-01-01T00:00:00')
+        main_a = sha()
+
+        # Create feat-a branch and a sub-feature branch
+        git('checkout', '-b', 'sub-feature')
+        pathlib.Path(repo, 'sub.txt').write_text('sub')
+        git('add', '.')
+        git('commit', '-m', 'Sub-feature work', date='2020-01-15T00:00:00')
+
+        git('checkout', '-b', 'feat-a', main_a)
+        pathlib.Path(repo, 'feat_a.txt').write_text('feat_a')
+        git('add', '.')
+        git('commit', '-m', 'Feature A work', date='2020-01-20T00:00:00')
+
+        # Feature-branch-internal merge: merge sub-feature INTO feat-a
+        # This creates a true merge commit on feat-a, NOT on main.
+        git('merge', '--no-ff', 'sub-feature',
+            '-m', "Merge branch 'sub-feature'",
+            date='2020-01-25T00:00:00')
+        internal_merge_sha = sha()
+
+        # Back on main: PR merge of feat-a into main
+        git('checkout', 'main')
+        git('merge', '--no-ff', 'feat-a',
+            '-m', 'Merge pull request #1 from user/feat-a',
+            date='2020-02-01T00:00:00')
+
+        git('tag', 'v1.0')
+
+        cfg = make_config(
+            str(tmp_path_factory.mktemp('fb_merge_cfg')),
+            primary_branch='main',
+            release_tag_prefix='v',
+            max_release_tags=10,
+        )
+        gs = gitstats.GitStats(repo, cfg)
+        gs.collect()
+
+        tags = {t['name']: t for t in gs.data['tags']}
+        assert 'v1.0' in tags, "v1.0 tag not collected"
+
+        def author_merges(tag_entry, name):
+            for a in tag_entry['authors']:
+                if a['name'] == name:
+                    return a.get('merges', 0)
+            return 0
+
+        v1_merges = author_merges(tags['v1.0'], 'Merger')
+        assert v1_merges == 1, (
+            f"Expected exactly 1 merge credit for v1.0 (the PR merge into main); "
+            f"got {v1_merges}. The feature-branch-internal merge was incorrectly credited."
+        )
+
     # ── HTML output ───────────────────────────────────────────────────────
 
     @pytest.fixture(scope='class')

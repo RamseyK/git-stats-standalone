@@ -910,13 +910,26 @@ class GitStats:
             tag_range = f"{all_tags[i + 1]}..{tag}" if i + 1 < len(all_tags) else tag
             try:
                 # Include --numstat so per-author line stats are available.
-                # Include parent hashes (%P), committer email (%ce), committer
-                # name (%cn), and subject (%s) so merge commits can be detected
-                # and credited to the committer for the PR Merges dimension.
+                # Include commit hash (%H), parent hashes (%P), committer email
+                # (%ce), committer name (%cn), and subject (%s) so merge commits
+                # can be detected and credited to the committer.
                 tag_log = self._run_git(['log', tag_range, '--numstat',
-                                         '--pretty=format:COMMIT|%P|%at|%an|%ae|%ce|%cn|%s'])
+                                         '--pretty=format:COMMIT|%H|%P|%at|%an|%ae|%ce|%cn|%s'])
             except subprocess.CalledProcessError:
                 continue
+
+            # Pre-compute the first-parent SHA set for this range.  Merge credits
+            # are only awarded to commits that are actually on the primary branch
+            # spine — not to merge commits buried inside feature branches that
+            # happen to be reachable from this tag.  The full log (above) is kept
+            # for commit/line attribution; first-parent is used solely for merge
+            # gating.
+            try:
+                fp_shas = set(
+                    self._run_git(['log', tag_range, '--first-parent', '--format=%H']).splitlines()
+                )
+            except subprocess.CalledProcessError:
+                fp_shas = set()
 
             # Accumulate per-author and per-team data: commits, line stats,
             # first/last commit timestamp, PR merges, and issue tags.
@@ -933,10 +946,10 @@ class GitStats:
 
             for line in tag_log.splitlines():
                 if line.startswith('COMMIT|'):
-                    parts = line.split('|', 7)
-                    if len(parts) < 8:
+                    parts = line.split('|', 8)
+                    if len(parts) < 9:
                         continue
-                    _, parents_str, ts_str, a_name, a_email, c_email, c_name, subject = parts
+                    _, commit_sha, parents_str, ts_str, a_name, a_email, c_email, c_name, subject = parts
                     ts    = int(ts_str) if ts_str.isdigit() else 0
                     canon = self._get_author(a_name, a_email)
                     team  = self._get_team(canon, a_email, ts)
@@ -969,12 +982,13 @@ class GitStats:
                         tt['_issue_tags'].update(_tag_issue_matches)
 
                     # Credit the committer with the merge only when the commit
-                    # is a PR merge INTO the primary branch.  _is_pr_merge adds
-                    # a direction check on top of _detect_merge so that sync
-                    # commits (merging the primary branch into a feature branch)
-                    # are excluded here even though their lines are still
-                    # suppressed via current_skip_lines above.
-                    if self._is_pr_merge(parents_str, c_email, a_email, subject):
+                    # is on the primary branch spine (fp_shas) AND is a PR merge
+                    # into primary (_is_pr_merge).  The first-parent check ensures
+                    # that merge commits buried inside feature branches — which are
+                    # reachable from the tag but not on the main branch spine — do
+                    # not receive credit.  _is_pr_merge provides the subject-based
+                    # sync-commit exclusion as a second layer of defense.
+                    if commit_sha in fp_shas and self._is_pr_merge(parents_str, c_email, a_email, subject):
                         committer = self._get_author(c_name, c_email)
                         c_team    = self._get_team(committer, c_email, ts)
                         if committer not in tag_authors:
