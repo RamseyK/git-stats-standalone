@@ -513,10 +513,12 @@ class GitStats:
           Non-primary target — subject ends with "into <branch>" where
                                <branch> is not the primary branch.
 
-        _collect_merges avoids sync commits naturally by walking
-        ``--first-parent`` on the primary branch.  The tag loop has no such
-        constraint and sees all commits between tags, so this check provides
-        the equivalent filter.
+        Both _collect_merges and the tag loop use this function.
+        _collect_merges walks ``--first-parent`` on the primary branch which
+        naturally excludes most sync commits; the tag loop sees the full
+        commit graph between tags.  In both cases the explicit sync-commit
+        exclusion here (especially "Merge remote-tracking branch 'origin/…'")
+        is necessary for correctness.
 
         Line exclusion always uses _detect_merge so that sync-commit diffs
         are still suppressed even though the committer is not credited.
@@ -744,7 +746,7 @@ class GitStats:
                 continue
             _, parents_str, c_email, c_name, ts_str, a_email, subject = parts
 
-            if not self._detect_merge(parents_str, c_email, a_email, subject):
+            if not self._is_pr_merge(parents_str, c_email, a_email, subject):
                 continue
 
             ts = int(ts_str) if ts_str.strip().isdigit() else 0

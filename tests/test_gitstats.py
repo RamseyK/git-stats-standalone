@@ -3699,6 +3699,97 @@ class TestPRMergeRate:
         # 'Add readme' must not contribute to this count
         assert committer.get('merges', 0) == 4
 
+    def test_remote_tracking_primary_sync_excluded_from_collect_merges(
+            self, tmp_path_factory):
+        """'Merge remote-tracking branch 'origin/main'' on the first-parent spine
+        must NOT receive merge credit from _collect_merges.
+
+        This is the edge case where _detect_merge alone (without _is_pr_merge)
+        would incorrectly credit the committer: _detect_merge matches
+        'merge remote-tracking branch' as a subject heuristic and its
+        is_primary_source check only covers 'Merge branch <primary>', not
+        'Merge remote-tracking branch origin/<primary>'.  _is_pr_merge adds
+        the remote-tracking variant to its sync-commit exclusion list.
+
+        Scenario: a developer on main ran 'git fetch && git merge origin/main'
+        while already up-to-date — creating a no-op true merge with that subject
+        directly on the primary branch spine.
+        """
+        import pathlib
+        repo = str(tmp_path_factory.mktemp('rt_sync_repo'))
+
+        def git(*args, env_extra=None):
+            env = os.environ.copy()
+            if env_extra:
+                env.update(env_extra)
+            subprocess.run(
+                ['git', '-C', repo] + list(args),
+                check=True, capture_output=True, env=env,
+            )
+
+        git('init', '-b', 'main')
+        git('config', 'user.email', 'dev@example.com')
+        git('config', 'user.name', 'Developer')
+        git('config', 'commit.gpgsign', 'false')
+
+        # Commit A: initial commit on main
+        pathlib.Path(repo, 'file.txt').write_text('init')
+        git('add', '.')
+        git('commit', '-m', 'Initial commit')
+
+        # Commit B: a real feature branch PR merge
+        git('checkout', '-b', 'feature')
+        pathlib.Path(repo, 'feat.txt').write_text('feature')
+        git('add', '.')
+        git('commit', '-m', 'Feature work')
+        git('checkout', 'main')
+        git('merge', '--no-ff', 'feature', '-m', 'Merge pull request #1 from dev/feature')
+
+        # Commit C: simulate 'git merge origin/main' while on main (no-op sync)
+        # We use --allow-unrelated-histories with an orphan to get a true merge
+        # with the sync subject. Simplest approach: use commit-tree + update-ref.
+        # Actually the easiest way is to use git commit-tree manually.
+        result = subprocess.run(
+            ['git', '-C', repo, 'rev-parse', 'HEAD'],
+            capture_output=True, text=True, check=True,
+        )
+        head_sha = result.stdout.strip()
+        # Create a merge commit whose parents are HEAD and HEAD (self-merge),
+        # simulating the remote-tracking sync subject on the primary branch spine.
+        tree_result = subprocess.run(
+            ['git', '-C', repo, 'rev-parse', 'HEAD^{tree}'],
+            capture_output=True, text=True, check=True,
+        )
+        tree_sha = tree_result.stdout.strip()
+        commit_result = subprocess.run(
+            ['git', '-C', repo, 'commit-tree', tree_sha,
+             '-p', head_sha, '-p', head_sha,
+             '-m', "Merge remote-tracking branch 'origin/main'"],
+            capture_output=True, text=True, check=True,
+            env={**os.environ, 'GIT_AUTHOR_NAME': 'Developer',
+                 'GIT_AUTHOR_EMAIL': 'dev@example.com',
+                 'GIT_COMMITTER_NAME': 'Developer',
+                 'GIT_COMMITTER_EMAIL': 'dev@example.com'},
+        )
+        sync_sha = commit_result.stdout.strip()
+        subprocess.run(
+            ['git', '-C', repo, 'update-ref', 'refs/heads/main', sync_sha],
+            check=True, capture_output=True,
+        )
+
+        cfg = make_config(tmp_path_factory.mktemp('rt_sync_cfg'), primary_branch='main')
+        gs = gitstats.GitStats(repo, cfg)
+        gs.data['authors'] = {}
+        gs.data['teams']   = {}
+        gs._collect_merges(repo)
+
+        total = sum(a.get('merges', 0) for a in gs.data['authors'].values())
+        # Only commit B (PR merge) should count; the sync commit C must be excluded.
+        assert total == 1, (
+            f"Expected exactly 1 merge credit (the real PR merge); "
+            f"got {total}. The remote-tracking primary sync commit was incorrectly credited."
+        )
+
     # ── Configurable merge heuristics ────────────────────────────────────────
 
     def test_default_merge_heuristics_equals_class_constant(self, repo_path, tmp_path):
