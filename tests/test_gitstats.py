@@ -2397,6 +2397,157 @@ class TestTagImpacts:
             f"got {v1_merges}. The feature-branch-internal merge was incorrectly credited."
         )
 
+    def test_merge_after_latest_tag_credited_globally_not_in_any_tag_card(
+            self, tmp_path_factory):
+        """A PR merge committed after the latest release tag must be counted in the
+        global author merge total (_collect_merges) but must not appear in any
+        release card's per-tag merge count.
+
+        Timeline:
+          A  — init
+          B  — 'Merge pull request #1'  → v1.0 tag
+          C  — 'Merge pull request #2'  (after v1.0, outside any tag range)
+
+        Expected:
+          global merges = 2  (B + C, full primary branch history)
+          v1.0 card merges = 1  (B only; C is outside the tag window)
+        """
+        import pathlib, os as _os
+        repo = str(tmp_path_factory.mktemp('post_tag_merge_repo'))
+
+        def git(*args, date=None):
+            env = dict(_os.environ)
+            if date:
+                env['GIT_AUTHOR_DATE']    = date
+                env['GIT_COMMITTER_DATE'] = date
+            env['GIT_CONFIG_COUNT']   = '1'
+            env['GIT_CONFIG_KEY_0']   = 'commit.gpgsign'
+            env['GIT_CONFIG_VALUE_0'] = 'false'
+            subprocess.run(['git', '-C', repo] + list(args),
+                           check=True, capture_output=True, env=env)
+
+        git('init', '-b', 'main')
+        git('config', 'user.email', 'merger@example.com')
+        git('config', 'user.name', 'Merger')
+
+        pathlib.Path(repo, 'init.txt').write_text('init')
+        git('add', '.')
+        git('commit', '-m', 'Initial commit', date='2020-01-01T00:00:00')         # A
+
+        pathlib.Path(repo, 'feat1.txt').write_text('feat1')
+        git('add', '.')
+        git('commit', '-m', 'Merge pull request #1 from user/feat1',
+            date='2020-02-01T00:00:00')                                            # B
+        git('tag', 'v1.0')
+
+        # C is after v1.0 — outside any release tag window
+        pathlib.Path(repo, 'feat2.txt').write_text('feat2')
+        git('add', '.')
+        git('commit', '-m', 'Merge pull request #2 from user/feat2',
+            date='2020-03-01T00:00:00')                                            # C
+
+        cfg = make_config(
+            str(tmp_path_factory.mktemp('post_tag_merge_cfg')),
+            primary_branch='main', release_tag_prefix='v', max_release_tags=10,
+        )
+        gs = gitstats.GitStats(repo, cfg)
+        gs.collect()
+
+        # Global count: _collect_merges walks full primary branch history
+        global_merges = gs.data['authors'].get('Merger', {}).get('merges', 0)
+        assert global_merges == 2, (
+            f"Expected 2 global merges (B + C); got {global_merges}. "
+            f"_collect_merges must not be constrained by release_tag_prefix."
+        )
+
+        # Per-tag count: only B falls within v1.0's range
+        tags = {t['name']: t for t in gs.data['tags']}
+        assert 'v1.0' in tags, "v1.0 tag not found"
+        def author_merges(tag_entry, name):
+            for a in tag_entry['authors']:
+                if a['name'] == name:
+                    return a.get('merges', 0)
+            return 0
+        v1_merges = author_merges(tags['v1.0'], 'Merger')
+        assert v1_merges == 1, (
+            f"Expected 1 merge in v1.0 card (B only); got {v1_merges}. "
+            f"C (after v1.0) must not appear in any tag card."
+        )
+
+    def test_non_prefixed_tag_between_releases_does_not_split_range(
+            self, tmp_path_factory):
+        """A tag that does not match release_tag_prefix sitting between two
+        prefix-matching tags must not create a gap in the release card's range.
+
+        Timeline:
+          A  — init  → v1.0
+          B  — 'Merge pull request #1'  → internal-42  (non-prefixed tag)
+          C  — 'Merge pull request #2'  → v2.0
+
+        With release_tag_prefix='v', all_tags = [v2.0, v1.0].
+        v2.0 range = v1.0..v2.0 — both B and C are included.
+        internal-42 must not act as a range boundary, so neither merge is lost.
+        """
+        import pathlib, os as _os
+        repo = str(tmp_path_factory.mktemp('non_prefix_tag_repo'))
+
+        def git(*args, date=None):
+            env = dict(_os.environ)
+            if date:
+                env['GIT_AUTHOR_DATE']    = date
+                env['GIT_COMMITTER_DATE'] = date
+            env['GIT_CONFIG_COUNT']   = '1'
+            env['GIT_CONFIG_KEY_0']   = 'commit.gpgsign'
+            env['GIT_CONFIG_VALUE_0'] = 'false'
+            subprocess.run(['git', '-C', repo] + list(args),
+                           check=True, capture_output=True, env=env)
+
+        git('init', '-b', 'main')
+        git('config', 'user.email', 'merger@example.com')
+        git('config', 'user.name', 'Merger')
+
+        pathlib.Path(repo, 'init.txt').write_text('init')
+        git('add', '.')
+        git('commit', '-m', 'Initial commit', date='2020-01-01T00:00:00')
+        git('tag', 'v1.0')
+
+        pathlib.Path(repo, 'feat1.txt').write_text('feat1')
+        git('add', '.')
+        git('commit', '-m', 'Merge pull request #1 from user/feat1',
+            date='2020-02-01T00:00:00')                                            # B
+        git('tag', 'internal-42')   # non-prefixed tag after B
+
+        pathlib.Path(repo, 'feat2.txt').write_text('feat2')
+        git('add', '.')
+        git('commit', '-m', 'Merge pull request #2 from user/feat2',
+            date='2020-03-01T00:00:00')                                            # C
+        git('tag', 'v2.0')
+
+        cfg = make_config(
+            str(tmp_path_factory.mktemp('non_prefix_tag_cfg')),
+            primary_branch='main', release_tag_prefix='v', max_release_tags=10,
+        )
+        gs = gitstats.GitStats(repo, cfg)
+        gs.collect()
+
+        tags = {t['name']: t for t in gs.data['tags']}
+        assert 'v1.0' in tags and 'v2.0' in tags, "Both v-tags must be present"
+        assert 'internal-42' not in tags, "Non-prefixed tag must not appear as a release card"
+
+        def author_merges(tag_entry, name):
+            for a in tag_entry['authors']:
+                if a['name'] == name:
+                    return a.get('merges', 0)
+            return 0
+
+        v2_merges = author_merges(tags['v2.0'], 'Merger')
+        assert v2_merges == 2, (
+            f"Expected 2 merges in v2.0 card (B + C); got {v2_merges}. "
+            f"internal-42 must not split the v1.0..v2.0 range."
+        )
+        assert author_merges(tags['v1.0'], 'Merger') == 0, \
+            "v1.0 card must have no merges (all commits are after v1.0)"
+
     # ── HTML output ───────────────────────────────────────────────────────
 
     @pytest.fixture(scope='class')
@@ -3891,7 +4042,7 @@ class TestPRMergeRate:
     def test_default_merge_heuristics_equals_class_constant(self, repo_path, tmp_path):
         """When 'merge_heuristics' is absent from config, the attribute must equal
         the class-level _DEFAULT_MERGE_HEURISTICS constant and the default flag must
-        be set so that built-in logic (primary-branch exclusion, committer-differs)
+        be set so that built-in logic (primary-branch exclusion)
         still applies."""
         cfg = make_config(tmp_path)
         gs = gitstats.GitStats(repo_path, cfg)
@@ -4262,7 +4413,6 @@ class TestDetectMerge:
     _PRIMARY = 'main'
     _NO_PARENTS = ''          # single-parent (ordinary commit)
     _TWO_PARENTS = 'abc def'  # true merge
-    _SAME_EMAIL = 'a@x.com'
 
     @pytest.fixture
     def gs(self, tmp_path):
@@ -4272,74 +4422,39 @@ class TestDetectMerge:
     # ── True merges (parent count) ────────────────────────────────────────────
 
     def test_true_merge_detected(self, gs):
-        assert gs._detect_merge(self._TWO_PARENTS, self._SAME_EMAIL, self._SAME_EMAIL, 'anything') is True
+        assert gs._detect_merge(self._TWO_PARENTS, 'anything') is True
 
     def test_single_parent_not_a_true_merge(self, gs):
-        assert gs._detect_merge(self._NO_PARENTS, self._SAME_EMAIL, self._SAME_EMAIL, 'Fix bug') is False
+        assert gs._detect_merge(self._NO_PARENTS, 'Fix bug') is False
 
     # ── Built-in subject heuristics ───────────────────────────────────────────
 
     def test_pull_request_subject_detected(self, gs):
-        assert gs._detect_merge(self._NO_PARENTS, self._SAME_EMAIL, self._SAME_EMAIL,
+        assert gs._detect_merge(self._NO_PARENTS,
                                  'Merge pull request #42 from user/branch') is True
 
     def test_merge_remote_tracking_detected(self, gs):
-        assert gs._detect_merge(self._NO_PARENTS, self._SAME_EMAIL, self._SAME_EMAIL,
+        assert gs._detect_merge(self._NO_PARENTS,
                                  'Merge remote-tracking branch origin/feature') is True
 
     def test_merge_feature_branch_detected(self, gs):
-        assert gs._detect_merge(self._NO_PARENTS, self._SAME_EMAIL, self._SAME_EMAIL,
+        assert gs._detect_merge(self._NO_PARENTS,
                                  "Merge branch 'feature/cool-thing'") is True
 
     def test_merge_primary_branch_not_detected(self, gs):
         """Merging the primary branch into itself is excluded from heuristics."""
-        assert gs._detect_merge(self._NO_PARENTS, self._SAME_EMAIL, self._SAME_EMAIL,
-                                 "Merge branch 'main'") is False
+        assert gs._detect_merge(self._NO_PARENTS, "Merge branch 'main'") is False
 
     def test_merge_primary_branch_into_feature_not_detected(self, gs):
         """Primary branch pulled into a feature branch is not a PR merge heuristic."""
-        assert gs._detect_merge(self._NO_PARENTS, self._SAME_EMAIL, self._SAME_EMAIL,
+        assert gs._detect_merge(self._NO_PARENTS,
                                  "Merge branch 'main' into feature/foo") is False
 
     def test_normal_commit_not_detected(self, gs):
-        assert gs._detect_merge(self._NO_PARENTS, self._SAME_EMAIL, self._SAME_EMAIL,
-                                 'Fix crash in parser') is False
+        assert gs._detect_merge(self._NO_PARENTS, 'Fix crash in parser') is False
 
     def test_empty_subject_not_detected(self, gs):
-        assert gs._detect_merge(self._NO_PARENTS, self._SAME_EMAIL, self._SAME_EMAIL, '') is False
-
-    # ── Committer-differs heuristic (built-in only) ───────────────────────────
-
-    def test_committer_differs_detected(self, gs):
-        """Different committer/author e-mails flag a squash merge."""
-        assert gs._detect_merge(self._NO_PARENTS, 'committer@x.com', 'author@y.com',
-                                 'Regular commit message') is True
-
-    def test_committer_same_not_detected(self, gs):
-        assert gs._detect_merge(self._NO_PARENTS, 'same@x.com', 'same@x.com',
-                                 'Regular commit message') is False
-
-    def test_committer_differs_case_insensitive(self, gs):
-        assert gs._detect_merge(self._NO_PARENTS, 'USER@X.COM', 'user@x.com',
-                                 'Regular commit message') is False
-
-    def test_committer_email_whitespace_not_falsely_detected(self, gs):
-        """Whitespace on either email must be stripped before comparison.
-
-        Before the fix, c_email was not stripped while a_email was, so a
-        committer email with a trailing space ('same@x.com ') would compare
-        unequal to 'same@x.com', falsely flagging a normal commit as a merge
-        and discarding its line stats.
-        """
-        # Trailing space on c_email — must NOT be detected as a merge.
-        assert gs._detect_merge(self._NO_PARENTS, 'same@x.com ', 'same@x.com',
-                                 'Fix bug') is False
-        # Trailing space on a_email — must NOT be detected as a merge.
-        assert gs._detect_merge(self._NO_PARENTS, 'same@x.com', 'same@x.com ',
-                                 'Fix bug') is False
-        # Both have spaces — still the same address, must NOT be a merge.
-        assert gs._detect_merge(self._NO_PARENTS, ' same@x.com ', ' same@x.com ',
-                                 'Fix bug') is False
+        assert gs._detect_merge(self._NO_PARENTS, '') is False
 
     # ── Custom merge_heuristics ───────────────────────────────────────────────
 
@@ -4348,69 +4463,50 @@ class TestDetectMerge:
                           merge_heuristics=['squash merge', 'landed via'])
         gs = gitstats.GitStats(str(tmp_path), cfg)
         # Custom patterns match
-        assert gs._detect_merge(self._NO_PARENTS, self._SAME_EMAIL, self._SAME_EMAIL,
-                                 'Squash merge of feature branch') is True
-        assert gs._detect_merge(self._NO_PARENTS, self._SAME_EMAIL, self._SAME_EMAIL,
-                                 'Landed via merge queue') is True
+        assert gs._detect_merge(self._NO_PARENTS, 'Squash merge of feature branch') is True
+        assert gs._detect_merge(self._NO_PARENTS, 'Landed via merge queue') is True
         # Built-in subject heuristics no longer apply
-        assert gs._detect_merge(self._NO_PARENTS, self._SAME_EMAIL, self._SAME_EMAIL,
-                                 'Merge pull request #5') is False
+        assert gs._detect_merge(self._NO_PARENTS, 'Merge pull request #5') is False
 
-    def test_committer_differs_always_applied_with_custom_heuristics(self, tmp_path):
-        """Committer-differs check must fire even when a custom heuristics list is used."""
-        cfg = make_config(str(tmp_path), primary_branch=self._PRIMARY,
-                          merge_heuristics=['landed via'])
-        gs = gitstats.GitStats(str(tmp_path), cfg)
-        # Different committer/author — must be detected regardless of heuristic list.
-        assert gs._detect_merge(self._NO_PARENTS, 'committer@x.com', 'author@y.com',
-                                 'Regular commit') is True
-
-    def test_committer_differs_always_applied_with_empty_heuristics(self, tmp_path):
-        """Committer-differs check must fire even when merge_heuristics=[]."""
+    def test_true_merge_detected_with_empty_heuristics(self, tmp_path):
+        """True merge (two parents) is always detected regardless of heuristics setting."""
         cfg = make_config(str(tmp_path), primary_branch=self._PRIMARY,
                           merge_heuristics=[])
         gs = gitstats.GitStats(str(tmp_path), cfg)
-        assert gs._detect_merge(self._NO_PARENTS, 'committer@x.com', 'author@y.com',
-                                 'Regular commit') is True
-        # True merge still works
-        assert gs._detect_merge(self._TWO_PARENTS, self._SAME_EMAIL, self._SAME_EMAIL, '') is True
-        # No subject match, same email → not a merge
-        assert gs._detect_merge(self._NO_PARENTS, self._SAME_EMAIL, self._SAME_EMAIL,
-                                 'Merge pull request #5') is False
+        assert gs._detect_merge(self._TWO_PARENTS, '') is True
+        # No subject match → not a merge for single-parent commits
+        assert gs._detect_merge(self._NO_PARENTS, 'Merge pull request #5') is False
 
     # ── merge_exclude_primary_branch config flag ──────────────────────────────
 
     def test_primary_branch_excluded_by_default(self, gs):
         """'merge branch <primary>' is not detected as a merge by default."""
-        assert gs._detect_merge(self._NO_PARENTS, self._SAME_EMAIL, self._SAME_EMAIL,
-                                 "Merge branch 'main'") is False
+        assert gs._detect_merge(self._NO_PARENTS, "Merge branch 'main'") is False
 
     def test_primary_branch_exclusion_disabled_via_config(self, tmp_path):
         """When merge_exclude_primary_branch=false, primary-branch subjects are credited."""
         cfg = make_config(str(tmp_path), primary_branch=self._PRIMARY,
                           merge_exclude_primary_branch=False)
         gs = gitstats.GitStats(str(tmp_path), cfg)
-        assert gs._detect_merge(self._NO_PARENTS, self._SAME_EMAIL, self._SAME_EMAIL,
-                                 "Merge branch 'main'") is True
+        assert gs._detect_merge(self._NO_PARENTS, "Merge branch 'main'") is True
 
     def test_primary_branch_exclusion_does_not_suppress_other_pattern_matches(self, tmp_path):
         """A primary-sync subject that ALSO matches another heuristic must still be credited."""
         # Subject starts with 'merge branch main' but also contains 'pull request #'.
         cfg = make_config(str(tmp_path), primary_branch=self._PRIMARY)
         gs = gitstats.GitStats(str(tmp_path), cfg)
-        assert gs._detect_merge(self._NO_PARENTS, self._SAME_EMAIL, self._SAME_EMAIL,
+        assert gs._detect_merge(self._NO_PARENTS,
                                  "Merge branch 'main' - pull request #99") is True
 
     def test_non_primary_merge_branch_not_affected_by_exclusion(self, gs):
         """'merge branch <feature>' must still be credited regardless of exclusion setting."""
-        assert gs._detect_merge(self._NO_PARENTS, self._SAME_EMAIL, self._SAME_EMAIL,
-                                 "Merge branch 'feature/cool-thing'") is True
+        assert gs._detect_merge(self._NO_PARENTS, "Merge branch 'feature/cool-thing'") is True
 
     def test_merge_branch_primary_with_url_into_non_primary_excluded(self, gs):
         """Bitbucket-style subject that names primary as source and non-primary as target
         must be excluded (source-is-primary check fires first)."""
         assert gs._detect_merge(
-            self._NO_PARENTS, self._SAME_EMAIL, self._SAME_EMAIL,
+            self._NO_PARENTS,
             "Merge branch 'main' of https://bitbucket.example.org/test into bugfix/asdf",
         ) is False
 
@@ -4418,7 +4514,7 @@ class TestDetectMerge:
         """'Merge remote-tracking branch <origin/primary> into <non-primary>' must be
         excluded — the explicit non-primary target (into staging) marks it as a sync."""
         assert gs._detect_merge(
-            self._NO_PARENTS, self._SAME_EMAIL, self._SAME_EMAIL,
+            self._NO_PARENTS,
             "Merge remote-tracking branch 'origin/main' into staging",
         ) is False
 
@@ -4426,7 +4522,7 @@ class TestDetectMerge:
         """'Merge branch <non-primary> into <non-primary>' must be excluded —
         neither the source nor the destination is the primary branch."""
         assert gs._detect_merge(
-            self._NO_PARENTS, self._SAME_EMAIL, self._SAME_EMAIL,
+            self._NO_PARENTS,
             "Merge branch 'develop' into staging",
         ) is False
 
@@ -4434,7 +4530,7 @@ class TestDetectMerge:
         """'Merge branch <feature> into <primary>' must be credited — this is the
         normal case of a PR landing on the primary branch."""
         assert gs._detect_merge(
-            self._NO_PARENTS, self._SAME_EMAIL, self._SAME_EMAIL,
+            self._NO_PARENTS,
             "Merge branch 'feature/my-work' into main",
         ) is True
 
@@ -4443,7 +4539,7 @@ class TestDetectMerge:
         # 'merge remote-tracking branch' also matches, but 'into staging'
         # unconditionally marks this as a sync commit.
         assert gs._detect_merge(
-            self._NO_PARENTS, self._SAME_EMAIL, self._SAME_EMAIL,
+            self._NO_PARENTS,
             "Merge remote-tracking branch 'origin/feature' into staging",
         ) is False
 
@@ -4497,16 +4593,15 @@ class TestDetectMerge:
 
 class TestNeverMergeSubjects:
     """Commits whose subjects appear in _NEVER_MERGE_SUBJECTS must return False
-    from _detect_merge regardless of committer/author mismatch or heuristics."""
+    from _detect_merge regardless of heuristics."""
 
     @pytest.fixture
     def gs(self, tmp_path):
         cfg = make_config(str(tmp_path), primary_branch='main')
         return gitstats.GitStats(str(tmp_path), cfg)
 
-    def _dm(self, gs, subject, *, committer='bot@github.com', author='dev@example.com'):
-        # Single parent → true-merge path is disabled; committer differs.
-        return gs._detect_merge('abc123', committer, author, subject)
+    def _dm(self, gs, subject):
+        return gs._detect_merge('abc123', subject)
 
     def test_applied_suggestion_lowercase_not_a_merge(self, gs):
         assert self._dm(gs, 'applied suggestion') is False
@@ -4523,18 +4618,14 @@ class TestNeverMergeSubjects:
     def test_applied_suggestion_leading_trailing_whitespace(self, gs):
         assert self._dm(gs, '  Applied suggestion  ') is False
 
-    def test_applied_suggestion_partial_match_still_a_merge(self, gs):
-        # Subject that *contains* the phrase but is not equal to it should
-        # fall through to the committer-differs path and be credited.
-        assert self._dm(gs, 'applied suggestion to fix typo') is True
+    def test_applied_suggestion_partial_match_not_a_merge(self, gs):
+        # Partial match is not in _NEVER_MERGE_SUBJECTS and has no subject
+        # heuristic — not detected as a merge.
+        assert self._dm(gs, 'applied suggestion to fix typo') is False
 
-    def test_non_excluded_subject_still_detected_via_committer_differs(self, gs):
-        assert self._dm(gs, 'fix typo') is True
-
-    def test_same_emails_applied_suggestion_not_a_merge(self, gs):
-        # Sanity: even if committer == author, the subject is excluded.
-        assert gs._detect_merge('abc123', 'dev@example.com', 'dev@example.com',
-                                'Applied suggestion') is False
+    def test_applied_suggestion_excluded_from_subject_heuristic(self, gs):
+        # Sanity: subject is excluded even without any merge keywords.
+        assert gs._detect_merge('abc123', 'Applied suggestion') is False
 
 
 # ---------------------------------------------------------------------------
@@ -4556,7 +4647,6 @@ class TestIsPrMerge:
     _PRIMARY     = 'main'
     _NO_PARENTS  = ''
     _TWO_PARENTS = 'abc def'
-    _SAME_EMAIL  = 'a@x.com'
 
     @pytest.fixture
     def gs(self, tmp_path):
@@ -4566,45 +4656,38 @@ class TestIsPrMerge:
     # ── Must pass through everything _detect_merge accepts ────────────────────
 
     def test_ordinary_commit_not_a_pr_merge(self, gs):
-        assert gs._is_pr_merge(self._NO_PARENTS, self._SAME_EMAIL, self._SAME_EMAIL,
-                                'Fix crash in parser') is False
+        assert gs._is_pr_merge(self._NO_PARENTS, 'Fix crash in parser') is False
 
     def test_pull_request_subject_is_pr_merge(self, gs):
-        assert gs._is_pr_merge(self._NO_PARENTS, self._SAME_EMAIL, self._SAME_EMAIL,
+        assert gs._is_pr_merge(self._NO_PARENTS,
                                 'Merge pull request #42 from user/branch') is True
-
-    def test_committer_differs_is_pr_merge(self, gs):
-        assert gs._is_pr_merge(self._NO_PARENTS, 'bot@github.com', 'author@x.com',
-                                'Regular commit message') is True
 
     def test_feature_branch_true_merge_is_pr_merge(self, gs):
         """True merge of a feature branch into primary is a PR merge."""
-        assert gs._is_pr_merge(self._TWO_PARENTS, self._SAME_EMAIL, self._SAME_EMAIL,
-                                "Merge branch 'feature/my-thing'") is True
+        assert gs._is_pr_merge(self._TWO_PARENTS, "Merge branch 'feature/my-thing'") is True
 
     # ── Primary-branch sync commits must be excluded ──────────────────────────
 
     def test_true_merge_of_primary_into_other_excluded(self, gs):
         """True merge whose subject indicates the primary branch being pulled in
         is a sync commit — must NOT be credited as a PR merge."""
-        assert gs._is_pr_merge(self._TWO_PARENTS, self._SAME_EMAIL, self._SAME_EMAIL,
-                                "Merge branch 'main'") is False
+        assert gs._is_pr_merge(self._TWO_PARENTS, "Merge branch 'main'") is False
 
     def test_true_merge_primary_into_feature_excluded(self, gs):
-        assert gs._is_pr_merge(self._TWO_PARENTS, self._SAME_EMAIL, self._SAME_EMAIL,
+        assert gs._is_pr_merge(self._TWO_PARENTS,
                                 "Merge branch 'main' into feature/foo") is False
 
     def test_true_merge_primary_double_quote_excluded(self, gs):
-        assert gs._is_pr_merge(self._TWO_PARENTS, self._SAME_EMAIL, self._SAME_EMAIL,
+        assert gs._is_pr_merge(self._TWO_PARENTS,
                                 'Merge branch "main" into feature/bar') is False
 
     def test_true_merge_remote_tracking_primary_excluded(self, gs):
-        assert gs._is_pr_merge(self._TWO_PARENTS, self._SAME_EMAIL, self._SAME_EMAIL,
+        assert gs._is_pr_merge(self._TWO_PARENTS,
                                 "Merge remote-tracking branch 'origin/main'") is False
 
     def test_true_merge_remote_tracking_other_branch_is_pr_merge(self, gs):
         """Remote-tracking merge of a non-primary branch is a PR merge."""
-        assert gs._is_pr_merge(self._TWO_PARENTS, self._SAME_EMAIL, self._SAME_EMAIL,
+        assert gs._is_pr_merge(self._TWO_PARENTS,
                                 "Merge remote-tracking branch 'origin/feature/x'") is True
 
     def test_remote_tracking_branch_prefixed_with_primary_name_is_pr_merge(self, gs):
@@ -4617,35 +4700,27 @@ class TestIsPrMerge:
         only the exact primary branch name is excluded.
         """
         # 'main-release' starts with 'main' — must still be counted as a PR merge.
-        assert gs._is_pr_merge(self._TWO_PARENTS, self._SAME_EMAIL, self._SAME_EMAIL,
+        assert gs._is_pr_merge(self._TWO_PARENTS,
                                 "Merge remote-tracking branch 'origin/main-release'") is True
         # 'main-v2' similarly must not be excluded.
-        assert gs._is_pr_merge(self._TWO_PARENTS, self._SAME_EMAIL, self._SAME_EMAIL,
+        assert gs._is_pr_merge(self._TWO_PARENTS,
                                 "Merge remote-tracking branch 'origin/main-v2'") is True
 
     def test_remote_tracking_primary_branch_no_quotes_excluded(self, gs):
         """Remote-tracking sync commit without quotes around the branch name must
         still be excluded (e.g. git produces this format on some systems)."""
-        assert gs._is_pr_merge(self._TWO_PARENTS, self._SAME_EMAIL, self._SAME_EMAIL,
+        assert gs._is_pr_merge(self._TWO_PARENTS,
                                 "Merge remote-tracking branch origin/main") is False
 
     def test_remote_tracking_primary_branch_double_quote_excluded(self, gs):
         """Remote-tracking sync commit using double quotes must be excluded."""
-        assert gs._is_pr_merge(self._TWO_PARENTS, self._SAME_EMAIL, self._SAME_EMAIL,
+        assert gs._is_pr_merge(self._TWO_PARENTS,
                                 'Merge remote-tracking branch "origin/main"') is False
 
     def test_sync_commit_single_parent_not_excluded(self, gs):
         """Single-parent commit with primary-branch subject is not a true merge;
-        the sync exclusion applies only to true merges (two parents)."""
-        # A heuristic match with primary-branch wording that isn't a true merge
-        # is not excluded (this pattern wouldn't normally occur in practice).
-        # The key invariant: _is_pr_merge is only MORE restrictive than
-        # _detect_merge, never less.
-        result = gs._is_pr_merge(self._NO_PARENTS, self._SAME_EMAIL, self._SAME_EMAIL,
-                                  "Merge branch 'main'")
-        # _detect_merge returns False for this (excluded by subject heuristic),
-        # so _is_pr_merge must also return False.
-        assert result is False
+        _detect_merge already returns False for it so _is_pr_merge must too."""
+        assert gs._is_pr_merge(self._NO_PARENTS, "Merge branch 'main'") is False
 
     # ── Custom merge_heuristics ───────────────────────────────────────────────
 
@@ -4655,15 +4730,14 @@ class TestIsPrMerge:
         cfg = make_config(str(tmp_path), primary_branch=self._PRIMARY,
                           merge_heuristics=['landed via', 'squash merge'])
         gs = gitstats.GitStats(str(tmp_path), cfg)
-        assert gs._is_pr_merge(self._TWO_PARENTS, self._SAME_EMAIL, self._SAME_EMAIL,
+        assert gs._is_pr_merge(self._TWO_PARENTS,
                                 "Merge branch 'main' into feature/x") is False
 
     def test_custom_heuristics_feature_true_merge_is_pr_merge(self, tmp_path):
         cfg = make_config(str(tmp_path), primary_branch=self._PRIMARY,
                           merge_heuristics=['landed via'])
         gs = gitstats.GitStats(str(tmp_path), cfg)
-        assert gs._is_pr_merge(self._TWO_PARENTS, self._SAME_EMAIL, self._SAME_EMAIL,
-                                "Merge branch 'feature/x'") is True
+        assert gs._is_pr_merge(self._TWO_PARENTS, "Merge branch 'feature/x'") is True
 
     # ── Explicit non-primary target ("into <branch>") exclusion ──────────────
 
@@ -4671,7 +4745,7 @@ class TestIsPrMerge:
         """Bitbucket URL-style subject with primary source and non-primary target
         must not count as a PR merge (true merge variant)."""
         assert gs._is_pr_merge(
-            self._TWO_PARENTS, self._SAME_EMAIL, self._SAME_EMAIL,
+            self._TWO_PARENTS,
             "Merge branch 'main' of https://bitbucket.example.org/test into bugfix/asdf",
         ) is False
 
@@ -4680,12 +4754,12 @@ class TestIsPrMerge:
         as a PR merge — the subject explicitly targets a non-primary branch."""
         # Single-parent heuristic commit
         assert gs._is_pr_merge(
-            self._NO_PARENTS, self._SAME_EMAIL, self._SAME_EMAIL,
+            self._NO_PARENTS,
             "Merge remote-tracking branch 'origin/main' into staging",
         ) is False
         # True merge variant
         assert gs._is_pr_merge(
-            self._TWO_PARENTS, self._SAME_EMAIL, self._SAME_EMAIL,
+            self._TWO_PARENTS,
             "Merge remote-tracking branch 'origin/main' into staging",
         ) is False
 
@@ -4694,28 +4768,27 @@ class TestIsPrMerge:
         neither source nor target is the primary branch."""
         # Single-parent heuristic commit
         assert gs._is_pr_merge(
-            self._NO_PARENTS, self._SAME_EMAIL, self._SAME_EMAIL,
+            self._NO_PARENTS,
             "Merge branch 'develop' into staging",
         ) is False
         # True merge variant
         assert gs._is_pr_merge(
-            self._TWO_PARENTS, self._SAME_EMAIL, self._SAME_EMAIL,
+            self._TWO_PARENTS,
             "Merge branch 'develop' into staging",
         ) is False
 
     def test_merge_branch_feature_into_primary_is_pr_merge(self, gs):
         """'Merge branch feature into primary' IS a PR merge — explicit primary target."""
         assert gs._is_pr_merge(
-            self._TWO_PARENTS, self._SAME_EMAIL, self._SAME_EMAIL,
+            self._TWO_PARENTS,
             "Merge branch 'feature/my-work' into main",
         ) is True
 
-    def test_committer_differs_sync_subject_not_pr_merge(self, gs):
-        """Even when committer ≠ author, a sync subject (into non-primary) must
-        not be credited.  The sync exclusion in _is_pr_merge overrides the
-        committer-differs result from _detect_merge."""
+    def test_sync_subject_into_non_primary_not_pr_merge(self, gs):
+        """A sync subject targeting a non-primary branch must not be credited —
+        the into-non-primary exclusion applies regardless of parent count."""
         assert gs._is_pr_merge(
-            self._NO_PARENTS, 'bot@github.com', 'author@x.com',
+            self._NO_PARENTS,
             "Merge remote-tracking branch 'origin/main' into staging",
         ) is False
 

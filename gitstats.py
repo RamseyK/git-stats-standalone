@@ -423,7 +423,7 @@ class GitStats:
 
     # ------------------------------------------------------------------ collect
 
-    def _detect_merge(self, parents_str: str, c_email: str, a_email: str, subject: str) -> bool:
+    def _detect_merge(self, parents_str: str, subject: str) -> bool:
         """Return True when a commit should be treated as a merge.
 
         Used both to credit the merges dimension (via _collect_merges) and to
@@ -432,8 +432,6 @@ class GitStats:
 
         Args:
             parents_str: Space-separated parent hashes from %P.
-            c_email:     Committer email (%ce).
-            a_email:     Author email (%ae).
             subject:     Commit subject line (%s).
 
         A commit is a merge when any of the following hold:
@@ -447,10 +445,6 @@ class GitStats:
                                 (b) subjects with an explicit non-primary target
                                     ("... into <branch>") are unconditionally
                                     excluded — the target is stated explicitly.
-          Committer differs — committer e-mail ≠ author e-mail; catches squash
-                              merges whose edited messages bypass subject
-                              heuristics.  Always applied regardless of other
-                              settings.
         """
         is_true_merge = len(parents_str.split()) >= 2
         s = subject.lower().strip()
@@ -493,15 +487,9 @@ class GitStats:
                 if into_m and into_m.group(1).strip("'\"") != pb:
                     is_subject_heuristic = False
 
-        # Committer-differs: always applied regardless of heuristic settings —
-        # catches squash merges whose commit messages bypass all subject patterns.
-        is_committer_merge = (
-            not is_true_merge
-            and c_email.strip().lower() != a_email.strip().lower()
-        )
-        return is_true_merge or is_subject_heuristic or is_committer_merge
+        return is_true_merge or is_subject_heuristic
 
-    def _is_pr_merge(self, parents_str: str, c_email: str, a_email: str, subject: str) -> bool:
+    def _is_pr_merge(self, parents_str: str, subject: str) -> bool:
         """Return True when a commit is a PR merge *into* the primary branch.
 
         Extends _detect_merge with a sync-commit exclusion applied to all
@@ -523,7 +511,7 @@ class GitStats:
         Line exclusion always uses _detect_merge so that sync-commit diffs
         are still suppressed even though the committer is not credited.
         """
-        if not self._detect_merge(parents_str, c_email, a_email, subject):
+        if not self._detect_merge(parents_str, subject):
             return False
         # Sync commit exclusion: applied to all commits regardless of parent
         # count.  _collect_merges avoids sync commits naturally via
@@ -612,7 +600,7 @@ class GitStats:
                 all_ts.append(ts)
                 current_author = author
                 current_team = team
-                current_skip_lines = self._detect_merge(parents_str, c_email, email, subject)
+                current_skip_lines = self._detect_merge(parents_str, subject)
                 # Track the most-recently-seen email for each canonical author so
                 # we can resolve email-keyed team membership entries later.
 
@@ -734,19 +722,19 @@ class GitStats:
 
         result = subprocess.run(
             ['git', '-C', repo_path, 'log', primary, '--first-parent',
-             '--format=MERGE|%P|%ce|%cn|%ct|%ae|%s'],
+             '--format=MERGE|%P|%ce|%cn|%ct|%s'],
             capture_output=True, text=True, errors='replace',
         )
 
         for line in result.stdout.splitlines():
             if not line.startswith('MERGE|'):
                 continue
-            parts = line.split('|', 6)
-            if len(parts) < 7:
+            parts = line.split('|', 5)
+            if len(parts) < 6:
                 continue
-            _, parents_str, c_email, c_name, ts_str, a_email, subject = parts
+            _, parents_str, c_email, c_name, ts_str, subject = parts
 
-            if not self._is_pr_merge(parents_str, c_email, a_email, subject):
+            if not self._is_pr_merge(parents_str, subject):
                 continue
 
             ts = int(ts_str) if ts_str.strip().isdigit() else 0
@@ -955,7 +943,7 @@ class GitStats:
                     team  = self._get_team(canon, a_email, ts)
                     current_author = canon
                     current_team   = team
-                    current_skip_lines = self._detect_merge(parents_str, c_email, a_email, subject)
+                    current_skip_lines = self._detect_merge(parents_str, subject)
                     if self._issue_tag_re:
                         _tag_issue_matches = self._issue_tag_re.findall(subject)
                         tag_issues.update(_tag_issue_matches)
@@ -988,7 +976,7 @@ class GitStats:
                     # reachable from the tag but not on the main branch spine — do
                     # not receive credit.  _is_pr_merge provides the subject-based
                     # sync-commit exclusion as a second layer of defense.
-                    if commit_sha in fp_shas and self._is_pr_merge(parents_str, c_email, a_email, subject):
+                    if commit_sha in fp_shas and self._is_pr_merge(parents_str, subject):
                         committer = self._get_author(c_name, c_email)
                         c_team    = self._get_team(committer, c_email, ts)
                         if committer not in tag_authors:
