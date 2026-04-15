@@ -113,6 +113,7 @@ All configuration lives in a single JSON file. Every key is optional.
 | `bus_factor_threshold` | `0.5` | Fraction (0–1) used to compute both bus factors — the fewest contributors whose combined commits (or PR merges) reach this fraction. The PR Merges bus factor is hidden when `impact_w_merges` is `0`. |
 | `merge_heuristics` | *(see below)* | Substrings matched case-insensitively against commit subjects to detect squash/rebase merges. Replaces the built-in subject patterns entirely when present. |
 | `merge_exclude_primary_branch` | `true` | When `true`, subjects matching `"Merge branch '<primary>'"` are excluded from the subject heuristics — they indicate a sync commit pulling the primary branch into a feature branch rather than a PR landing. Set to `false` to credit those commits. |
+| `ignore_commits` | `[]` | List of commit hashes to exclude from all analysis — commit counts, line stats, PR merge credits, activity heatmap, and per-release attribution. Full 40-character SHA1 hashes or unique short prefixes (7+ characters recommended) are accepted. Useful for excluding bulk imports, automated commits, or history-rewriting artifacts. |
 | `component_markers` | *(see below)* | Filenames that identify a component root. Any directory directly containing one of these files becomes a component in the churn chart. Replaces the default set entirely. |
 | `loc_extensions` | *(see below)* | File extensions (with leading dot) counted toward the **Lines of Code** tile. Matched case-insensitively. Replaces the default set entirely. |
 

@@ -5269,5 +5269,327 @@ class TestTimeRangedMembership:
             "Unassigned Community member must not appear in previous members"
 
 
+# ---------------------------------------------------------------------------
+# ignore_commits
+# ---------------------------------------------------------------------------
+
+class TestIgnoreCommits:
+    """Verify that commits listed in ignore_commits are excluded from all analysis.
+
+    Tests cover:
+      - Commit counts and author records (_collect_commits).
+      - Line stats excluded for ignored commits.
+      - Activity heatmap and timestamp-based metrics.
+      - PR merge credits excluded for ignored commits (_collect_merges).
+      - Per-release attribution excluded for ignored commits (tag loop).
+      - Full-hash and short-prefix matching.
+      - Empty ignore list has no effect.
+    """
+
+    @pytest.fixture
+    def simple_repo(self, tmp_path_factory):
+        """Three-commit repo on 'main' with deterministic hashes.
+
+        A  — 'Initial commit'
+        B  — 'Add feature'
+        C  — 'Merge pull request #1 from user/feat'  (heuristic PR merge)
+
+        Returns (repo_path, sha_a, sha_b, sha_c).
+        """
+        import pathlib
+        repo = str(tmp_path_factory.mktemp('ignore_simple_repo'))
+
+        def git(*args):
+            subprocess.run(['git', '-C', repo] + list(args),
+                           check=True, capture_output=True,
+                           env={**os.environ,
+                                'GIT_AUTHOR_NAME': 'Alice',
+                                'GIT_AUTHOR_EMAIL': 'alice@example.com',
+                                'GIT_COMMITTER_NAME': 'Alice',
+                                'GIT_COMMITTER_EMAIL': 'alice@example.com',
+                                'GIT_CONFIG_COUNT': '1',
+                                'GIT_CONFIG_KEY_0': 'commit.gpgsign',
+                                'GIT_CONFIG_VALUE_0': 'false',
+                                'GIT_AUTHOR_DATE': '2022-01-01T00:00:00',
+                                'GIT_COMMITTER_DATE': '2022-01-01T00:00:00'})
+
+        def sha():
+            return subprocess.check_output(
+                ['git', '-C', repo, 'rev-parse', 'HEAD'], text=True).strip()
+
+        git('init', '-b', 'main')
+
+        pathlib.Path(repo, 'a.txt').write_text('aaa\nbbb\nccc\n')
+        git('add', '.')
+        git('commit', '-m', 'Initial commit')
+        sha_a = sha()
+
+        pathlib.Path(repo, 'b.txt').write_text('xxx\nyyy\n')
+        git('add', '.')
+        git('commit', '-m', 'Add feature')
+        sha_b = sha()
+
+        pathlib.Path(repo, 'c.txt').write_text('zzz\n')
+        git('add', '.')
+        git('commit', '-m', 'Merge pull request #1 from user/feat')
+        sha_c = sha()
+
+        return repo, sha_a, sha_b, sha_c
+
+    # ── Config loading ────────────────────────────────────────────────────────
+
+    def test_ignore_commits_stored_as_set(self, tmp_path):
+        """ignore_commits in config must be stored lowercased on the instance."""
+        cfg = make_config(tmp_path, ignore_commits=['ABCDEF1234567', 'deadbeef'])
+        gs = gitstats.GitStats('.', cfg)
+        assert 'abcdef1234567' in gs.ignore_commits
+        assert 'deadbeef' in gs.ignore_commits
+
+    def test_empty_ignore_list_default(self, tmp_path):
+        """When ignore_commits is absent, the set must be empty."""
+        cfg = make_config(tmp_path)
+        gs = gitstats.GitStats('.', cfg)
+        assert gs.ignore_commits == set()
+
+    def test_is_ignored_commit_full_hash(self, tmp_path):
+        """_is_ignored_commit must return True for an exact full-hash match."""
+        cfg = make_config(tmp_path, ignore_commits=['abc123def456abc123def456abc123def456abc1'])
+        gs = gitstats.GitStats('.', cfg)
+        assert gs._is_ignored_commit('abc123def456abc123def456abc123def456abc1')
+        assert not gs._is_ignored_commit('abc123def456abc123def456abc123def456abc2')
+
+    def test_is_ignored_commit_short_prefix(self, tmp_path):
+        """_is_ignored_commit must return True when a configured prefix matches
+        the start of the full commit hash."""
+        cfg = make_config(tmp_path, ignore_commits=['abc1234'])
+        gs = gitstats.GitStats('.', cfg)
+        assert gs._is_ignored_commit('abc1234def456abc1234def456abc1234def456a')
+        assert not gs._is_ignored_commit('abc1235def456abc1234def456abc1234def456a')
+
+    def test_is_ignored_commit_case_insensitive(self, tmp_path):
+        """_is_ignored_commit must be case-insensitive."""
+        cfg = make_config(tmp_path, ignore_commits=['ABCDEF1'])
+        gs = gitstats.GitStats('.', cfg)
+        assert gs._is_ignored_commit('abcdef1234567890abcdef1234567890abcdef12')
+        assert gs._is_ignored_commit('ABCDEF1234567890abcdef1234567890abcdef12')
+
+    def test_is_ignored_commit_empty_list(self, tmp_path):
+        """_is_ignored_commit must always return False when ignore list is empty."""
+        cfg = make_config(tmp_path)
+        gs = gitstats.GitStats('.', cfg)
+        assert not gs._is_ignored_commit('abc1234def456abc1234def456abc1234def456a')
+
+    # ── Commit-level exclusion (_collect_commits) ─────────────────────────────
+
+    def test_ignored_commit_excluded_from_commit_count(
+            self, simple_repo, tmp_path_factory):
+        """An ignored commit must not contribute to the author's commit count."""
+        repo, sha_a, sha_b, sha_c = simple_repo
+        cfg = make_config(tmp_path_factory.mktemp('ic_count'),
+                          primary_branch='main',
+                          ignore_commits=[sha_b])
+        gs = gitstats.GitStats(repo, cfg)
+        gs.collect()
+
+        alice = gs.data['authors'].get('Alice', {})
+        # B is ignored; only A and C (heuristic merge, counted as commit too)
+        # remain → 2 commits.
+        assert alice.get('commits', 0) == 2, (
+            f"Expected 2 commits (A + C); B should be ignored. "
+            f"Got {alice.get('commits', 0)}"
+        )
+
+    def test_ignored_commit_excluded_from_line_stats(
+            self, simple_repo, tmp_path_factory):
+        """An ignored commit's added/deleted lines must not be counted."""
+        repo, sha_a, sha_b, sha_c = simple_repo
+        # Ignore B which adds b.txt (2 lines).
+        cfg = make_config(tmp_path_factory.mktemp('ic_lines'),
+                          primary_branch='main',
+                          ignore_commits=[sha_b])
+        gs = gitstats.GitStats(repo, cfg)
+        gs.collect()
+
+        alice = gs.data['authors'].get('Alice', {})
+        # C ('Merge pull request') is a heuristic merge → its lines are also
+        # excluded by merge detection.  Only A's lines (3 adds) should count.
+        assert alice.get('add', 0) == 3, (
+            f"Expected 3 added lines (from A only); got {alice.get('add', 0)}"
+        )
+
+    def test_ignored_commit_excluded_from_total_commits(
+            self, simple_repo, tmp_path_factory):
+        """data['general']['total_commits'] must not count ignored commits."""
+        repo, sha_a, sha_b, sha_c = simple_repo
+        cfg = make_config(tmp_path_factory.mktemp('ic_total'),
+                          primary_branch='main',
+                          ignore_commits=[sha_b])
+        gs = gitstats.GitStats(repo, cfg)
+        gs.collect()
+
+        total = gs.data['general']['total_commits']
+        assert total == 2, (
+            f"Expected total_commits=2 (A + C); got {total}"
+        )
+
+    def test_ignored_commit_short_prefix_works(
+            self, simple_repo, tmp_path_factory):
+        """A 7-character short prefix must match and exclude the commit."""
+        repo, sha_a, sha_b, sha_c = simple_repo
+        cfg = make_config(tmp_path_factory.mktemp('ic_short'),
+                          primary_branch='main',
+                          ignore_commits=[sha_b[:7]])
+        gs = gitstats.GitStats(repo, cfg)
+        gs.collect()
+
+        alice = gs.data['authors'].get('Alice', {})
+        assert alice.get('commits', 0) == 2, (
+            f"Short prefix ignore must exclude B; expected 2 commits, "
+            f"got {alice.get('commits', 0)}"
+        )
+
+    def test_multiple_ignored_commits(
+            self, simple_repo, tmp_path_factory):
+        """Multiple hashes in ignore_commits must all be excluded."""
+        repo, sha_a, sha_b, sha_c = simple_repo
+        cfg = make_config(tmp_path_factory.mktemp('ic_multi'),
+                          primary_branch='main',
+                          ignore_commits=[sha_a, sha_c])
+        gs = gitstats.GitStats(repo, cfg)
+        gs.collect()
+
+        alice = gs.data['authors'].get('Alice', {})
+        assert alice.get('commits', 0) == 1, (
+            f"A and C ignored; only B should remain. "
+            f"Expected 1 commit, got {alice.get('commits', 0)}"
+        )
+
+    def test_empty_ignore_list_no_effect(
+            self, simple_repo, tmp_path_factory):
+        """An empty ignore_commits list must leave all commits counted."""
+        repo, sha_a, sha_b, sha_c = simple_repo
+        cfg = make_config(tmp_path_factory.mktemp('ic_empty'),
+                          primary_branch='main',
+                          ignore_commits=[])
+        gs = gitstats.GitStats(repo, cfg)
+        gs.collect()
+
+        alice = gs.data['authors'].get('Alice', {})
+        assert alice.get('commits', 0) == 3, (
+            f"Empty ignore list must count all 3 commits; "
+            f"got {alice.get('commits', 0)}"
+        )
+
+    # ── Merge credit exclusion (_collect_merges) ──────────────────────────────
+
+    def test_ignored_commit_excluded_from_merge_credits(
+            self, simple_repo, tmp_path_factory):
+        """A PR merge commit in ignore_commits must not generate a merge credit."""
+        repo, sha_a, sha_b, sha_c = simple_repo
+        # C is the 'Merge pull request' heuristic merge — ignore it.
+        cfg = make_config(tmp_path_factory.mktemp('ic_merge'),
+                          primary_branch='main',
+                          ignore_commits=[sha_c])
+        gs = gitstats.GitStats(repo, cfg)
+        gs.data['authors'] = {}
+        gs.data['teams']   = {}
+        gs._collect_merges(repo)
+
+        total = sum(a.get('merges', 0) for a in gs.data['authors'].values())
+        assert total == 0, (
+            f"C (PR merge) was ignored; expected 0 merge credits, got {total}"
+        )
+
+    def test_non_ignored_merge_still_credited(
+            self, simple_repo, tmp_path_factory):
+        """Ignoring an unrelated commit must not affect merge credit for others."""
+        repo, sha_a, sha_b, sha_c = simple_repo
+        cfg = make_config(tmp_path_factory.mktemp('ic_merge_ok'),
+                          primary_branch='main',
+                          ignore_commits=[sha_a])  # ignore A, not C
+        gs = gitstats.GitStats(repo, cfg)
+        gs.data['authors'] = {}
+        gs.data['teams']   = {}
+        gs._collect_merges(repo)
+
+        total = sum(a.get('merges', 0) for a in gs.data['authors'].values())
+        assert total == 1, (
+            f"Only A is ignored; C (PR merge) must still be credited. "
+            f"Expected 1 merge, got {total}"
+        )
+
+    # ── Per-release attribution (tag loop) ────────────────────────────────────
+
+    def test_ignored_commit_excluded_from_tag_attribution(
+            self, tmp_path_factory):
+        """An ignored commit must not appear in the per-release tag breakdown."""
+        import pathlib, os as _os
+        repo = str(tmp_path_factory.mktemp('ic_tag_repo'))
+
+        def git(*args, date='2022-01-01T00:00:00'):
+            subprocess.run(
+                ['git', '-C', repo] + list(args),
+                check=True, capture_output=True,
+                env={**_os.environ,
+                     'GIT_AUTHOR_NAME': 'Alice',
+                     'GIT_AUTHOR_EMAIL': 'alice@example.com',
+                     'GIT_COMMITTER_NAME': 'Alice',
+                     'GIT_COMMITTER_EMAIL': 'alice@example.com',
+                     'GIT_CONFIG_COUNT': '1',
+                     'GIT_CONFIG_KEY_0': 'commit.gpgsign',
+                     'GIT_CONFIG_VALUE_0': 'false',
+                     'GIT_AUTHOR_DATE': date,
+                     'GIT_COMMITTER_DATE': date},
+            )
+
+        def sha():
+            return subprocess.check_output(
+                ['git', '-C', repo, 'rev-parse', 'HEAD'], text=True).strip()
+
+        git('init', '-b', 'main')
+
+        # Use distinct dates so git tag --sort=-creatordate is deterministic.
+        pathlib.Path(repo, 'a.txt').write_text('aaa\n')
+        git('add', '.')
+        git('commit', '-m', 'Initial commit', date='2022-01-01T00:00:00')
+        git('tag', 'v1.0')
+
+        pathlib.Path(repo, 'b.txt').write_text('bbb\n')
+        git('add', '.')
+        git('commit', '-m', 'Add feature', date='2022-02-01T00:00:00')
+        sha_b = sha()
+
+        pathlib.Path(repo, 'c.txt').write_text('ccc\n')
+        git('add', '.')
+        git('commit', '-m', 'Another feature', date='2022-03-01T00:00:00')
+        git('tag', 'v2.0')
+
+        # Ignore B — only C should count in v2.0 card.
+        cfg = make_config(
+            tmp_path_factory.mktemp('ic_tag_cfg'),
+            primary_branch='main',
+            release_tag_prefix='v',
+            max_release_tags=10,
+            ignore_commits=[sha_b],
+        )
+        gs = gitstats.GitStats(repo, cfg)
+        gs.collect()
+
+        tags = {t['name']: t for t in gs.data['tags']}
+        assert 'v2.0' in tags
+
+        def author_commits(tag_entry, name):
+            for a in tag_entry['authors']:
+                if a['name'] == name:
+                    return a.get('commits', 0)
+            return 0
+
+        v2_commits = author_commits(tags['v2.0'], 'Alice')
+        assert v2_commits == 1, (
+            f"B is ignored; v2.0 card should show 1 commit (C only). "
+            f"Got {v2_commits}"
+        )
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main())

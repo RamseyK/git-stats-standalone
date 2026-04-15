@@ -321,6 +321,12 @@ class GitStats:
                     file=sys.stderr,
                 )
 
+        # Commit hashes to exclude from all analysis — commits, lines, merges,
+        # activity, and tag attribution.  Full 40-character SHA1 hashes or
+        # unique short prefixes (≥7 characters recommended) are accepted.
+        # Entries are lowercased so matching is case-insensitive.
+        self.ignore_commits = {h.lower() for h in config.get('ignore_commits', [])}
+
         # Central data store populated by collect() and consumed by generate_report().
         self.data = {
             'project_name': os.path.basename(os.path.abspath(repo_path)),
@@ -423,6 +429,18 @@ class GitStats:
             ['git', '-C', repo or self.repo_path] + args,
             stderr=subprocess.DEVNULL
         ).decode('utf-8', 'ignore')
+
+    def _is_ignored_commit(self, commit_hash: str) -> bool:
+        """Return True when commit_hash should be excluded from all analysis.
+
+        Matches against self.ignore_commits using startswith so that both
+        full 40-character SHA1 hashes and short prefixes work correctly.
+        Returns False immediately when the ignore list is empty.
+        """
+        if not self.ignore_commits:
+            return False
+        h = commit_hash.lower()
+        return any(h.startswith(ig) for ig in self.ignore_commits)
 
     # ------------------------------------------------------------------ collect
 
@@ -567,7 +585,7 @@ class GitStats:
             main repo.
         """
         log_data = self._run_git(
-            ['log', '--numstat', '--pretty=format:COMMIT|%P|%at|%an|%ae|%ce|%s'], repo_path
+            ['log', '--numstat', '--pretty=format:COMMIT|%H|%P|%at|%an|%ae|%ce|%s'], repo_path
         )
 
         # State carried across lines within the same commit
@@ -595,7 +613,18 @@ class GitStats:
                 current_commit_adds = 0
                 current_commit_dels = 0
 
-                _, parents_str, ts_str, name, email, c_email, subject = line.split('|', 6)
+                _, commit_hash, parents_str, ts_str, name, email, c_email, subject = line.split('|', 7)
+
+                # Skip commits in the ignore list entirely — no author/team/
+                # activity stats, no line accumulation, no commit_lines entry.
+                # Setting current_author to None also suppresses the numstat
+                # lines that follow this header.
+                if self._is_ignored_commit(commit_hash):
+                    current_author = None
+                    current_team = None
+                    current_skip_lines = False
+                    continue
+
                 ts = int(ts_str)
                 current_commit_ts = ts
                 dt = datetime.datetime.fromtimestamp(ts)
@@ -763,7 +792,8 @@ class GitStats:
                 continue
             _, h, parents_str, c_email, c_name, ts_str, subject = parts
             fp_shas.add(h)
-            commits[h] = (parents_str, c_email, c_name, ts_str, subject)
+            if not self._is_ignored_commit(h):
+                commits[h] = (parents_str, c_email, c_name, ts_str, subject)
 
         for line in merges_result.stdout.splitlines():
             if not line.startswith('MERGE|'):
@@ -772,7 +802,7 @@ class GitStats:
             if len(parts) < 7:
                 continue
             _, h, parents_str, c_email, c_name, ts_str, subject = parts
-            if h not in commits:
+            if h not in commits and not self._is_ignored_commit(h):
                 # Off-spine merge: only admit if it explicitly targets primary.
                 into_m = re.search(r'\binto\s+[\'"]?(\S+?)[\'"]?\s*$',
                                    subject.lower())
@@ -1003,6 +1033,13 @@ class GitStats:
                     if len(parts) < 9:
                         continue
                     _, commit_sha, parents_str, ts_str, a_name, a_email, c_email, c_name, subject = parts
+
+                    if self._is_ignored_commit(commit_sha):
+                        current_author = None
+                        current_team   = None
+                        current_skip_lines = False
+                        continue
+
                     ts    = int(ts_str) if ts_str.isdigit() else 0
                     canon = self._get_author(a_name, a_email)
                     team  = self._get_team(canon, a_email, ts)
