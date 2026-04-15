@@ -124,17 +124,15 @@ In addition to true merge commits (two or more parents), GitStats detects squash
 - Subject starts with `Merge remote-tracking branch`
 - Subject starts with `Merge branch`
 
-The committer e-mail differs from author e-mail check is **always applied** regardless of whether built-in or custom heuristics are active — it catches squash merges whose commit messages were edited before landing, bypassing all subject patterns.
-
 When `merge_exclude_primary_branch` is `true` (the default), subjects that match `"Merge branch '<primary>'"` are excluded from the `Merge branch` pattern — they indicate a sync commit pulling the primary branch into a feature branch, not a PR landing. If another configured pattern also matches the same subject, the exclusion does not apply. Set `merge_exclude_primary_branch` to `false` to credit these commits.
 
-When `merge_heuristics` is present in config it **replaces** the built-in subject patterns entirely. Each string is matched as a case-insensitive substring of the commit subject. The committer-differs check and the `merge_exclude_primary_branch` exclusion both continue to apply.
+When `merge_heuristics` is present in config it **replaces** the built-in subject patterns entirely. Each string is matched as a case-insensitive substring of the commit subject. The `merge_exclude_primary_branch` exclusion continues to apply.
 
 ```json
 "merge_heuristics": ["Pull request #", "Merge remote-tracking branch"]
 ```
 
-Set to an empty array `[]` to rely solely on the committer-differs check and true merge commits (two-parent merges); all subject-based detection is disabled.
+Set to an empty array `[]` to rely solely on true merge commits (two-parent merges); all subject-based detection is disabled.
 
 **Line count exclusion:** any commit identified as a merge — true or heuristic — has its line additions and deletions excluded from all author and team metrics. Component churn is still tracked. See [Noise filtering — Step 0](#noise-filtering) for the full rationale.
 
@@ -240,7 +238,7 @@ Each metric is normalized against the top performer in that dimension. The final
 - **Commits** — rewards consistent, incremental contribution.
 - **Effective lines** — volume of real code changed, after noise filtering. Reformats and reverts score near zero.
 - **Tenure** — days between first and last commit. A burst of 500 commits over one week scores lower than 500 commits spread over three years.
-- **PR Merges** — number of pull requests merged into the primary branch, credited to the committer. Includes true merge commits and squash/rebase merges detected by commit message heuristics.
+- **PR Merges** — number of pull requests merged into the primary branch, credited to the committer. Includes true merge commits (detected via both the first-parent spine and any true merge commits that explicitly name the primary branch as the target in their subject line) and squash/rebase merges detected by commit message heuristics.
 - **Issues Addressed** — count of unique issue tags (e.g. `PROJ-1234`) found in commit subjects, deduplicated per author. Requires `issue_tag_prefixes` in config. Disabled (`0` weight) by default.
 
 The Impact tab's author and team leaderboard rows show all active dimensions inline — commits, lines, tenure, and (when enabled) PR merges and issues addressed.

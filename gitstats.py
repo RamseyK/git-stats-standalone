@@ -502,11 +502,11 @@ class GitStats:
                                <branch> is not the primary branch.
 
         Both _collect_merges and the tag loop use this function.
-        _collect_merges walks ``--first-parent`` on the primary branch which
-        naturally excludes most sync commits; the tag loop sees the full
-        commit graph between tags.  In both cases the explicit sync-commit
-        exclusion here (especially "Merge remote-tracking branch 'origin/…'")
-        is necessary for correctness.
+        _collect_merges walks the union of --first-parent and --merges (with
+        explicit "into <primary>" guard for off-spine merges); the tag loop
+        sees the full commit graph between tags.  In both cases the explicit
+        sync-commit exclusion here (especially "Merge remote-tracking branch
+        'origin/…'") is necessary for correctness.
 
         Line exclusion always uses _detect_merge so that sync-commit diffs
         are still suppressed even though the committer is not credited.
@@ -514,9 +514,9 @@ class GitStats:
         if not self._detect_merge(parents_str, subject):
             return False
         # Sync commit exclusion: applied to all commits regardless of parent
-        # count.  _collect_merges avoids sync commits naturally via
-        # --first-parent; the tag loop sees all commits between tags and needs
-        # this filter.
+        # count.  _collect_merges guards off-spine merges via the explicit
+        # "into <primary>" subject check; the tag loop uses the same guard
+        # when expanding fp_shas with --merges results.
         s  = subject.lower().strip()
         pb = self.primary_branch.lower()
         # (1) Source is the primary branch (remote-tracking or local).
@@ -693,8 +693,9 @@ class GitStats:
     def _collect_merges(self, repo_path):
         """Credit committers for PR merges detected in repo_path.
 
-        Walks the first-parent history of self.primary_branch and identifies
-        merge commits by two criteria:
+        Walks the union of --first-parent history and true merge commits
+        (--merges) reachable from self.primary_branch, deduplicates on commit
+        hash, and identifies PR merge commits by two criteria:
 
           True merge  — the commit has two or more parents (git merge).
           Heuristic   — squash/rebase merges detected by commit subject:
@@ -702,6 +703,15 @@ class GitStats:
             • Starts with "Merge remote-tracking branch"
             • Starts with "Merge branch" but does NOT merge the primary
               branch itself back in (i.e., not "Merge branch 'develop'").
+
+        The union of --first-parent and --merges ensures both coverage paths:
+          • Single-parent heuristic commits on the primary spine are
+            captured by --first-parent.
+          • True merge commits reachable from the primary branch via a
+            non-first-parent path are captured by --merges, provided their
+            subject explicitly names the primary branch as the target
+            ("into <primary>").  This guard prevents feature-branch-internal
+            merges (e.g. "Merge branch 'sub-feature'") from being credited.
 
         The committer (not the author) is credited because they are the
         person who pressed the merge button.  If the committer is not
@@ -720,20 +730,52 @@ class GitStats:
         if check.returncode != 0:
             return
 
-        result = subprocess.run(
-            ['git', '-C', repo_path, 'log', primary, '--first-parent',
-             '--format=MERGE|%P|%ce|%cn|%ct|%s'],
+        fmt = '--format=MERGE|%H|%P|%ce|%cn|%ct|%s'
+        pb_lower = primary.lower()
+
+        fp_result = subprocess.run(
+            ['git', '-C', repo_path, 'log', primary, '--first-parent', fmt],
+            capture_output=True, text=True, errors='replace',
+        )
+        merges_result = subprocess.run(
+            ['git', '-C', repo_path, 'log', primary, '--merges', fmt],
             capture_output=True, text=True, errors='replace',
         )
 
-        for line in result.stdout.splitlines():
+        # Collect unique commits by hash.  First-parent commits are always
+        # eligible.  Off-spine true merge commits (reachable via --merges but
+        # not on the first-parent chain) are only admitted when their subject
+        # explicitly targets the primary branch ("into <primary>"), guarding
+        # against feature-branch-internal merges reachable via non-first-parent
+        # paths.
+        fp_shas: set = set()
+        commits: dict = {}  # hash → (parents_str, c_email, c_name, ts_str, subject)
+
+        for line in fp_result.stdout.splitlines():
             if not line.startswith('MERGE|'):
                 continue
-            parts = line.split('|', 5)
-            if len(parts) < 6:
+            parts = line.split('|', 6)
+            if len(parts) < 7:
                 continue
-            _, parents_str, c_email, c_name, ts_str, subject = parts
+            _, h, parents_str, c_email, c_name, ts_str, subject = parts
+            fp_shas.add(h)
+            commits[h] = (parents_str, c_email, c_name, ts_str, subject)
 
+        for line in merges_result.stdout.splitlines():
+            if not line.startswith('MERGE|'):
+                continue
+            parts = line.split('|', 6)
+            if len(parts) < 7:
+                continue
+            _, h, parents_str, c_email, c_name, ts_str, subject = parts
+            if h not in commits:
+                # Off-spine merge: only admit if it explicitly targets primary.
+                into_m = re.search(r'\binto\s+[\'"]?(\S+?)[\'"]?\s*$',
+                                   subject.lower())
+                if into_m and into_m.group(1).strip("'\"") == pb_lower:
+                    commits[h] = (parents_str, c_email, c_name, ts_str, subject)
+
+        for h, (parents_str, c_email, c_name, ts_str, subject) in commits.items():
             if not self._is_pr_merge(parents_str, subject):
                 continue
 
@@ -906,16 +948,35 @@ class GitStats:
             except subprocess.CalledProcessError:
                 continue
 
-            # Pre-compute the first-parent SHA set for this range.  Merge credits
-            # are only awarded to commits that are actually on the primary branch
-            # spine — not to merge commits buried inside feature branches that
-            # happen to be reachable from this tag.  The full log (above) is kept
-            # for commit/line attribution; first-parent is used solely for merge
-            # gating.
+            # Pre-compute the merge-credit SHA set for this range.  Only commits
+            # that are actually on the primary branch spine receive merge credits
+            # — not merge commits buried inside feature branches that happen to be
+            # reachable from this tag via a non-first-parent path.
+            #
+            # Two sources are unioned:
+            #   1. --first-parent  — the primary branch spine (catches heuristic
+            #      squash merges as well as true merges where the primary is the
+            #      first parent).
+            #   2. --merges with explicit "into <primary>" subject — catches true
+            #      merge commits that land on the primary branch but are reachable
+            #      only via a non-first-parent path (e.g. when the PR commit's
+            #      first parent is the feature branch tip rather than main).
+            #      The subject guard prevents feature-branch-internal merges
+            #      (e.g. "Merge branch 'sub-feature'", no "into" clause) from
+            #      being admitted.
             try:
                 fp_shas = set(
                     self._run_git(['log', tag_range, '--first-parent', '--format=%H']).splitlines()
                 )
+                pb_lower = self.primary_branch.lower()
+                for merge_line in self._run_git(
+                        ['log', tag_range, '--merges', '--format=%H|%s']).splitlines():
+                    if '|' not in merge_line:
+                        continue
+                    mh, msubj = merge_line.split('|', 1)
+                    into_m = re.search(r'\binto\s+[\'"]?(\S+?)[\'"]?\s*$', msubj.lower())
+                    if into_m and into_m.group(1).strip("'\"") == pb_lower:
+                        fp_shas.add(mh)
             except subprocess.CalledProcessError:
                 fp_shas = set()
 

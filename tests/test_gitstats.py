@@ -2548,6 +2548,113 @@ class TestTagImpacts:
         assert author_merges(tags['v1.0'], 'Merger') == 0, \
             "v1.0 card must have no merges (all commits are after v1.0)"
 
+    def test_off_spine_merge_into_primary_credited_in_tag_loop(
+            self, tmp_path_factory):
+        """A true merge with 'into main' subject reachable only via a non-first-parent
+        path must receive merge credit in the per-tag breakdown.
+
+        Setup (commit-tree):
+          A — initial commit on main  → v1.0
+          F — feature work (parent: A)
+          M — true merge (parents: F, A), subject "Merge branch 'PROJ-99' into main"
+              M's first parent is F, so --first-parent from N skips M.
+          N — merge commit on main (parents: A, M), subject "Merge branch 'integration'"
+              → v2.0
+
+        git log v1.0..v2.0 --first-parent: N (then A, already in v1.0)
+        git log v1.0..v2.0 --merges:       N, M
+
+        The tag loop must include M in the merge-credit SHA set (via the
+        explicit 'into main' subject guard) so that M's committer receives credit.
+        Expected: v2.0 card shows 2 merge credits (N + M).
+        """
+        import pathlib, os as _os
+        repo = str(tmp_path_factory.mktemp('tag_off_spine_repo'))
+
+        def git(*args):
+            subprocess.run(
+                ['git', '-C', repo] + list(args),
+                check=True, capture_output=True,
+                env={**_os.environ,
+                     'GIT_CONFIG_COUNT': '1',
+                     'GIT_CONFIG_KEY_0': 'commit.gpgsign',
+                     'GIT_CONFIG_VALUE_0': 'false'},
+            )
+
+        def git_out(*args):
+            r = subprocess.run(['git', '-C', repo] + list(args),
+                               check=True, capture_output=True, text=True)
+            return r.stdout.strip()
+
+        def commit_tree(tree, parents, msg):
+            parent_args = []
+            for p in parents:
+                parent_args += ['-p', p]
+            return subprocess.run(
+                ['git', '-C', repo, 'commit-tree', tree] + parent_args + ['-m', msg],
+                check=True, capture_output=True, text=True,
+                env={**_os.environ,
+                     'GIT_AUTHOR_NAME': 'Merger',
+                     'GIT_AUTHOR_EMAIL': 'merger@example.com',
+                     'GIT_COMMITTER_NAME': 'Merger',
+                     'GIT_COMMITTER_EMAIL': 'merger@example.com',
+                     'GIT_AUTHOR_DATE': '2021-01-01T00:00:00',
+                     'GIT_COMMITTER_DATE': '2021-01-01T00:00:00'},
+            ).stdout.strip()
+
+        git('init', '-b', 'main')
+        git('config', 'user.email', 'merger@example.com')
+        git('config', 'user.name', 'Merger')
+
+        # A — initial commit
+        pathlib.Path(repo, 'init.txt').write_text('init')
+        git('add', '.')
+        git('commit', '-m', 'Initial commit')
+        a_sha = git_out('rev-parse', 'HEAD')
+        git('tag', 'v1.0')
+
+        tree = git_out('rev-parse', 'HEAD^{tree}')
+
+        # F — feature work (parent: A)
+        f_sha = commit_tree(tree, [a_sha], 'Feature work')
+
+        # M — "Merge branch 'PROJ-99' into main" (parents: F, A)
+        # First parent is F (feature), so --first-parent from N never visits M.
+        m_sha = commit_tree(tree, [f_sha, a_sha], "Merge branch 'PROJ-99' into main")
+
+        # N — merge commit on main (parents: A, M); N's first parent is A.
+        n_sha = commit_tree(tree, [a_sha, m_sha], "Merge branch 'integration'")
+        subprocess.run(
+            ['git', '-C', repo, 'update-ref', 'refs/heads/main', n_sha],
+            check=True, capture_output=True,
+        )
+        git('tag', 'v2.0')
+
+        cfg = make_config(
+            str(tmp_path_factory.mktemp('tag_off_spine_cfg')),
+            primary_branch='main',
+            release_tag_prefix='v',
+            max_release_tags=10,
+        )
+        gs = gitstats.GitStats(repo, cfg)
+        gs.collect()
+
+        tags = {t['name']: t for t in gs.data['tags']}
+        assert 'v2.0' in tags, "v2.0 tag not collected"
+
+        def author_merges(tag_entry, name):
+            for a in tag_entry['authors']:
+                if a['name'] == name:
+                    return a.get('merges', 0)
+            return 0
+
+        v2_merges = author_merges(tags['v2.0'], 'Merger')
+        assert v2_merges == 2, (
+            f"Expected 2 merge credits in v2.0 (N + off-spine M with 'into main'); "
+            f"got {v2_merges}. The union of --first-parent and --merges with "
+            f"explicit 'into main' guard must capture M in fp_shas."
+        )
+
     # ── HTML output ───────────────────────────────────────────────────────
 
     @pytest.fixture(scope='class')
@@ -4213,8 +4320,9 @@ class TestPRMergeRate:
         """_collect_merges must not credit a PR-style merge that lands on a
         feature branch rather than the primary branch.
 
-        The underlying mechanism is '--first-parent primary' in the git log
-        command: commits that exist only on other branches are never visited.
+        Commits that are not reachable from the primary branch at all are
+        never visited by either --first-parent or --merges on that branch,
+        so they cannot receive credit regardless of their subject.
         """
         tmp = str(tmp_path_factory.mktemp('non_primary_cfg'))
         cfg = make_config(tmp, primary_branch='main')
@@ -4264,6 +4372,103 @@ class TestPRMergeRate:
         total = sum(a.get('merges', 0) for a in gs.data['authors'].values())
         assert total == 1, (
             f"Expected 1 merge (PR merge on main), got {total}"
+        )
+
+    def test_off_spine_merge_into_primary_credited(self, tmp_path_factory):
+        """A true merge with 'Merge branch ... into main' subject that is
+        reachable from main via a non-first-parent path must still be credited.
+
+        Scenario (created with commit-tree):
+          A — initial commit on main
+          F — feature work (parent: A)
+          M — true merge commit (parents: F, A),
+              subject "Merge branch 'PROJ-1234' into main"
+              M's first parent is F (the feature tip), so --first-parent
+              starting from main's tip does NOT visit M.
+          N — merge commit on main (parents: A, M),
+              subject "Merge branch 'integration'"
+              N's first parent is A; M is N's second parent.
+          main → N
+
+        git log main --first-parent: N → A  (M is missed!)
+        git log main --merges:       N, M   (M is found via N's second parent)
+
+        Since M has "into main" in its subject, the union approach must credit it.
+        N itself has subject "Merge branch 'integration'" (no "into" clause,
+        2 parents) → also credited as a true merge.
+        Total expected: 2 credits.
+        """
+        import pathlib
+        repo = str(tmp_path_factory.mktemp('off_spine_repo'))
+
+        def git(*args):
+            subprocess.run(['git', '-C', repo] + list(args),
+                           check=True, capture_output=True)
+
+        def git_out(*args):
+            r = subprocess.run(['git', '-C', repo] + list(args),
+                               check=True, capture_output=True, text=True)
+            return r.stdout.strip()
+
+        git('init', '-b', 'main')
+        git('config', 'user.email', 'dev@example.com')
+        git('config', 'user.name', 'Dev')
+        git('config', 'commit.gpgsign', 'false')
+
+        # A — initial commit
+        pathlib.Path(repo, 'init.txt').write_text('init')
+        git('add', '.')
+        git('commit', '-m', 'Initial commit')
+        a_sha = git_out('rev-parse', 'HEAD')
+
+        # F — feature work (parent: A)
+        tree_sha = git_out('rev-parse', 'HEAD^{tree}')
+        f_sha = subprocess.run(
+            ['git', '-C', repo, 'commit-tree', tree_sha, '-p', a_sha,
+             '-m', 'Feature work'],
+            check=True, capture_output=True, text=True,
+            env={**os.environ,
+                 'GIT_AUTHOR_NAME': 'Dev', 'GIT_AUTHOR_EMAIL': 'dev@example.com',
+                 'GIT_COMMITTER_NAME': 'Dev', 'GIT_COMMITTER_EMAIL': 'dev@example.com'},
+        ).stdout.strip()
+
+        # M — "Merge branch 'PROJ-1234' into main" (parents: F, A)
+        # M's first parent is F (feature tip), so --first-parent won't visit M
+        # when approaching from N (since N's first parent is A, not M).
+        m_sha = subprocess.run(
+            ['git', '-C', repo, 'commit-tree', tree_sha,
+             '-p', f_sha, '-p', a_sha,
+             '-m', "Merge branch 'PROJ-1234' into main"],
+            check=True, capture_output=True, text=True,
+            env={**os.environ,
+                 'GIT_AUTHOR_NAME': 'Dev', 'GIT_AUTHOR_EMAIL': 'dev@example.com',
+                 'GIT_COMMITTER_NAME': 'Dev', 'GIT_COMMITTER_EMAIL': 'dev@example.com'},
+        ).stdout.strip()
+
+        # N — merge commit on main (parents: A, M), main → N
+        # N's first parent is A, so --first-parent visits: N → A (misses M!)
+        n_sha = subprocess.run(
+            ['git', '-C', repo, 'commit-tree', tree_sha,
+             '-p', a_sha, '-p', m_sha,
+             '-m', "Merge branch 'integration'"],
+            check=True, capture_output=True, text=True,
+            env={**os.environ,
+                 'GIT_AUTHOR_NAME': 'Dev', 'GIT_AUTHOR_EMAIL': 'dev@example.com',
+                 'GIT_COMMITTER_NAME': 'Dev', 'GIT_COMMITTER_EMAIL': 'dev@example.com'},
+        ).stdout.strip()
+        subprocess.run(['git', '-C', repo, 'update-ref', 'refs/heads/main', n_sha],
+                       check=True, capture_output=True)
+
+        cfg = make_config(tmp_path_factory.mktemp('off_spine_cfg'), primary_branch='main')
+        gs = gitstats.GitStats(repo, cfg)
+        gs.data['authors'] = {}
+        gs.data['teams']   = {}
+        gs._collect_merges(repo)
+
+        total = sum(a.get('merges', 0) for a in gs.data['authors'].values())
+        assert total == 2, (
+            f"Expected 2 merge credits (N + off-spine M with 'into main'); got {total}. "
+            f"The union of --first-parent and --merges must capture M."
         )
 
     # ── Impact score — merges dimension ──────────────────────────────────────
