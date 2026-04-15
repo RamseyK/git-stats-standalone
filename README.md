@@ -45,11 +45,34 @@ All configuration lives in a single JSON file. Every key is optional.
 
 ```json
 {
+  "issue_tag_prefixes": ["PROJ", "BUG"],
   "release_tag_prefix": "v",
   "max_release_tags": 50,
   "max_authors_per_tag": 20,
   "max_teams_per_tag": 10,
   "primary_branch": "main",
+  "ignore_commits": [],
+
+  "impact_w_commits": 30,
+  "impact_w_lines": 30,
+  "impact_w_tenure": 15,
+  "impact_w_merges": 25,
+  "impact_w_issues": 0,
+
+  "impact_use_net_lines": true,
+  "impact_wash_window_days": 7,
+  "impact_wash_min_gross": 200,
+  "impact_line_cap_percentile": 95,
+
+  "merge_heuristics": ["Pull request #", "Merge remote-tracking branch", "Merge branch"],
+  "merge_exclude_primary_branch": true,
+
+  "summary_velocity_days": [30, 90],
+  "monthly_top_authors": 3,
+  "bus_factor_threshold": 0.5,
+
+  "component_markers": ["pyproject.toml", "Cargo.toml", "CMakeLists.txt"],
+  "loc_extensions": [".py", ".cc", ".c", ".cpp", ".h", ".hpp", ".rs", ".cs"],
 
   "teams": {
     "Core": {
@@ -74,31 +97,7 @@ All configuration lives in a single JSON file. Every key is optional.
       "jsmith@work.com",
       "jane.smith@oldcompany.com"
     ]
-  },
-
-  "issue_tag_prefixes": ["PROJ", "BUG"],
-  "ignore_commits": [],
-
-  "impact_w_commits": 30,
-  "impact_w_lines": 30,
-  "impact_w_tenure": 15,
-  "impact_w_merges": 25,
-  "impact_w_issues": 0,
-
-  "merge_heuristics": ["Pull request #", "Merge remote-tracking branch", "Merge branch"],
-  "merge_exclude_primary_branch": true,
-
-  "impact_use_net_lines": true,
-  "impact_wash_window_days": 7,
-  "impact_wash_min_gross": 200,
-  "impact_line_cap_percentile": 95,
-
-  "summary_velocity_days": [30, 90],
-  "monthly_top_authors": 3,
-  "bus_factor_threshold": 0.5,
-
-  "component_markers": ["pyproject.toml", "Cargo.toml", "CMakeLists.txt"],
-  "loc_extensions": [".py", ".cc", ".c", ".cpp", ".h", ".hpp", ".rs", ".cs"]
+  }
 }
 ```
 
