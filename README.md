@@ -47,6 +47,8 @@ All configuration lives in a single JSON file. Every key is optional.
 {
   "release_tag_prefix": "v",
   "max_release_tags": 50,
+  "max_authors_per_tag": 20,
+  "max_teams_per_tag": 10,
   "primary_branch": "main",
 
   "teams": {
@@ -75,6 +77,7 @@ All configuration lives in a single JSON file. Every key is optional.
   },
 
   "issue_tag_prefixes": ["PROJ", "BUG"],
+  "ignore_commits": [],
 
   "impact_w_commits": 30,
   "impact_w_lines": 30,
@@ -82,6 +85,7 @@ All configuration lives in a single JSON file. Every key is optional.
   "impact_w_merges": 25,
   "impact_w_issues": 0,
 
+  "merge_heuristics": ["Pull request #", "Merge remote-tracking branch", "Merge branch"],
   "merge_exclude_primary_branch": true,
 
   "impact_use_net_lines": true,
@@ -284,7 +288,7 @@ The exact configured values and computed cap are displayed on the **Impact** tab
 
 ### PR merge detection
 
-The PR Merges dimension counts merges into `primary_branch` using three strategies: true merge commits (two or more parents), heuristic detection of squash/rebase merges by commit subject, and a committer-differs check that catches squash merges whose messages were edited before landing — see [Merge heuristics](#merge-heuristics) for the built-in patterns and how to configure them.
+The PR Merges dimension counts merges into `primary_branch` using two strategies: true merge commits (two or more parents) and heuristic detection of squash/rebase merges by commit subject — see [Merge heuristics](#merge-heuristics) for the built-in patterns and how to configure them.
 
 The committer (`git log %cn/%ce`) receives credit — the author of the merged branch does not. Credit accumulates across all repositories (main and support repos).
 

@@ -85,9 +85,8 @@ class GitStats:
     # ── Built-in merge subject heuristics ────────────────────────────────────────
     # These patterns are applied as case-insensitive substrings when no
     # merge_heuristics key is present in config.json.  The built-in mode also
-    # enables the committer-differs check and the primary-branch exclusion for
-    # "merge branch" subjects — neither of which applies when the user supplies a
-    # custom list.
+    # enables the primary-branch exclusion for "merge branch" subjects, which
+    # does not apply when the user supplies a custom list.
     _DEFAULT_MERGE_HEURISTICS = (
         'pull request #',
         'merge remote-tracking branch',
@@ -245,10 +244,8 @@ class GitStats:
         # Heuristic patterns for detecting squash/rebase merges by commit subject.
         # Each string is matched as a case-insensitive substring of the subject.
         # When merge_heuristics is absent from config.json the built-in defaults
-        # are used (see _DEFAULT_MERGE_HEURISTICS).  The committer-differs check
-        # (committer e-mail ≠ author e-mail) is always applied regardless of this
-        # setting.  Any commit identified as a merge also has its line counts
-        # excluded from all author/team metrics.
+        # are used (see _DEFAULT_MERGE_HEURISTICS).  Any commit identified as a
+        # merge also has its line counts excluded from all author/team metrics.
         raw_h = config.get('merge_heuristics', None)
         if raw_h is None:
             self.merge_heuristics = list(self._DEFAULT_MERGE_HEURISTICS)
