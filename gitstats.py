@@ -99,6 +99,9 @@ class GitStats:
     # lower-casing and stripping the subject.
     _NEVER_MERGE_SUBJECTS = frozenset({
         'applied suggestion',
+        'merge conflict',
+        'merged conflict',
+        'resolving conflict'
     })
 
     def __init__(self, repo_path, config_file=None, support_paths=None):
@@ -451,8 +454,9 @@ class GitStats:
         pb = self.primary_branch.lower()
 
         # Never-merge subjects: override all other detection paths.
-        if s in self._NEVER_MERGE_SUBJECTS:
-            return False
+        for deny_merge_subject_fragment in self._NEVER_MERGE_SUBJECTS:
+            if deny_merge_subject_fragment in s:
+                return False
 
         # Subject heuristic: all configured patterns are checked first.
         is_subject_heuristic = any(h in s for h in self.merge_heuristics)
