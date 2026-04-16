@@ -1584,6 +1584,17 @@ class GitStats:
                 </div>
                 {issues_section}
             </div>''')
+
+        total_tags = self.data['general'].get('total_tags', len(self.data['tags']))
+        hidden = total_tags - len(self.data['tags'])
+        if hidden > 0:
+            parts.append(
+                f'<div class="text-center text-sm text-slate-400 font-semibold py-4">'
+                f'{hidden:,} older release{"s" if hidden != 1 else ""} not shown'
+                f' — increase <code class="font-mono text-slate-500">max_release_tags</code>'
+                f' in config to display more.'
+                f'</div>'
+            )
         return '\n'.join(parts)
 
     # ------------------------------------------------------------------ report helpers
@@ -2863,7 +2874,7 @@ function renderTeamsGrid() {{
 
             ${{impactBar(s.impact, color)}}
 
-            <div class="grid grid-cols-${{impactWMerges > 0 ? 4 : 3}} gap-2 my-4 text-center text-sm">
+            <div class="grid grid-cols-${{impactWMerges > 0 ? 3 : 2}} gap-2 my-4 text-center text-sm">
                 <div class="bg-slate-50 rounded-xl p-3">
                     <div class="font-black text-slate-900">${{fmt(s.commits)}}</div>
                     <div class="text-[10px] font-bold text-slate-400 uppercase">Commits</div>
@@ -2874,12 +2885,8 @@ function renderTeamsGrid() {{
                     <div class="text-[10px] font-bold text-slate-400 uppercase">Merges</div>
                 </div>` : ''}}
                 <div class="bg-slate-50 rounded-xl p-3">
-                    <div class="font-black text-emerald-600">+${{fmt(s.add)}}</div>
-                    <div class="text-[10px] font-bold text-slate-400 uppercase">Added</div>
-                </div>
-                <div class="bg-slate-50 rounded-xl p-3">
-                    <div class="font-black text-red-400">-${{fmt(s.del)}}</div>
-                    <div class="text-[10px] font-bold text-slate-400 uppercase">Removed</div>
+                    <div class="font-black text-slate-900"><span class="text-emerald-600">+${{fmt(s.add)}}</span><span class="text-slate-300 mx-1">/</span><span class="text-red-400">-${{fmt(s.del)}}</span></div>
+                    <div class="text-[10px] font-bold text-slate-400 uppercase">Lines</div>
                 </div>
             </div>
 

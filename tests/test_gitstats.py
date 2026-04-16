@@ -1898,6 +1898,87 @@ class TestReleaseTags:
         v3_authors = [a['name'] for a in tags_by_name['v3.0']['authors']]
         assert v3_authors == ['Charlie']
 
+    def test_hidden_releases_note_shown_when_capped(self, tmp_path_factory):
+        """When max_release_tags caps the display, the HTML must include a note
+        at the bottom stating how many older releases are not shown."""
+        import pathlib, os as _os
+        repo = str(tmp_path_factory.mktemp('hidden_note_repo'))
+
+        def git(*args, date='2020-01-01T00:00:00'):
+            subprocess.check_call(
+                ['git', '-C', repo] + list(args),
+                env={**_os.environ,
+                     'GIT_AUTHOR_NAME': 'Dev', 'GIT_AUTHOR_EMAIL': 'dev@x.com',
+                     'GIT_COMMITTER_NAME': 'Dev', 'GIT_COMMITTER_EMAIL': 'dev@x.com',
+                     'GIT_AUTHOR_DATE': date, 'GIT_COMMITTER_DATE': date,
+                     'GIT_CONFIG_COUNT': '1',
+                     'GIT_CONFIG_KEY_0': 'commit.gpgsign',
+                     'GIT_CONFIG_VALUE_0': 'false'},
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+
+        git('init', '-b', 'main')
+        for i, date in enumerate([
+            '2020-01-01T00:00:00',
+            '2020-02-01T00:00:00',
+            '2020-03-01T00:00:00',
+        ], 1):
+            pathlib.Path(repo, f'f{i}.txt').write_text(str(i))
+            git('add', '.', date=date)
+            git('commit', '-m', f'commit {i}', date=date)
+            git('tag', f'v{i}.0', date=date)
+
+        # Show only the 2 newest; v1.0 is hidden (3 total − 2 shown = 1 hidden)
+        cfg = make_config(
+            tmp_path_factory.mktemp('hidden_note_cfg'),
+            release_tag_prefix='v', max_release_tags=2,
+        )
+        gs = gitstats.GitStats(repo, cfg)
+        gs.collect()
+        html = generate_html(gs, tmp_path_factory, 'hidden_note_html')
+
+        assert 'not shown' in html, "Expected a hidden-releases note in the HTML"
+        assert 'max_release_tags' in html, "Expected config key hint in hidden-releases note"
+
+    def test_hidden_releases_note_absent_when_all_shown(self, tmp_path_factory):
+        """When all releases fit within max_release_tags the note must not appear."""
+        import pathlib, os as _os
+        repo = str(tmp_path_factory.mktemp('no_hidden_note_repo'))
+
+        def git(*args, date='2020-01-01T00:00:00'):
+            subprocess.check_call(
+                ['git', '-C', repo] + list(args),
+                env={**_os.environ,
+                     'GIT_AUTHOR_NAME': 'Dev', 'GIT_AUTHOR_EMAIL': 'dev@x.com',
+                     'GIT_COMMITTER_NAME': 'Dev', 'GIT_COMMITTER_EMAIL': 'dev@x.com',
+                     'GIT_AUTHOR_DATE': date, 'GIT_COMMITTER_DATE': date,
+                     'GIT_CONFIG_COUNT': '1',
+                     'GIT_CONFIG_KEY_0': 'commit.gpgsign',
+                     'GIT_CONFIG_VALUE_0': 'false'},
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+
+        git('init', '-b', 'main')
+        for i, date in enumerate([
+            '2020-01-01T00:00:00',
+            '2020-02-01T00:00:00',
+        ], 1):
+            pathlib.Path(repo, f'f{i}.txt').write_text(str(i))
+            git('add', '.', date=date)
+            git('commit', '-m', f'commit {i}', date=date)
+            git('tag', f'v{i}.0', date=date)
+
+        # max_release_tags=10 comfortably fits both tags — no note expected
+        cfg = make_config(
+            tmp_path_factory.mktemp('no_hidden_note_cfg'),
+            release_tag_prefix='v', max_release_tags=10,
+        )
+        gs = gitstats.GitStats(repo, cfg)
+        gs.collect()
+        html = generate_html(gs, tmp_path_factory, 'no_hidden_note_html')
+
+        assert 'not shown' not in html, "No hidden-releases note expected when all releases fit"
+
 
 # ---------------------------------------------------------------------------
 # Per-release impact scoring (_score_tag_entities / _compute_tag_impacts)
