@@ -1,6 +1,6 @@
 # Git Stats Standalone
 
-A Python script that analyzes a Git repository and generates a self-contained HTML statistics report viewable offline in any browser. The most important design principal of this project: All computed statistics and scoring **must** serve a purpose to help highlight the actual impact of contributors (and optionally their teams) make on a codebase. All metrics added must assist in measuring true impact, effort, and expertise of contributors to a codebase (based on git history).
+A Python script that analyzes Git repository history and generates a self-contained HTML statistics report viewable offline in any browser. Reports can be used to measure and analyze true impact, effort, and expertise of contributors (and optionally their teams) to a codebase.
 
 ## Primary Metrics
 
@@ -41,7 +41,9 @@ Running without `-c` is fully supported. All settings use built-in defaults: eve
 
 ## Configuration
 
-All configuration lives in a single JSON file. Every key is optional.
+A configuration JSON file can be used to customize the various statistics, weights, display, and project-specific attributes.
+
+Every key is optional.
 
 ```json
 {
