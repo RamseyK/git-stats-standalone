@@ -5,6 +5,7 @@
 # ///
 
 import html
+from html import escape as _html_escape
 import math
 import os
 import re
@@ -324,9 +325,15 @@ class GitStats:
         # Entries are lowercased so matching is case-insensitive.
         self.ignore_commits = {h.lower() for h in config.get('ignore_commits', [])}
 
+        # Display name shown in the report header and page title.
+        # Falls back to the main repository's directory basename when the key is
+        # absent from config or its value is an empty string.
+        _cfg_project_name = config.get('project_name', '').strip()
+        self.project_name = _cfg_project_name or os.path.basename(os.path.abspath(repo_path))
+
         # Central data store populated by collect() and consumed by generate_report().
         self.data = {
-            'project_name': os.path.basename(os.path.abspath(repo_path)),
+            'project_name': self.project_name,
             'analysis_date': datetime.datetime.now().strftime("%Y-%m-%d %H:%M"),
             'general': {'total_commits': 0, 'total_files': 0, 'total_lines': 0,
                         'total_repo_lines': 0, 'age_days': 0},
@@ -503,7 +510,7 @@ class GitStats:
                 )
             if is_subject_heuristic:
                 into_m = re.search(r'\binto\s+(\S+)\s*$', s)
-                if into_m and into_m.group(1).strip("'\"") != pb:
+                if into_m and into_m.group(1).strip("'\"").rstrip('.,;:)(') != pb:
                     is_subject_heuristic = False
 
         return is_true_merge or is_subject_heuristic
@@ -550,7 +557,7 @@ class GitStats:
         # (2) Explicit non-primary target: "... into <branch>" where branch ≠ primary.
         if not is_pb_sync:
             into_m = re.search(r'\binto\s+(\S+)\s*$', s)
-            if into_m and into_m.group(1).strip("'\"") != pb:
+            if into_m and into_m.group(1).strip("'\"").rstrip('.,;:)(') != pb:
                 is_pb_sync = True
         if is_pb_sync:
             return False
@@ -803,7 +810,7 @@ class GitStats:
                 # Off-spine merge: only admit if it explicitly targets primary.
                 into_m = re.search(r'\binto\s+[\'"]?(\S+?)[\'"]?\s*$',
                                    subject.lower())
-                if into_m and into_m.group(1).strip("'\"") == pb_lower:
+                if into_m and into_m.group(1).strip("'\"").rstrip('.,;:)(') == pb_lower:
                     commits[h] = (parents_str, c_email, c_name, ts_str, subject)
 
         for h, (parents_str, c_email, c_name, ts_str, subject) in commits.items():
@@ -912,9 +919,16 @@ class GitStats:
 
             support_ls = self._run_git(['ls-files'], support_path).splitlines()
             sup_dirs_set = set()
+            sup_repo_lines = 0
             for f in support_ls:
                 if os.path.basename(f) in self.component_markers:
                     sup_dirs_set.add(os.path.dirname(f))
+                if os.path.splitext(f)[1].lower() in self.loc_extensions:
+                    try:
+                        with open(os.path.join(support_path, f), 'rb') as _fh:
+                            sup_repo_lines += _fh.read().count(b'\n')
+                    except OSError:
+                        pass
             support_component_dirs = sorted(sup_dirs_set, key=len, reverse=True)
 
             sup_components   = Counter()
@@ -929,6 +943,7 @@ class GitStats:
 
             self.data['support_repos'].append({
                 'name': support_name,
+                'repo_lines': sup_repo_lines,
                 'components': sup_components,
                 'component_contributions': sup_comp_contrib,
                 'team_components': sup_team_comps,
@@ -1006,7 +1021,7 @@ class GitStats:
                         continue
                     mh, msubj = merge_line.split('|', 1)
                     into_m = re.search(r'\binto\s+[\'"]?(\S+?)[\'"]?\s*$', msubj.lower())
-                    if into_m and into_m.group(1).strip("'\"") == pb_lower:
+                    if into_m and into_m.group(1).strip("'\"").rstrip('.,;:)(') == pb_lower:
                         fp_shas.add(mh)
             except subprocess.CalledProcessError:
                 fp_shas = set()
@@ -2143,6 +2158,21 @@ class GitStats:
         age_days   = self.data['general'].get('age_days', 0)
         repo_lines = self.data['general'].get('total_repo_lines', 0)
 
+        # Tooltip for the "Net Lines" header stat: current LOC per repo.
+        # Each part is individually escaped; parts are joined with &#10; (newline
+        # in title attributes) so the entity is never itself escaped.
+        # NOTE: _html_escape (module-level alias) is used because the local variable
+        # `html` (the full HTML document string, assigned later in this function)
+        # shadows the `html` module name throughout the entire function scope.
+        support_repos = self.data.get('support_repos', [])
+        if support_repos:
+            _loc_parts = [_html_escape(f'{pname}: {repo_lines:,} lines')]
+            for sr in support_repos:
+                _loc_parts.append(_html_escape(f'{sr["name"]}: {sr.get("repo_lines", 0):,} lines'))
+            net_lines_tooltip = '&#10;'.join(_loc_parts)
+        else:
+            net_lines_tooltip = _html_escape(f'{repo_lines:,} lines of code')
+
         iw_commits = self.IMPACT_W_COMMITS
         iw_lines   = self.IMPACT_W_LINES
         iw_tenure  = self.IMPACT_W_TENURE
@@ -2283,7 +2313,7 @@ class GitStats:
             </div>
             <div class="text-center px-4 border-r border-slate-100">
                 <span class="block text-2xl font-black text-blue-600">{tlines:,}</span>
-                <span class="text-[10px] uppercase font-bold text-slate-400">Net Lines</span>
+                <span class="text-[10px] uppercase font-bold text-slate-400 cursor-help" title="{net_lines_tooltip}">Net Lines</span>
             </div>
             <div class="text-center px-4 border-r border-slate-100">
                 <span class="block text-2xl font-black text-slate-900">{nauth}</span>

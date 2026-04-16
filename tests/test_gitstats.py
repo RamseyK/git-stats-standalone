@@ -3168,6 +3168,119 @@ class TestNoTeams:
 
 
 # ---------------------------------------------------------------------------
+# project_name config option
+# ---------------------------------------------------------------------------
+
+class TestProjectName:
+    """Verify that project_name in config overrides the repo directory name
+    as the display name across every location in the generated HTML."""
+
+    DIR_NAME     = 'raw-dir-name'
+    DISPLAY_NAME = 'My Overridden Project'
+
+    @pytest.fixture
+    def tiny_repo(self, tmp_path_factory):
+        """Minimal one-commit repo in a directory named DIR_NAME.
+
+        Uses a directory with a distinctive name so any accidental leak of the
+        raw basename into the HTML is immediately detectable.
+        """
+        import pathlib as _pl
+        base = tmp_path_factory.mktemp('pn_repo')
+        repo = str(base / self.DIR_NAME)
+        os.makedirs(repo)
+        env = {
+            **os.environ,
+            'GIT_AUTHOR_NAME':     'Dev',
+            'GIT_AUTHOR_EMAIL':    'dev@example.com',
+            'GIT_COMMITTER_NAME':  'Dev',
+            'GIT_COMMITTER_EMAIL': 'dev@example.com',
+            'GIT_AUTHOR_DATE':     '2023-01-01T00:00:00',
+            'GIT_COMMITTER_DATE':  '2023-01-01T00:00:00',
+            'GIT_CONFIG_COUNT':    '1',
+            'GIT_CONFIG_KEY_0':    'commit.gpgsign',
+            'GIT_CONFIG_VALUE_0':  'false',
+        }
+        def git(*args):
+            subprocess.check_call(
+                ['git', '-C', repo] + list(args),
+                env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+        git('init', '-b', 'main')
+        _pl.Path(repo, 'pyproject.toml').write_text('[project]\nname = "pkg"\n')
+        _pl.Path(repo, 'main.py').write_text('def hello(): pass\n')
+        git('add', '.')
+        git('commit', '-m', 'Initial commit')
+        return repo
+
+    # ── Data layer ────────────────────────────────────────────────────────────
+
+    def test_project_name_stored_in_data(self, tiny_repo, tmp_path_factory):
+        """project_name from config must be stored verbatim in self.data."""
+        cfg = make_config(tmp_path_factory.mktemp('pn_data'), project_name=self.DISPLAY_NAME)
+        gs = gitstats.GitStats(tiny_repo, cfg)
+        gs.collect()
+        assert gs.data['project_name'] == self.DISPLAY_NAME
+
+    def test_project_name_default_is_dir_basename(self, tiny_repo, tmp_path_factory):
+        """When project_name is absent from config the directory basename is used."""
+        cfg = make_config(tmp_path_factory.mktemp('pn_default'))
+        gs = gitstats.GitStats(tiny_repo, cfg)
+        gs.collect()
+        assert gs.data['project_name'] == self.DIR_NAME
+
+    def test_project_name_empty_string_falls_back_to_dir(self, tiny_repo, tmp_path_factory):
+        """An empty string value must fall back to the directory basename."""
+        cfg = make_config(tmp_path_factory.mktemp('pn_empty'), project_name='')
+        gs = gitstats.GitStats(tiny_repo, cfg)
+        gs.collect()
+        assert gs.data['project_name'] == self.DIR_NAME
+
+    def test_project_name_whitespace_falls_back_to_dir(self, tiny_repo, tmp_path_factory):
+        """A whitespace-only value must be stripped and fall back to the directory basename."""
+        cfg = make_config(tmp_path_factory.mktemp('pn_ws'), project_name='   ')
+        gs = gitstats.GitStats(tiny_repo, cfg)
+        gs.collect()
+        assert gs.data['project_name'] == self.DIR_NAME
+
+    # ── HTML output — all locations ───────────────────────────────────────────
+
+    @pytest.fixture
+    def overridden_html(self, tiny_repo, tmp_path_factory):
+        """HTML report generated with project_name set to DISPLAY_NAME."""
+        cfg = make_config(tmp_path_factory.mktemp('pn_html_cfg'), project_name=self.DISPLAY_NAME)
+        gs = gitstats.GitStats(tiny_repo, cfg)
+        gs.collect()
+        return generate_html(gs, tmp_path_factory, 'pn_html')
+
+    def test_dir_name_absent_from_html(self, overridden_html):
+        """The raw directory name must not appear anywhere in the HTML when overridden."""
+        assert self.DIR_NAME not in overridden_html
+
+    def test_display_name_in_page_title(self, overridden_html):
+        """Display name must appear in the HTML <title> tag."""
+        assert f'GitStats: {self.DISPLAY_NAME}' in overridden_html
+
+    def test_display_name_in_global_header(self, overridden_html):
+        """Display name must appear in the persistent page header <h2>."""
+        # The header sits outside all tab divs and is always visible.
+        header_end = overridden_html.find('id="tab-summary"')
+        header_section = overridden_html[:header_end]
+        assert self.DISPLAY_NAME in header_section
+
+    def test_display_name_in_summary_tab(self, overridden_html):
+        """Display name must appear in the Summary tab project card heading."""
+        summary_start = overridden_html.find('id="tab-summary"')
+        summary_end   = overridden_html.find('id="tab-impact"', summary_start)
+        section = overridden_html[summary_start:summary_end]
+        assert self.DISPLAY_NAME in section
+
+    def test_display_name_in_component_chart_heading(self, overridden_html):
+        """Display name must appear in the Component Churn chart heading."""
+        assert f'Component Churn \u2014 {self.DISPLAY_NAME}' in overridden_html
+
+
+# ---------------------------------------------------------------------------
 # Support repositories
 # ---------------------------------------------------------------------------
 
@@ -3265,6 +3378,12 @@ class TestSupportRepos:
         """The support repo must have detected at least one component."""
         sr = combined_gs.data['support_repos'][0]
         assert len(sr['components']) > 0
+
+    def test_support_repo_has_repo_lines_key(self, combined_gs):
+        """Each support repo entry must include a 'repo_lines' integer key."""
+        sr = combined_gs.data['support_repos'][0]
+        assert 'repo_lines' in sr
+        assert isinstance(sr['repo_lines'], int)
 
     def test_support_repo_components_separate_from_main(self, combined_gs):
         """Support repo components must not appear in the main repo component dict."""
@@ -3930,6 +4049,40 @@ class TestSummaryTab:
         so the tooltip fires anywhere along the x-axis, not just over a rendered point."""
         assert "mode: 'index'" in std_html
         assert "intersect: false" in std_html
+
+    # ── Net Lines header tooltip ──────────────────────────────────────────────
+
+    def test_net_lines_tooltip_no_support_repos(self, std_gs, tmp_path_factory):
+        """Without support repos the Net Lines tooltip must show current LOC of the main repo."""
+        html = generate_html(std_gs, tmp_path_factory, 'nl_tooltip_single')
+        repo_lines = std_gs.data['general']['total_repo_lines']
+        expected = f'title="{repo_lines:,} lines of code"'
+        assert expected in html, (
+            f"Expected Net Lines tooltip '{expected}' not found in header"
+        )
+
+    def test_net_lines_tooltip_with_support_repos(self, combined_gs, tmp_path_factory):
+        """With a support repo the tooltip must list LOC for each repo on separate lines."""
+        html = generate_html(combined_gs, tmp_path_factory, 'nl_tooltip_combined')
+        main_lines = combined_gs.data['general']['total_repo_lines']
+        pname = combined_gs.data['project_name']
+        sr = combined_gs.data['support_repos'][0]
+        sr_lines = sr['repo_lines']
+        sr_name  = sr['name']
+        # Both repo LOC entries must appear in the title attribute, separated by &#10;.
+        assert f'{pname}: {main_lines:,} lines' in html
+        assert f'{sr_name}: {sr_lines:,} lines' in html
+        assert '&#10;' in html  # newline separator must be present in the attribute
+
+    def test_net_lines_tooltip_support_repo_lines_positive(self, combined_gs):
+        """Support repo entry must carry a positive repo_lines count after collect()."""
+        sr = combined_gs.data['support_repos'][0]
+        assert 'repo_lines' in sr
+        assert sr['repo_lines'] > 0
+
+    def test_net_lines_tooltip_cursor_help_class(self, std_html):
+        """The Net Lines span must carry the cursor-help class to signal interactivity."""
+        assert 'cursor-help' in std_html
 
 
 # ---------------------------------------------------------------------------

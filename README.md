@@ -47,6 +47,7 @@ Every key is optional.
 
 ```json
 {
+  "project_name": "My Project",
   "issue_tag_prefixes": ["PROJ", "BUG"],
   "release_tag_prefix": "v",
   "max_release_tags": 50,
@@ -107,6 +108,7 @@ Every key is optional.
 
 | Key | Default | Description |
 |-----|---------|-------------|
+| `project_name` | *(repo directory name)* | Display name shown in the report header and page title. Defaults to the main repository's directory basename when absent or empty. |
 | `release_tag_prefix` | `""` | Only tags whose name starts with this prefix appear in the Releases tab. `"v"` includes `v1.0` but excludes `nightly-20240101`. An empty string includes all tags. |
 | `max_release_tags` | `20` | Maximum number of release tags to display, taken from the most recent. `0` shows all tags. |
 | `max_authors_per_tag` | `20` | Maximum number of authors shown in the per-release breakdown on the Releases tab. |
