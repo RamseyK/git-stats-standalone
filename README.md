@@ -11,6 +11,17 @@ A Python script that analyzes Git repository history and generates a self-contai
 - **Releases** — per-release breakdown of commits by author and team, with referenced issue count when `issue_tag_prefixes` is configured
 - **Components** — churn chart for directories that contain a component marker file (configurable; defaults to `make.py`, `pyproject.toml`, `setup.py`, `Makefile`, `meta.yaml`)
 
+## Screenshots
+
+### Demo Project
+
+![Summary](screenshots/demo_project/01_summary.png)
+![Impact](screenshots/demo_project/02_impact.png)
+![Contributors](screenshots/demo_project/03_contributors.png)
+![Teams](screenshots/demo_project/04_teams.png)
+![Releases](screenshots/demo_project/05_releases.png)
+![Components](screenshots/demo_project/06_components.png)
+
 ## Requirements
 
 * Python 3.11+

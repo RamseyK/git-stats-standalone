@@ -846,7 +846,16 @@ def build_demo_repo(repo_dir: str) -> None:
 
 # Injected into each tab's HTML copy to activate the right tab on load.
 # showTab(id, btn) requires the button element to apply the .active class.
+# CSS disables transitions/animations so Chrome headless doesn't capture a
+# half-applied .active state on the tab button.
 _TAB_INJECT = """
+<style>
+  *, *::before, *::after {{
+      transition: none !important;
+      animation: none !important;
+  }}
+  html {{ scroll-behavior: auto !important; }}
+</style>
 <script>
 window.addEventListener('load', function () {{
     var label = {label!r};
