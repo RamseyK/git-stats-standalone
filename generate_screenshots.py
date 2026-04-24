@@ -23,6 +23,7 @@ Output (default ./screenshots/):
 """
 
 import argparse
+import datetime
 import json
 import os
 import pathlib
@@ -38,6 +39,22 @@ import gitstats  # noqa: E402
 CHROME = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
 SCREENSHOT_WIDTH  = 1440
 SCREENSHOT_HEIGHT = 900
+
+# ── Timeline anchoring ────────────────────────────────────────────────────────
+# Every hardcoded date in build_demo_repo() and build_support_repo() is shifted
+# by _DEMO_OFFSET so the most recent commit lands ~10 days before today. Without
+# this, the Summary tab's velocity cards (30d / 90d) show "0 / no prior data"
+# whenever real time moves past the end of the static timeline. The historical
+# span (~26 months) is preserved, so all five releases still appear and the
+# monthly activity chart still spans more than two years.
+_DEMO_LATEST_HARDCODED = datetime.datetime(2025, 3, 18, 10, 30)
+_DEMO_TARGET_LATEST    = datetime.datetime.now().replace(microsecond=0) - datetime.timedelta(days=10)
+_DEMO_OFFSET           = _DEMO_TARGET_LATEST - _DEMO_LATEST_HARDCODED
+
+
+def _shift_date(date_str: str) -> str:
+    """Apply _DEMO_OFFSET to an ISO-format date string ('YYYY-MM-DDTHH:MM:SS')."""
+    return (datetime.datetime.fromisoformat(date_str) + _DEMO_OFFSET).isoformat(timespec="seconds")
 
 # (tab_id, button_label, output_filename_stem)
 TABS = [
@@ -60,6 +77,11 @@ DEMO_CONFIG = {
             "members": [
                 "Alice Chen",    "alice@example.com",
                 "Bob Martinez",  "bob@example.com",
+                # Henry left the team — exercises the "Previous Members" section
+                # on the Team card. Both name and email need a "to" date so
+                # post-departure commits don't fall back to a still-valid range.
+                {"name": "Henry Walsh",       "to": "2024-03-31"},
+                {"name": "henry@example.com", "to": "2024-03-31"},
             ],
             "color": "#3b82f6",
         },
@@ -80,10 +102,15 @@ DEMO_CONFIG = {
         },
     },
     "aliases": {},
-    "impact_w_commits": 35,
-    "impact_w_lines":   35,
+    # Issue tag tracking — exercises the Issues dimension on the Impact tab,
+    # the Issues sort button on Authors, and the "Referenced Issues" section
+    # on each Release card.
+    "issue_tag_prefixes": ["PROJ", "BUG", "INFRA"],
+    "impact_w_commits": 30,
+    "impact_w_lines":   30,
     "impact_w_tenure":  15,
     "impact_w_merges":  15,
+    "impact_w_issues":  10,
     "impact_use_net_lines":       True,
     "impact_wash_window_days":    7,
     "impact_wash_min_gross":      50,
@@ -242,6 +269,7 @@ def build_demo_repo(repo_dir: str) -> None:
 
     def git(*args, name="Alice Chen", email="alice@example.com",
             date="2023-01-01T12:00:00"):
+        date = _shift_date(date)
         env = {
             **os.environ,
             "GIT_AUTHOR_NAME":     name,
@@ -279,6 +307,7 @@ def build_demo_repo(repo_dir: str) -> None:
         git("branch", "-d", branch, name=name, email=email, date=date)
 
     def tag(name_tag, date, tagger="Alice Chen", tagger_email="alice@example.com"):
+        date = _shift_date(date)
         env = {
             **os.environ,
             "GIT_COMMITTER_NAME":  tagger,
@@ -299,6 +328,8 @@ def build_demo_repo(repo_dir: str) -> None:
     E = dict(name="Eve Johnson",   email="eve@example.com")
     F = dict(name="Frank Lee",     email="frank@example.com")
     G = dict(name="Grace Kim",     email="grace@example.com")
+    # Henry left Core on 2024-03-31 — exercises the "Previous Members" section.
+    H = dict(name="Henry Walsh",   email="henry@example.com")
 
     # ── Init ──────────────────────────────────────────────────────────────────
     git("init", "-b", "main")
@@ -321,6 +352,10 @@ def build_demo_repo(repo_dir: str) -> None:
         "core/engine.py": _module("engine", 5),
     }, date="2023-01-12T11:00:00", **A)
 
+    commit("Engine: error taxonomy and structured exceptions (PROJ-4)", {
+        "core/errors.py": _module("errors", 4),
+    }, date="2023-01-15T16:00:00", **H)
+
     commit("Platform configuration module", {
         "platform/config.py": _module("config", 4),
     }, date="2023-01-18T14:00:00", **C)
@@ -341,6 +376,10 @@ def build_demo_repo(repo_dir: str) -> None:
         "core/engine.py": _module("engine", 8),
     }, date="2023-02-14T10:30:00", **B)
 
+    commit("Errors: catalog of typed retryable failures", {
+        "core/errors.py": _module("errors", 7),
+    }, date="2023-02-17T13:00:00", **H)
+
     commit("Auth: session management and expiry", {
         "core/auth.py": _module("auth", 9),
     }, date="2023-02-20T11:00:00", **A)
@@ -353,15 +392,15 @@ def build_demo_repo(repo_dir: str) -> None:
         "tests/test_auth.py": _test_module("auth", 8),
     }, date="2023-03-06T09:00:00", **E)
 
-    commit("Engine: telemetry hooks and structured logging", {
+    commit("Engine: telemetry hooks and structured logging (PROJ-12)", {
         "core/engine.py": _module("engine", 11),
     }, date="2023-03-13T10:00:00", **B)
 
-    commit("API: rate limiting and request validation", {
+    commit("API: rate limiting and request validation (PROJ-15)", {
         "platform/api.py": _module("api", 9),
     }, date="2023-03-20T14:00:00", **C)
 
-    commit("Auth: add PKCE and OAuth2 code flow", {
+    commit("Auth: add PKCE and OAuth2 code flow (PROJ-22)", {
         "core/auth.py": _module("auth", 12),
     }, date="2023-04-03T10:00:00", **A)
 
@@ -381,7 +420,7 @@ def build_demo_repo(repo_dir: str) -> None:
         "platform/api.py": _module("api", 12),
     }, date="2023-05-02T11:00:00", **C)
 
-    commit("Auth: RBAC permission checks", {
+    commit("Auth: RBAC permission checks (PROJ-31)", {
         "core/auth.py": _module("auth", 14),
     }, date="2023-05-09T10:30:00", **A)
 
@@ -400,7 +439,7 @@ def build_demo_repo(repo_dir: str) -> None:
         "tests/test_integration.py": _test_module("integration", 9),
     }, date="2023-05-23T09:00:00", **E)
 
-    commit("Fix: engine retry storm under high load", {
+    commit("Fix: engine retry storm under high load (BUG-7)", {
         "core/engine.py": _module("engine", 14),
     }, date="2023-05-30T10:00:00", **B)
 
@@ -408,19 +447,19 @@ def build_demo_repo(repo_dir: str) -> None:
 
     # ── Phase 2: v1.1 patch cycle (2023-06 – 2023-09) ─────────────────────────
 
-    commit("Auth: fix token clock-skew on expiry check", {
+    commit("Auth: fix token clock-skew on expiry check (BUG-101)", {
         "core/auth.py": _module("auth", 15),
     }, date="2023-06-07T10:00:00", **A)
 
-    commit("API: fix 500 on malformed JSON body", {
+    commit("API: fix 500 on malformed JSON body (BUG-102)", {
         "platform/api.py": _module("api", 13),
     }, date="2023-06-13T11:00:00", **C)
 
-    commit("Config: fix reload race condition", {
+    commit("Config: fix reload race condition (BUG-105)", {
         "platform/config.py": _module("config", 10),
     }, date="2023-06-20T14:00:00", **D)
 
-    commit("Engine: add circuit-breaker pattern", {
+    commit("Engine: add circuit-breaker pattern (PROJ-58)", {
         "core/engine.py": _module("engine", 15),
     }, date="2023-06-27T10:00:00", **B)
 
@@ -428,6 +467,10 @@ def build_demo_repo(repo_dir: str) -> None:
         "tests/test_auth.py":        _test_module("auth", 11),
         "tests/test_api.py":         _test_module("api", 12),
     }, date="2023-07-05T09:00:00", **G)
+
+    commit("Errors: harmonize error codes across components (BUG-110)", {
+        "core/errors.py": _module("errors", 10),
+    }, date="2023-07-19T14:00:00", **H)
 
     commit("Auth: cache warm-up on startup", {
         "core/auth.py": _module("auth", 16),
@@ -449,11 +492,11 @@ def build_demo_repo(repo_dir: str) -> None:
         "platform/config.py": _module("config", 12),
     }, date="2023-08-09T11:00:00", **D)
 
-    commit("Auth: MFA support (TOTP)", {
+    commit("Auth: MFA support, TOTP (PROJ-71)", {
         "core/auth.py": _module("auth", 18),
     }, date="2023-08-16T10:00:00", **A)
 
-    commit("Fix: API timeout not propagated to upstream calls", {
+    commit("Fix: API timeout not propagated to upstream calls (BUG-118)", {
         "platform/api.py": _module("api", 15),
     }, date="2023-08-23T14:30:00", **C)
 
@@ -473,11 +516,11 @@ def build_demo_repo(repo_dir: str) -> None:
 
     # ── Phase 3: v2.0 major release (2023-09 – 2024-01) ──────────────────────
 
-    commit("Add core scheduler for background jobs", {
+    commit("Add core scheduler for background jobs (PROJ-150)", {
         "core/scheduler.py": _module("scheduler", 5),
     }, date="2023-09-08T10:00:00", **B)
 
-    commit("Platform: middleware pipeline", {
+    commit("Platform: middleware pipeline (PROJ-151)", {
         "platform/middleware.py": _module("middleware", 5),
     }, date="2023-09-15T11:00:00", **C)
 
@@ -489,6 +532,10 @@ def build_demo_repo(repo_dir: str) -> None:
         "core/auth.py": _module("auth", 20),
     }, date="2023-09-29T10:30:00", **A)
 
+    commit("Errors: introduce error chaining and root cause API (PROJ-160)", {
+        "core/errors.py": _module("errors", 13),
+    }, date="2023-10-05T15:00:00", **H)
+
     commit("Middleware: request tracing and correlation IDs", {
         "platform/middleware.py": _module("middleware", 8),
     }, date="2023-10-06T11:00:00", **C)
@@ -497,7 +544,7 @@ def build_demo_repo(repo_dir: str) -> None:
         "core/engine.py": _module("engine", 18),
     }, date="2023-10-13T10:00:00", **B)
 
-    commit("API: GraphQL layer over REST endpoints", {
+    commit("API: GraphQL layer over REST endpoints (PROJ-180)", {
         "platform/api.py": _module("api", 18),
     }, date="2023-10-20T14:00:00", **D)
 
@@ -534,7 +581,7 @@ def build_demo_repo(repo_dir: str) -> None:
         "core/auth.py": _module("auth", 24),
     }, date="2023-12-15T10:00:00", **A)
 
-    commit("API: versioned routing (/v1, /v2)", {
+    commit("API: versioned routing /v1 and /v2 (PROJ-205)", {
         "platform/api.py": _module("api", 20),
     }, date="2023-12-22T11:00:00", **C)
 
@@ -583,6 +630,10 @@ def build_demo_repo(repo_dir: str) -> None:
         "tests/test_api.py":         _test_module("api", 18),
     }, date="2024-02-13T09:00:00", **F)
 
+    commit("Errors: handoff doc + final cleanup before departure", {
+        "core/errors.py": _module("errors", 16),
+    }, date="2024-03-22T17:00:00", **H)
+
     commit("Config: distributed config sync via etcd", {
         "platform/config.py": _module("config", 16),
     }, date="2024-02-20T13:00:00", **D)
@@ -591,7 +642,7 @@ def build_demo_repo(repo_dir: str) -> None:
         "core/scheduler.py": _module("scheduler", 15),
     }, date="2024-02-27T10:00:00", **B)
 
-    commit("Auth: SSO via SAML 2.0", {
+    commit("Auth: SSO via SAML 2.0 (PROJ-310)", {
         "core/auth.py": _module("auth", 27),
     }, date="2024-03-05T10:30:00", **A)
 
@@ -607,11 +658,11 @@ def build_demo_repo(repo_dir: str) -> None:
         "core/engine.py": _module("engine", 24),
     }, date="2024-03-26T10:00:00", **B)
 
-    commit("Auth: device authorization grant flow", {
+    commit("Auth: device authorization grant flow (PROJ-322)", {
         "core/auth.py": _module("auth", 28),
     }, date="2024-04-02T10:30:00", **A)
 
-    commit("API: webhook delivery with retry", {
+    commit("API: webhook delivery with retry (PROJ-330)", {
         "platform/api.py": _module("api", 24),
     }, date="2024-04-09T11:00:00", **C)
 
@@ -646,7 +697,7 @@ def build_demo_repo(repo_dir: str) -> None:
         "core/engine.py": _module("engine", 27),
     }, date="2024-05-10T10:00:00", **B)
 
-    commit("Auth: passkey / FIDO2 support", {
+    commit("Auth: passkey / FIDO2 support (PROJ-410)", {
         "core/auth.py": _module("auth", 30),
     }, date="2024-05-17T10:30:00", **A)
 
@@ -667,11 +718,11 @@ def build_demo_repo(repo_dir: str) -> None:
         "tests/test_integration.py": _test_module("integration", 25),
     }, date="2024-06-18T09:00:00", **E)
 
-    commit("Auth: zero-trust policy engine", {
+    commit("Auth: zero-trust policy engine (PROJ-440)", {
         "core/auth.py": _module("auth", 32),
     }, date="2024-07-02T10:30:00", **A)
 
-    commit("Engine: multi-region failover", {
+    commit("Engine: multi-region failover (INFRA-12)", {
         "core/engine.py": _module("engine", 30),
     }, date="2024-07-16T10:00:00", **B)
 
@@ -695,7 +746,7 @@ def build_demo_repo(repo_dir: str) -> None:
         "tests/test_integration.py": _test_module("integration", 29),
     }, date="2024-09-24T09:00:00", **F)
 
-    commit("Engine: WASM plugin runtime", {
+    commit("Engine: WASM plugin runtime (INFRA-20)", {
         "core/engine.py": _module("engine", 33),
     }, date="2024-10-08T10:00:00", **B)
 
@@ -703,11 +754,11 @@ def build_demo_repo(repo_dir: str) -> None:
         "platform/config.py": _module("config", 24),
     }, date="2024-10-22T13:00:00", **D)
 
-    commit("Auth: ephemeral credential support", {
+    commit("Auth: ephemeral credential support (PROJ-470)", {
         "core/auth.py": _module("auth", 36),
     }, date="2024-11-05T10:30:00", **A)
 
-    commit("API: GraphQL subscriptions", {
+    commit("API: GraphQL subscriptions (PROJ-475)", {
         "platform/api.py": _module("api", 32),
     }, date="2024-11-19T11:00:00", **C)
 
@@ -745,7 +796,7 @@ def build_demo_repo(repo_dir: str) -> None:
 
     # ── Post-release work (2025-01 – present) ─────────────────────────────────
 
-    commit("Auth: post-quantum crypto primitives (experimental)", {
+    commit("Auth: post-quantum crypto primitives, experimental (PROJ-510)", {
         "core/auth.py": _module("auth", 38),
     }, date="2025-01-09T10:30:00", **A)
 
@@ -765,7 +816,7 @@ def build_demo_repo(repo_dir: str) -> None:
         "platform/config.py": _module("config", 26),
     }, date="2025-02-04T13:00:00", **D)
 
-    commit("Auth: audit log streaming to SIEM", {
+    commit("Auth: audit log streaming to SIEM (INFRA-31)", {
         "core/auth.py": _module("auth", 40),
     }, date="2025-02-11T10:30:00", **A)
 
@@ -840,6 +891,103 @@ def build_demo_repo(repo_dir: str) -> None:
        "API: persisted query support for GraphQL",
        {"platform/api.py": _module("api", 33)},
        D, "2025-01-16T10:00:00", "2025-01-17T09:00:00")
+
+
+def build_support_repo(repo_dir: str) -> None:
+    """Populate repo_dir with a small companion 'demo-tools' git history.
+
+    Passing this repo via support_paths exercises the support-repo header pill
+    on Summary, the multi-repo Net Lines tooltip, and the per-repo cards on the
+    Components tab. The repo has two components (cli/, sdk/) so it produces a
+    distinct churn chart from the main repo.
+    """
+    _no_sign = {
+        "GIT_CONFIG_COUNT":   "1",
+        "GIT_CONFIG_KEY_0":   "commit.gpgsign",
+        "GIT_CONFIG_VALUE_0": "false",
+    }
+
+    def git(*args, name="Carol Williams", email="carol@example.com",
+            date="2023-06-01T12:00:00"):
+        date = _shift_date(date)
+        env = {
+            **os.environ,
+            "GIT_AUTHOR_NAME":     name,
+            "GIT_AUTHOR_EMAIL":    email,
+            "GIT_COMMITTER_NAME":  name,
+            "GIT_COMMITTER_EMAIL": email,
+            "GIT_AUTHOR_DATE":     date,
+            "GIT_COMMITTER_DATE":  date,
+            **_no_sign,
+        }
+        subprocess.check_call(
+            ["git", "-C", repo_dir] + list(args),
+            env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+
+    def write(rel_path: str, content: str) -> None:
+        full = os.path.join(repo_dir, rel_path)
+        os.makedirs(os.path.dirname(full), exist_ok=True)
+        pathlib.Path(full).write_text(content, encoding="utf-8")
+
+    def commit(msg, files, name, email, date):
+        for path, content in files.items():
+            write(path, content)
+        git("add", ".")
+        git("commit", "-m", msg, name=name, email=email, date=date)
+
+    A = dict(name="Alice Chen",     email="alice@example.com")
+    C = dict(name="Carol Williams", email="carol@example.com")
+    D = dict(name="David Park",     email="david@example.com")
+    E = dict(name="Eve Johnson",    email="eve@example.com")
+
+    git("init", "-b", "main")
+    git("config", "user.email", "carol@example.com")
+    git("config", "user.name",  "Carol Williams")
+
+    commit("Initial CLI scaffolding and SDK skeleton", {
+        "README.md":              "# demo-tools\n\nCompanion CLI and SDK.\n",
+        "cli/pyproject.toml":     _pyproject("cli", "0.1.0"),
+        "sdk/pyproject.toml":     _pyproject("sdk", "0.1.0"),
+        "cli/main.py":            _module("cli", 4),
+        "sdk/client.py":          _module("client", 4),
+    }, date="2023-06-15T10:00:00", **C)
+
+    commit("CLI: argument parsing and subcommands", {
+        "cli/main.py": _module("cli", 7),
+    }, date="2023-08-20T11:00:00", **C)
+
+    commit("SDK: typed client wrapping the v1 API", {
+        "sdk/client.py": _module("client", 8),
+    }, date="2023-10-12T13:00:00", **D)
+
+    commit("CLI: progress indicators and colored output (PROJ-175)", {
+        "cli/main.py": _module("cli", 10),
+    }, date="2024-01-08T10:00:00", **C)
+
+    commit("SDK: retry policy and connection pooling", {
+        "sdk/client.py": _module("client", 11),
+    }, date="2024-03-04T12:00:00", **A)
+
+    commit("CLI: shell completion (bash/zsh/fish)", {
+        "cli/main.py": _module("cli", 13),
+    }, date="2024-05-22T14:00:00", **C)
+
+    commit("Tests: smoke tests for CLI commands", {
+        "tests/test_cli.py": _test_module("cli", 6),
+    }, date="2024-07-09T10:00:00", **E)
+
+    commit("SDK: streaming response helpers (PROJ-462)", {
+        "sdk/client.py": _module("client", 14),
+    }, date="2024-09-18T11:00:00", **D)
+
+    commit("CLI: configuration profiles and aliases", {
+        "cli/main.py": _module("cli", 16),
+    }, date="2024-12-03T10:00:00", **C)
+
+    commit("SDK: align typings with v3 API surface", {
+        "sdk/client.py": _module("client", 17),
+    }, date="2025-02-14T13:00:00", **D)
 
 
 # ── Screenshot engine ──────────────────────────────────────────────────────────
@@ -928,25 +1076,44 @@ def main() -> None:
         sys.exit(f"externals/ directory not found at {externals}")
 
     with tempfile.TemporaryDirectory(prefix="gitstats_demo_") as tmp:
-        repo_dir   = os.path.join(tmp, "demo-project")
-        cfg_path   = os.path.join(tmp, "config.json")
-        report_dir = os.path.join(tmp, "report")
-        html_path  = os.path.join(report_dir, "index.html")
+        repo_dir     = os.path.join(tmp, "demo-project")
+        support_dir  = os.path.join(tmp, "demo-tools")
+        cfg_path     = os.path.join(tmp, "config.json")
+        report_dir   = os.path.join(tmp, "report")
+        html_path    = os.path.join(report_dir, "index.html")
 
         os.makedirs(repo_dir)
+        os.makedirs(support_dir)
         os.makedirs(report_dir)
 
-        # Write config
+        # Write config — shift any team membership "from"/"to" dates by the
+        # same offset applied to commit timestamps so membership windows stay
+        # aligned with the (now-shifted) commit history.
+        config = json.loads(json.dumps(DEMO_CONFIG))  # deep copy
+        for tdef in config["teams"].values():
+            shifted_members = []
+            for m in tdef.get("members", []):
+                if isinstance(m, dict):
+                    sm = dict(m)
+                    for key in ("from", "to"):
+                        if sm.get(key):
+                            sm[key] = _shift_date(sm[key] + "T12:00:00")[:10]
+                    shifted_members.append(sm)
+                else:
+                    shifted_members.append(m)
+            tdef["members"] = shifted_members
         with open(cfg_path, "w") as f:
-            json.dump(DEMO_CONFIG, f, indent=2)
+            json.dump(config, f, indent=2)
 
-        # Build demo repository
+        # Build demo repository (main + support)
         print("Building demo repository...")
         build_demo_repo(repo_dir)
+        print("Building support repository...")
+        build_support_repo(support_dir)
 
         # Collect stats and generate report
         print("Running gitstats analysis...")
-        gs = gitstats.GitStats(repo_dir, cfg_path)
+        gs = gitstats.GitStats(repo_dir, cfg_path, support_paths=[support_dir])
         gs.collect()
         gs.generate_report(externals, html_path)
 
