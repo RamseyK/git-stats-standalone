@@ -4,7 +4,6 @@ A Python script that analyzes Git repository history and generates a self-contai
 
 - [Primary Metrics](#primary-metrics)
 - [Screenshots](#screenshots)
-- [Requirements](#requirements)
 - [Usage](#usage)
 - [Configuration](#configuration)
   - [General](#general)
@@ -39,11 +38,9 @@ A Python script that analyzes Git repository history and generates a self-contai
 ![Releases](screenshots/demo_project/05_releases.png)
 ![Components](screenshots/demo_project/06_components.png)
 
-## Requirements
-
-* Python 3.11+
-
 ## Usage
+
+With Python 3.11+:
 
 ```
 python gitstats.py -s <repo-path> -o <output.html> [-c <config.json>] [-externals <dir>] [-support <repo-path>] ...
@@ -377,7 +374,7 @@ The Active Tenure dimension is computed as the number of days between an author'
 
 If tenure distortion is a concern for a specific repository, it can be reduced or eliminated by lowering `impact_w_tenure` or setting it to `0`.
 
-# LICENSE
+# License
 
 MIT License. See LICENSE file.
 
