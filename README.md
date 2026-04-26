@@ -2,6 +2,23 @@
 
 A Python script that analyzes Git repository history and generates a self-contained HTML statistics report viewable offline in any browser. Reports can be used to measure and analyze true impact, effort, and expertise of contributors (and optionally their teams) to a codebase.
 
+- [Primary Metrics](#primary-metrics)
+- [Screenshots](#screenshots)
+- [Requirements](#requirements)
+- [Usage](#usage)
+- [Configuration](#configuration)
+  - [General](#general)
+  - [Teams](#teams)
+  - [Aliases](#aliases)
+- [Impact Score](#impact-score)
+  - [Noise filtering](#noise-filtering)
+  - [PR merge detection](#pr-merge-detection)
+  - [Tuning](#tuning)
+- [Support Repositories](#support-repositories)
+- [Potential Shortfalls](#potential-shortfalls)
+- [LICENSE](#license)
+- [Alternatives](#alternatives)
+
 ## Primary Metrics
 
 - **Summary** — project age, lines of code, weekly cadence, release count, commit velocity trend, monthly commit activity chart, bus factor (commits and PR merges), and hourly punchcard
