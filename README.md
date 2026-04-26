@@ -359,3 +359,16 @@ The Active Tenure dimension is computed as the number of days between an author'
 **For teams, dormancy is structurally unlikely by design.** A well-defined team is expected to maintain a diversity of active members such that the team as a whole rarely goes dormant — individual members may be less active at any given time, but the team's collective tenure reflects real, ongoing presence in the codebase. A team whose tenure span is largely empty (e.g., one historical member from years ago and no recent activity) is likely a team that no longer exists in a meaningful sense and probably should not be defined in the configuration, or should use time-ranged membership entries to reflect its actual active period.
 
 If tenure distortion is a concern for a specific repository, it can be reduced or eliminated by lowering `impact_w_tenure` or setting it to `0`.
+
+# LICENSE
+
+MIT License. See LICENSE file.
+
+# Alternatives
+
+I considered these alternatives before building this project, but, none of them met my specific use case. These still served as inspiration and may be useful for your needs.
+
+* [Git Stats (The OG project)](https://gitstats.sourceforge.net/)
+* [Git Stats (Modern)](https://pypi.org/project/gitstats)
+* [GitPyStats](https://github.com/git-quick-stats/git-py-stats)
+* [git-quick-stats](https://git-quick-stats.sh/)
